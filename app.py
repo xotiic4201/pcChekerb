@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import socketio
 import asyncio
 import os
@@ -17,653 +17,715 @@ import shutil
 from pathlib import Path
 import time
 import threading
+import tempfile
+import zipfile
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI(
-    title="Discord Bot Hosting API",
-    version="1.0.0",
-    description="Backend API for hosting Discord bots"
+    title="xotiicBotHosting API",
+    version="2.0.0",
+    description="Premium Discord Bot Hosting Platform Backend"
 )
 
-# CORS middleware
+# CORS middleware - Allow all origins for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Socket.IO
+# Initialize Socket.IO with proper CORS
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins='*',
-    ping_timeout=60,
-    ping_interval=25,
+    ping_timeout=120,
+    ping_interval=30,
     logger=True,
-    engineio_logger=True
+    engineio_logger=False
 )
 
 # Create necessary directories
 UPLOAD_DIR = "uploads"
 BOTS_DIR = "bots"
 LOGS_DIR = "logs"
+STATIC_DIR = "static"
 
-for directory in [UPLOAD_DIR, BOTS_DIR, LOGS_DIR]:
+for directory in [UPLOAD_DIR, BOTS_DIR, LOGS_DIR, STATIC_DIR]:
     Path(directory).mkdir(exist_ok=True)
 
 # Mount static files
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-app.mount("/bots", StaticFiles(directory=BOTS_DIR), name="bots")
+try:
+    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+    app.mount("/bots", StaticFiles(directory=BOTS_DIR), name="bots")
+except Exception as e:
+    logger.warning(f"Could not mount static directories: {e}")
 
 # In-memory storage
-connected_clients: Dict[str, dict] = {}  # client_id -> client_info
-bots_registry: Dict[str, dict] = {}      # bot_id -> bot_info
-bot_processes: Dict[str, subprocess.Popen] = {}  # bot_id -> process
-bot_logs: Dict[str, List[dict]] = {}     # bot_id -> logs
-client_connections: Dict[str, str] = {}  # sid -> client_id
+connected_clients: Dict[str, dict] = {}
+bots_registry: Dict[str, dict] = {}
+bot_processes: Dict[str, subprocess.Popen] = {}
+bot_logs: Dict[str, List[dict]] = {}
+client_connections: Dict[str, str] = {}
 active_websockets: Set[WebSocket] = set()
+
+# Track bot start times for uptime calculation
+bot_start_times: Dict[str, datetime] = {}
 
 class BotManager:
     def __init__(self):
-        self.bots = {}
-        self.client_connections = {}
+        self.bots = bots_registry
+        self.processes = bot_processes
         self.running = True
         
-    async def register_client(self, client_id: str, sid: str, client_info: dict = None):
-        """Register a new client (laptop/device) connection"""
-        self.client_connections[client_id] = sid
-        connected_clients[client_id] = {
-            'sid': sid,
-            'connected_at': datetime.now().isoformat(),
-            'last_seen': datetime.now().isoformat(),
-            'ip': client_info.get('ip', 'unknown') if client_info else 'unknown',
-            'platform': client_info.get('platform', 'unknown') if client_info else 'unknown',
-            'bot_count': 0
-        }
-        client_connections[sid] = client_id
-        logger.info(f"Client registered: {client_id}")
+    def calculate_uptime(self, bot_id: str) -> str:
+        """Calculate bot uptime"""
+        if bot_id not in bot_start_times:
+            return "0s"
         
-        # Send confirmation
-        await sio.emit('registration_confirmed', {
-            'client_id': client_id,
-            'message': 'Successfully connected to server',
-            'server_time': datetime.now().isoformat()
-        }, room=sid)
+        uptime_seconds = (datetime.now() - bot_start_times[bot_id]).total_seconds()
         
-        # Broadcast client count update
-        await self.broadcast_client_count()
+        if uptime_seconds < 60:
+            return f"{int(uptime_seconds)}s"
+        elif uptime_seconds < 3600:
+            return f"{int(uptime_seconds / 60)}m"
+        elif uptime_seconds < 86400:
+            hours = int(uptime_seconds / 3600)
+            minutes = int((uptime_seconds % 3600) / 60)
+            return f"{hours}h {minutes}m"
+        else:
+            days = int(uptime_seconds / 86400)
+            hours = int((uptime_seconds % 86400) / 3600)
+            return f"{days}d {hours}h"
     
-    async def unregister_client(self, client_id: str):
-        """Remove client connection"""
-        if client_id in self.client_connections:
-            sid = self.client_connections[client_id]
-            del self.client_connections[client_id]
-            if sid in client_connections:
-                del client_connections[sid]
-        
-        if client_id in connected_clients:
-            # Stop all bots from this client
-            for bot_id, bot in list(bots_registry.items()):
-                if bot.get('client_id') == client_id:
-                    await self.stop_bot_process(bot_id)
-            
-            del connected_clients[client_id]
-        
-        await self.broadcast_client_count()
-    
-    async def broadcast_client_count(self):
-        """Broadcast updated client count to all"""
-        await sio.emit('clients_update', {
-            'total_clients': len(connected_clients),
-            'clients': list(connected_clients.keys())
-        })
-    
-    async def update_bot_status(self, bot_data: dict):
-        """Update bot status and broadcast to all clients"""
-        bot_id = bot_data.get('id')
-        if not bot_id:
+    async def update_bot_metrics(self, bot_id: str):
+        """Update bot metrics (CPU, Memory, Uptime)"""
+        if bot_id not in self.bots:
             return
         
-        # Update or create bot entry
-        if bot_id not in bots_registry:
-            bots_registry[bot_id] = {
-                'id': bot_id,
-                'name': bot_data.get('name', 'Unnamed Bot'),
-                'status': 'unknown',
-                'client_id': bot_data.get('client_id'),
-                'created_at': datetime.now().isoformat(),
-                'last_updated': datetime.now().isoformat(),
-                'type': bot_data.get('type', 'unknown'),
-                'cpu': 0,
-                'memory': 0,
-                'uptime': '0',
-                'logs': [],
-                'config': bot_data.get('config', {})
-            }
+        bot = self.bots[bot_id]
         
-        # Update fields
-        bots_registry[bot_id].update({
-            'status': bot_data.get('status', bots_registry[bot_id]['status']),
+        # Calculate uptime
+        if bot.get('status') == 'running':
+            bot['uptime'] = self.calculate_uptime(bot_id)
+            
+            # Get process metrics if available
+            if bot_id in self.processes:
+                try:
+                    process = self.processes[bot_id]
+                    p = psutil.Process(process.pid)
+                    bot['cpu'] = round(p.cpu_percent(interval=0.1), 1)
+                    bot['memory'] = round(p.memory_info().rss / (1024 * 1024), 1)  # MB
+                except:
+                    pass
+        else:
+            bot['cpu'] = 0
+            bot['memory'] = 0
+            bot['uptime'] = '0s'
+        
+        bot['last_updated'] = datetime.now().isoformat()
+    
+    async def create_bot_entry(self, name: str, bot_type: str, token: str = None, code: str = None) -> str:
+        """Create a new bot entry"""
+        bot_id = str(uuid.uuid4())
+        
+        self.bots[bot_id] = {
+            'id': bot_id,
+            'name': name,
+            'status': 'stopped',
+            'type': bot_type,
+            'created_at': datetime.now().isoformat(),
             'last_updated': datetime.now().isoformat(),
-            'cpu': bot_data.get('cpu', bots_registry[bot_id]['cpu']),
-            'memory': bot_data.get('memory', bots_registry[bot_id]['memory']),
-            'uptime': bot_data.get('uptime', bots_registry[bot_id]['uptime'])
-        })
-        
-        # Add to logs
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'level': 'info',
-            'message': f"Status: {bot_data.get('status')}",
-            'data': bot_data
+            'cpu': 0,
+            'memory': 0,
+            'uptime': '0s',
+            'token': token,
+            'code': code,
+            'logs': []
         }
         
-        bot_logs.setdefault(bot_id, []).append(log_entry)
+        # Initialize logs
+        bot_logs[bot_id] = [{
+            'timestamp': datetime.now().isoformat(),
+            'level': 'info',
+            'message': f'Bot "{name}" created successfully'
+        }]
         
-        # Keep only last 100 logs per bot
-        if len(bot_logs[bot_id]) > 100:
-            bot_logs[bot_id] = bot_logs[bot_id][-100:]
-        
-        # Broadcast update to all connected clients
-        await sio.emit('bot_update', {
-            'bot': bots_registry[bot_id],
-            'total_bots': len(bots_registry),
-            'timestamp': datetime.now().isoformat()
-        })
+        logger.info(f"Created bot: {bot_id} - {name}")
+        return bot_id
     
-    async def start_bot_process(self, bot_id: str):
-        """Start a bot process locally (for testing)"""
-        bot = bots_registry.get(bot_id)
-        if not bot:
+    async def start_bot(self, bot_id: str) -> bool:
+        """Start a bot"""
+        if bot_id not in self.bots:
+            logger.error(f"Bot not found: {bot_id}")
             return False
+        
+        bot = self.bots[bot_id]
+        
+        # Check if already running
+        if bot.get('status') == 'running':
+            logger.warning(f"Bot already running: {bot_id}")
+            return True
         
         try:
-            bot_path = os.path.join(BOTS_DIR, bot_id)
+            # Update status
+            bot['status'] = 'starting'
+            await self.broadcast_bot_update(bot_id)
             
+            # Create bot directory
+            bot_dir = os.path.join(BOTS_DIR, bot_id)
+            os.makedirs(bot_dir, exist_ok=True)
+            
+            # Create bot file based on type
             if bot['type'] == 'python':
-                # For Python bots
-                if os.path.exists(os.path.join(bot_path, 'requirements.txt')):
-                    subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', 
-                                   os.path.join(bot_path, 'requirements.txt')], 
-                                  capture_output=True)
+                bot_file = os.path.join(bot_dir, 'bot.py')
                 
-                # Find main python file
-                py_files = [f for f in os.listdir(bot_path) if f.endswith('.py')]
-                if py_files:
-                    main_file = py_files[0]
-                    process = subprocess.Popen(
-                        [sys.executable, os.path.join(bot_path, main_file)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        env={**os.environ, 'DISCORD_BOT_ID': bot_id}
-                    )
-                    bot_processes[bot_id] = process
-                    
-                    # Start log reader thread
-                    threading.Thread(target=self._read_bot_logs, args=(bot_id, process), daemon=True).start()
-                    
-                    return True
-                    
+                # Use provided code or create basic template
+                if bot.get('code'):
+                    code = bot['code']
+                else:
+                    code = f"""
+import discord
+from discord.ext import commands
+import os
+import sys
+
+TOKEN = '{bot.get('token', 'YOUR_TOKEN_HERE')}'
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'{{bot.user}} is now online!')
+    print(f'Bot ID: {{bot.user.id}}')
+    print(f'Connected to {{len(bot.guilds)}} guilds')
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send(f'Pong! {{round(bot.latency * 1000)}}ms')
+
+@bot.command()
+async def hello(ctx):
+    await ctx.send(f'Hello {{ctx.author.mention}}!')
+
+if __name__ == '__main__':
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f'Error: {{e}}')
+        sys.exit(1)
+"""
+                
+                with open(bot_file, 'w') as f:
+                    f.write(code)
+                
+                # Start the process
+                process = subprocess.Popen(
+                    [sys.executable, bot_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=bot_dir,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                
             elif bot['type'] == 'nodejs':
-                # For Node.js bots
-                if os.path.exists(os.path.join(bot_path, 'package.json')):
-                    subprocess.run(['npm', 'install'], cwd=bot_path, capture_output=True)
+                bot_file = os.path.join(bot_dir, 'bot.js')
                 
-                # Find main js file
-                js_files = [f for f in os.listdir(bot_path) if f.endswith('.js')]
-                if js_files:
-                    main_file = js_files[0]
-                    process = subprocess.Popen(
-                        ['node', os.path.join(bot_path, main_file)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        env={**os.environ, 'DISCORD_BOT_ID': bot_id}
-                    )
-                    bot_processes[bot_id] = process
-                    
-                    # Start log reader thread
-                    threading.Thread(target=self._read_bot_logs, args=(bot_id, process), daemon=True).start()
-                    
-                    return True
+                if bot.get('code'):
+                    code = bot['code']
+                else:
+                    code = f"""
+const {{ Client, GatewayIntentBits }} = require('discord.js');
+
+const client = new Client({{
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+}});
+
+client.once('ready', () => {{
+    console.log(`${{client.user.tag}} is now online!`);
+    console.log(`Bot ID: ${{client.user.id}}`);
+    console.log(`Connected to ${{client.guilds.cache.size}} guilds`);
+}});
+
+client.on('messageCreate', async message => {{
+    if (message.content === '!ping') {{
+        message.reply(`Pong! ${{client.ws.ping}}ms`);
+    }}
+    if (message.content === '!hello') {{
+        message.reply(`Hello ${{message.author}}!`);
+    }}
+}});
+
+client.login('{bot.get('token', 'YOUR_TOKEN_HERE')}');
+"""
+                
+                with open(bot_file, 'w') as f:
+                    f.write(code)
+                
+                # Create package.json
+                package_json = {
+                    "name": bot['name'].lower().replace(' ', '-'),
+                    "version": "1.0.0",
+                    "main": "bot.js",
+                    "dependencies": {
+                        "discord.js": "^14.14.1"
+                    }
+                }
+                
+                with open(os.path.join(bot_dir, 'package.json'), 'w') as f:
+                    json.dump(package_json, f, indent=2)
+                
+                # Install dependencies
+                install_process = subprocess.run(
+                    ['npm', 'install'],
+                    cwd=bot_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                
+                if install_process.returncode != 0:
+                    logger.error(f"npm install failed: {install_process.stderr}")
+                
+                # Start the process
+                process = subprocess.Popen(
+                    ['node', bot_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=bot_dir,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+            else:
+                logger.error(f"Unknown bot type: {bot['type']}")
+                bot['status'] = 'error'
+                await self.broadcast_bot_update(bot_id)
+                return False
             
-            return False
+            # Store process
+            self.processes[bot_id] = process
+            bot_start_times[bot_id] = datetime.now()
+            
+            # Update status
+            bot['status'] = 'running'
+            await self.broadcast_bot_update(bot_id)
+            
+            # Start log reader
+            asyncio.create_task(self._read_process_logs(bot_id, process))
+            
+            # Add startup log
+            self.add_log(bot_id, 'info', f'Bot started successfully (PID: {process.pid})')
+            
+            logger.info(f"Started bot: {bot_id} - {bot['name']}")
+            return True
             
         except Exception as e:
             logger.error(f"Error starting bot {bot_id}: {e}")
+            bot['status'] = 'error'
+            await self.broadcast_bot_update(bot_id)
+            self.add_log(bot_id, 'error', f'Failed to start: {str(e)}')
             return False
     
-    def _read_bot_logs(self, bot_id: str, process: subprocess.Popen):
-        """Read logs from bot process"""
-        while True:
-            line = process.stdout.readline()
-            if not line and process.poll() is not None:
-                break
-            
-            if line:
-                log_entry = {
-                    'timestamp': datetime.now().isoformat(),
-                    'level': 'info',
-                    'message': line.strip()
-                }
-                
-                bot_logs.setdefault(bot_id, []).append(log_entry)
-                
-                # Broadcast log update
-                asyncio.run_coroutine_threadsafe(
-                    sio.emit('bot_log', {
-                        'bot_id': bot_id,
-                        'log': log_entry
-                    }),
-                    asyncio.get_event_loop()
-                )
-    
-    async def stop_bot_process(self, bot_id: str):
-        """Stop a running bot process"""
-        if bot_id in bot_processes:
-            process = bot_processes[bot_id]
-            
+    async def stop_bot(self, bot_id: str) -> bool:
+        """Stop a bot"""
+        if bot_id not in self.bots:
+            return False
+        
+        bot = self.bots[bot_id]
+        
+        if bot_id in self.processes:
             try:
-                # Try graceful termination
+                process = self.processes[bot_id]
+                
+                # Terminate process
                 process.terminate()
+                
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    # Force kill if not responding
                     process.kill()
                     process.wait()
-            except:
-                pass
-            
-            del bot_processes[bot_id]
-            
-            # Update status
-            if bot_id in bots_registry:
-                bots_registry[bot_id]['status'] = 'stopped'
-                bots_registry[bot_id]['cpu'] = 0
-                bots_registry[bot_id]['memory'] = 0
                 
-                await sio.emit('bot_update', {
-                    'bot': bots_registry[bot_id],
-                    'total_bots': len(bots_registry)
-                })
-            
-            return True
-        return False
+                del self.processes[bot_id]
+                
+                if bot_id in bot_start_times:
+                    del bot_start_times[bot_id]
+                
+                self.add_log(bot_id, 'info', 'Bot stopped')
+                
+            except Exception as e:
+                logger.error(f"Error stopping bot {bot_id}: {e}")
+                self.add_log(bot_id, 'error', f'Error stopping: {str(e)}')
+        
+        bot['status'] = 'stopped'
+        bot['cpu'] = 0
+        bot['memory'] = 0
+        bot['uptime'] = '0s'
+        await self.broadcast_bot_update(bot_id)
+        
+        logger.info(f"Stopped bot: {bot_id}")
+        return True
     
-    async def send_command_to_client(self, client_id: str, command: dict) -> bool:
-        """Send command to specific client (laptop)"""
-        if client_id in self.client_connections:
-            await sio.emit('bot_command', command, room=self.client_connections[client_id])
-            return True
-        return False
+    async def restart_bot(self, bot_id: str) -> bool:
+        """Restart a bot"""
+        self.add_log(bot_id, 'info', 'Restarting bot...')
+        await self.stop_bot(bot_id)
+        await asyncio.sleep(2)
+        return await self.start_bot(bot_id)
+    
+    async def delete_bot(self, bot_id: str) -> bool:
+        """Delete a bot"""
+        # Stop if running
+        await self.stop_bot(bot_id)
+        
+        # Remove directory
+        bot_dir = os.path.join(BOTS_DIR, bot_id)
+        if os.path.exists(bot_dir):
+            shutil.rmtree(bot_dir)
+        
+        # Remove from registry
+        if bot_id in self.bots:
+            del self.bots[bot_id]
+        
+        if bot_id in bot_logs:
+            del bot_logs[bot_id]
+        
+        logger.info(f"Deleted bot: {bot_id}")
+        return True
+    
+    def add_log(self, bot_id: str, level: str, message: str):
+        """Add a log entry for a bot"""
+        if bot_id not in bot_logs:
+            bot_logs[bot_id] = []
+        
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'level': level,
+            'message': message
+        }
+        
+        bot_logs[bot_id].append(log_entry)
+        
+        # Keep only last 200 logs
+        if len(bot_logs[bot_id]) > 200:
+            bot_logs[bot_id] = bot_logs[bot_id][-200:]
+        
+        # Broadcast log update
+        asyncio.create_task(sio.emit('bot_log', {
+            'bot_id': bot_id,
+            'log': log_entry
+        }))
+    
+    async def _read_process_logs(self, bot_id: str, process: subprocess.Popen):
+        """Read logs from bot process"""
+        try:
+            while True:
+                if process.poll() is not None:
+                    # Process ended
+                    if bot_id in self.bots:
+                        self.bots[bot_id]['status'] = 'stopped'
+                        await self.broadcast_bot_update(bot_id)
+                    break
+                
+                line = process.stdout.readline()
+                if line:
+                    self.add_log(bot_id, 'info', line.strip())
+                else:
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error reading logs for {bot_id}: {e}")
+    
+    async def broadcast_bot_update(self, bot_id: str):
+        """Broadcast bot update to all clients"""
+        if bot_id in self.bots:
+            await self.update_bot_metrics(bot_id)
+            bot = self.bots[bot_id]
+            
+            await sio.emit('bot_update', {
+                'bot': bot,
+                'timestamp': datetime.now().isoformat()
+            })
     
     def get_all_bots(self) -> List[dict]:
-        """Get all bots data"""
-        return list(bots_registry.values())
+        """Get all bots"""
+        return list(self.bots.values())
     
-    def get_bot_stats(self) -> dict:
-        """Get overall bot statistics"""
-        total = len(bots_registry)
-        running = sum(1 for b in bots_registry.values() if b.get('status') == 'running')
-        stopped = sum(1 for b in bots_registry.values() if b.get('status') == 'stopped')
-        error = sum(1 for b in bots_registry.values() if b.get('status') == 'error')
+    def get_stats(self) -> dict:
+        """Get overall stats"""
+        total = len(self.bots)
+        running = sum(1 for b in self.bots.values() if b.get('status') == 'running')
+        stopped = sum(1 for b in self.bots.values() if b.get('status') == 'stopped')
         
-        total_cpu = sum(b.get('cpu', 0) for b in bots_registry.values())
-        total_memory = sum(b.get('memory', 0) for b in bots_registry.values())
+        total_cpu = sum(b.get('cpu', 0) for b in self.bots.values())
+        total_memory = sum(b.get('memory', 0) for b in self.bots.values())
         
         return {
-            'total': total,
-            'running': running,
-            'stopped': stopped,
-            'error': error,
-            'total_cpu': total_cpu,
-            'total_memory': total_memory
+            'total_bots': total,
+            'running_bots': running,
+            'stopped_bots': stopped,
+            'total_cpu': round(total_cpu, 1),
+            'total_memory': round(total_memory, 1)
         }
 
 # Initialize bot manager
 manager = BotManager()
 
+# Background task to update metrics
+async def update_metrics_loop():
+    """Periodically update bot metrics"""
+    while True:
+        try:
+            for bot_id in list(manager.bots.keys()):
+                if manager.bots[bot_id].get('status') == 'running':
+                    await manager.update_bot_metrics(bot_id)
+                    await manager.broadcast_bot_update(bot_id)
+            
+            await asyncio.sleep(5)  # Update every 5 seconds
+        except Exception as e:
+            logger.error(f"Error in metrics loop: {e}")
+            await asyncio.sleep(5)
+
 # Socket.IO events
 @sio.event
 async def connect(sid, environ):
+    """Handle client connection"""
     logger.info(f"Client connected: {sid}")
+    
+    # Send current state
     await sio.emit('welcome', {
-        'message': 'Connected to Discord Bot Hosting Server',
+        'message': 'Connected to xotiicBotHosting Server',
         'server_time': datetime.now().isoformat(),
         'sid': sid
+    }, room=sid)
+    
+    # Send all bots
+    await sio.emit('bots_list', {
+        'bots': manager.get_all_bots(),
+        'stats': manager.get_stats()
     }, room=sid)
 
 @sio.event
 async def disconnect(sid):
+    """Handle client disconnect"""
     logger.info(f"Client disconnected: {sid}")
-    # Find and remove disconnected client
-    client_id = client_connections.get(sid)
-    if client_id:
-        await manager.unregister_client(client_id)
-        logger.info(f"Client disconnected: {client_id}")
-    elif sid in client_connections:
-        del client_connections[sid]
 
-@sio.event
-async def register_client(sid, data):
-    """Register a new client (laptop)"""
-    client_id = data.get('client_id', str(uuid.uuid4()))
-    client_info = {
-        'ip': data.get('ip', 'unknown'),
-        'platform': data.get('platform', 'unknown'),
-        'version': data.get('version', '1.0.0')
-    }
-    await manager.register_client(client_id, sid, client_info)
-
-@sio.event
-async def bot_status_update(sid, data):
-    """Update bot status from client"""
-    await manager.update_bot_status(data)
-
-@sio.event
-async def bot_heartbeat(sid, data):
-    """Receive heartbeat from client"""
-    client_id = client_connections.get(sid)
-    if client_id and client_id in connected_clients:
-        connected_clients[client_id]['last_seen'] = datetime.now().isoformat()
-        connected_clients[client_id]['bot_count'] = data.get('bot_count', 0)
-    
-    # Acknowledge heartbeat
-    await sio.emit('heartbeat_ack', {
-        'timestamp': datetime.now().isoformat()
-    }, room=sid)
-
-@sio.event
-async def bot_log_update(sid, data):
-    """Receive log update from bot"""
-    bot_id = data.get('bot_id')
-    log_entry = data.get('log')
-    
-    if bot_id and log_entry:
-        bot_logs.setdefault(bot_id, []).append({
-            'timestamp': datetime.now().isoformat(),
-            'level': log_entry.get('level', 'info'),
-            'message': log_entry.get('message', ''),
-            'source': 'bot'
-        })
-        
-        # Broadcast to all clients monitoring this bot
-        await sio.emit('bot_log', {
-            'bot_id': bot_id,
-            'log': log_entry
-        })
-
-# Bot control events
 @sio.event
 async def start_bot(sid, data):
-    """Request to start a bot"""
+    """Start a bot"""
     bot_id = data.get('bot_id')
-    if bot_id in bots_registry:
-        bot = bots_registry[bot_id]
-        client_id = bot.get('client_id')
-        
-        if client_id:
-            # Send command to client
-            await manager.send_command_to_client(client_id, {
-                'action': 'start',
-                'bot_id': bot_id,
-                'timestamp': datetime.now().isoformat()
-            })
+    if bot_id:
+        success = await manager.start_bot(bot_id)
+        if success:
+            await sio.emit('bot_started', {'bot_id': bot_id}, room=sid)
         else:
-            # Start locally if no client assigned
-            await manager.start_bot_process(bot_id)
+            await sio.emit('error', {'message': 'Failed to start bot', 'bot_id': bot_id}, room=sid)
 
 @sio.event
 async def stop_bot(sid, data):
-    """Request to stop a bot"""
+    """Stop a bot"""
     bot_id = data.get('bot_id')
-    if bot_id in bots_registry:
-        bot = bots_registry[bot_id]
-        client_id = bot.get('client_id')
-        
-        if client_id:
-            # Send command to client
-            await manager.send_command_to_client(client_id, {
-                'action': 'stop',
-                'bot_id': bot_id,
-                'timestamp': datetime.now().isoformat()
-            })
+    if bot_id:
+        success = await manager.stop_bot(bot_id)
+        if success:
+            await sio.emit('bot_stopped', {'bot_id': bot_id}, room=sid)
         else:
-            # Stop locally if no client assigned
-            await manager.stop_bot_process(bot_id)
+            await sio.emit('error', {'message': 'Failed to stop bot', 'bot_id': bot_id}, room=sid)
 
 @sio.event
 async def restart_bot(sid, data):
-    """Request to restart a bot"""
+    """Restart a bot"""
     bot_id = data.get('bot_id')
-    if bot_id in bots_registry:
-        bot = bots_registry[bot_id]
-        client_id = bot.get('client_id')
-        
-        if client_id:
-            # Send command to client
-            await manager.send_command_to_client(client_id, {
-                'action': 'restart',
-                'bot_id': bot_id,
-                'timestamp': datetime.now().isoformat()
-            })
+    if bot_id:
+        success = await manager.restart_bot(bot_id)
+        if success:
+            await sio.emit('bot_restarted', {'bot_id': bot_id}, room=sid)
+        else:
+            await sio.emit('error', {'message': 'Failed to restart bot', 'bot_id': bot_id}, room=sid)
 
 @sio.event
 async def deploy_bot(sid, data):
-    """Handle new bot deployment request"""
-    bot_name = data.get('name', 'New Bot')
+    """Deploy a new bot"""
+    name = data.get('name', 'New Bot')
     bot_type = data.get('type', 'python')
     token = data.get('token', '')
     code = data.get('code', '')
-    client_id = data.get('client_id')
     
-    if not client_id:
-        # Assign to client with least bots
-        if connected_clients:
-            client_id = min(connected_clients.keys(), 
-                          key=lambda x: connected_clients[x].get('bot_count', 0))
-    
-    if client_id and client_id in connected_clients:
-        bot_id = str(uuid.uuid4())
-        
-        # Create bot entry
-        bots_registry[bot_id] = {
-            'id': bot_id,
-            'name': bot_name,
-            'status': 'deploying',
-            'client_id': client_id,
-            'created_at': datetime.now().isoformat(),
-            'last_updated': datetime.now().isoformat(),
-            'type': bot_type,
-            'cpu': 0,
-            'memory': 0,
-            'uptime': '0',
-            'logs': [],
-            'config': {
-                'has_token': bool(token),
-                'code_provided': bool(code)
-            }
-        }
-        
-        # Send deployment command to client
-        success = await manager.send_command_to_client(client_id, {
-            'action': 'deploy',
-            'bot_id': bot_id,
-            'bot_data': {
-                'name': bot_name,
-                'type': bot_type,
-                'token': token,
-                'code': code
-            },
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        if success:
-            await sio.emit('bot_deployed', {
-                'bot_id': bot_id,
-                'message': 'Bot deployment started',
-                'client_id': client_id
-            }, room=sid)
-        else:
-            await sio.emit('deployment_error', {
-                'error': 'Failed to send deployment command to client',
-                'bot_id': bot_id
-            }, room=sid)
-    else:
-        await sio.emit('deployment_error', {
-            'error': 'No connected clients available',
-            'bot_id': None
-        }, room=sid)
-
-# Mount Socket.IO app
-socket_app = socketio.ASGIApp(sio, app)
-
-# WebSocket endpoint for direct communication
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_websockets.add(websocket)
+    if not token:
+        await sio.emit('error', {'message': 'Bot token is required'}, room=sid)
+        return
     
     try:
-        while True:
-            data = await websocket.receive_json()
-            # Handle WebSocket messages if needed
-            await websocket.send_json({
-                "status": "received", 
-                "data": data,
-                "timestamp": datetime.now().isoformat()
-            })
-    except WebSocketDisconnect:
-        active_websockets.remove(websocket)
-        logger.info("WebSocket disconnected")
+        bot_id = await manager.create_bot_entry(name, bot_type, token, code)
+        
+        # Broadcast new bot
+        await sio.emit('bot_deployed', {
+            'bot_id': bot_id,
+            'bot': manager.bots[bot_id],
+            'message': 'Bot deployed successfully'
+        })
+        
+        # Optionally auto-start
+        # await manager.start_bot(bot_id)
+        
+    except Exception as e:
+        logger.error(f"Error deploying bot: {e}")
+        await sio.emit('error', {'message': f'Failed to deploy bot: {str(e)}'}, room=sid)
 
-# REST API endpoints
+@sio.event
+async def get_bots(sid, data):
+    """Get all bots"""
+    await sio.emit('bots_list', {
+        'bots': manager.get_all_bots(),
+        'stats': manager.get_stats()
+    }, room=sid)
+
+# Create Socket.IO ASGI app
+socket_app = socketio.ASGIApp(
+    sio,
+    other_asgi_app=app,
+    socketio_path='socket.io'
+)
+
+# REST API Endpoints
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
-        "message": "Discord Bot Hosting API",
+        "name": "xotiicBotHosting API",
+        "version": "2.0.0",
         "status": "online",
-        "version": "1.0.0",
         "timestamp": datetime.now().isoformat(),
         "endpoints": {
-            "bots": "/api/bots",
-            "system_stats": "/api/system/stats",
-            "clients": "/api/clients",
-            "health": "/api/health",
+            "api": "/api",
             "docs": "/docs",
-            "redoc": "/redoc"
+            "health": "/api/health"
         }
     }
 
+@app.get("/api/health")
+async def health_check():
+    """Health check"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "bots": len(manager.bots),
+        "running": sum(1 for b in manager.bots.values() if b.get('status') == 'running')
+    }
+
 @app.get("/api/bots")
-async def get_bots(status: Optional[str] = None):
-    """Get all bots, optionally filtered by status"""
-    bots = manager.get_all_bots()
-    
-    if status:
-        bots = [bot for bot in bots if bot.get('status') == status]
-    
-    return JSONResponse({
-        'bots': bots,
-        'total': len(bots),
-        'stats': manager.get_bot_stats(),
-        'timestamp': datetime.now().isoformat()
-    })
+async def get_bots_api():
+    """Get all bots via REST API"""
+    return {
+        "bots": manager.get_all_bots(),
+        "stats": manager.get_stats(),
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.get("/api/bot/{bot_id}")
 async def get_bot(bot_id: str):
-    """Get specific bot details"""
-    if bot_id in bots_registry:
-        bot = bots_registry[bot_id].copy()
-        bot['logs'] = bot_logs.get(bot_id, [])[-50:]  # Last 50 logs
+    """Get specific bot"""
+    if bot_id in manager.bots:
+        bot = manager.bots[bot_id].copy()
+        bot['logs'] = bot_logs.get(bot_id, [])[-50:]
         return bot
     raise HTTPException(status_code=404, detail="Bot not found")
 
 @app.get("/api/bot/{bot_id}/logs")
-async def get_bot_logs(bot_id: str, limit: int = 100):
+async def get_bot_logs_api(bot_id: str, limit: int = 100):
     """Get bot logs"""
     if bot_id in bot_logs:
-        logs = bot_logs[bot_id][-limit:] if limit > 0 else bot_logs[bot_id]
-        return {'logs': logs, 'total': len(logs)}
-    return {'logs': [], 'total': 0}
+        logs = bot_logs[bot_id][-limit:]
+        return {"logs": logs, "total": len(logs)}
+    return {"logs": [], "total": 0}
+
+@app.post("/api/bot/start/{bot_id}")
+async def start_bot_api(bot_id: str):
+    """Start bot via API"""
+    success = await manager.start_bot(bot_id)
+    if success:
+        return {"message": "Bot started", "bot_id": bot_id}
+    raise HTTPException(status_code=500, detail="Failed to start bot")
+
+@app.post("/api/bot/stop/{bot_id}")
+async def stop_bot_api(bot_id: str):
+    """Stop bot via API"""
+    success = await manager.stop_bot(bot_id)
+    if success:
+        return {"message": "Bot stopped", "bot_id": bot_id}
+    raise HTTPException(status_code=500, detail="Failed to stop bot")
+
+@app.post("/api/bot/restart/{bot_id}")
+async def restart_bot_api(bot_id: str):
+    """Restart bot via API"""
+    success = await manager.restart_bot(bot_id)
+    if success:
+        return {"message": "Bot restarted", "bot_id": bot_id}
+    raise HTTPException(status_code=500, detail="Failed to restart bot")
 
 @app.delete("/api/bot/{bot_id}")
-async def delete_bot(bot_id: str):
-    """Delete a bot"""
-    if bot_id in bots_registry:
-        # Stop bot if running
-        await manager.stop_bot_process(bot_id)
-        
-        # Remove from registry
-        del bots_registry[bot_id]
-        
-        # Remove logs
-        if bot_id in bot_logs:
-            del bot_logs[bot_id]
-        
-        return {"message": "Bot deleted successfully", "bot_id": bot_id}
+async def delete_bot_api(bot_id: str):
+    """Delete bot via API"""
+    success = await manager.delete_bot(bot_id)
+    if success:
+        return {"message": "Bot deleted", "bot_id": bot_id}
     raise HTTPException(status_code=404, detail="Bot not found")
 
 @app.post("/api/upload")
 async def upload_bot(
     file: UploadFile = File(...),
     name: str = Form(...),
-    token: str = Form(None),
+    token: str = Form(...),
     bot_type: str = Form("python")
 ):
-    """Handle bot file upload"""
+    """Upload bot files"""
     try:
-        # Generate unique ID
-        upload_id = str(uuid.uuid4())
+        bot_id = str(uuid.uuid4())
+        bot_dir = os.path.join(BOTS_DIR, bot_id)
+        os.makedirs(bot_dir, exist_ok=True)
         
-        # Save file
-        filename = f"{upload_id}_{file.filename}"
-        filepath = os.path.join(UPLOAD_DIR, filename)
+        # Save uploaded file
+        file_path = os.path.join(bot_dir, file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
         
-        with open(filepath, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Extract if zip
+        if file.filename.endswith('.zip'):
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                zip_ref.extractall(bot_dir)
+            os.remove(file_path)
         
         # Create bot entry
-        bot_id = str(uuid.uuid4())
-        bots_registry[bot_id] = {
-            'id': bot_id,
-            'name': name,
-            'status': 'uploaded',
-            'client_id': None,
-            'created_at': datetime.now().isoformat(),
-            'type': bot_type,
-            'cpu': 0,
-            'memory': 0,
-            'uptime': '0',
-            'file_path': filepath,
-            'original_filename': file.filename,
-            'config': {
-                'has_token': bool(token),
-                'uploaded': True
-            }
-        }
+        bot_id = await manager.create_bot_entry(name, bot_type, token)
         
-        # Broadcast new bot
-        await sio.emit('bot_update', {
-            'bot': bots_registry[bot_id],
-            'total_bots': len(bots_registry)
+        await sio.emit('bot_deployed', {
+            'bot_id': bot_id,
+            'bot': manager.bots[bot_id]
         })
         
         return {
-            'success': True,
-            'message': 'Bot uploaded successfully',
-            'bot_id': bot_id,
-            'filename': filename,
-            'url': f'/uploads/{filename}',
-            'upload_id': upload_id
+            "success": True,
+            "bot_id": bot_id,
+            "message": "Bot uploaded successfully"
         }
+        
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -671,148 +733,54 @@ async def upload_bot(
 @app.get("/api/system/stats")
 async def system_stats():
     """Get system statistics"""
-    total_bots = len(bots_registry)
-    running_bots = sum(1 for b in bots_registry.values() if b.get('status') == 'running')
-    
-    # Calculate resource usage
-    total_cpu = sum(b.get('cpu', 0) for b in bots_registry.values())
-    total_memory = sum(b.get('memory', 0) for b in bots_registry.values())
-    
-    # Get server stats
-    cpu_percent = psutil.cpu_percent()
+    cpu_percent = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
     
     return {
-        'bots': {
-            'total': total_bots,
-            'running': running_bots,
-            'stopped': total_bots - running_bots,
-            'total_cpu': total_cpu,
-            'total_memory': total_memory
+        "bots": manager.get_stats(),
+        "system": {
+            "cpu": round(cpu_percent, 1),
+            "memory": {
+                "total": round(memory.total / (1024**3), 2),
+                "used": round(memory.used / (1024**3), 2),
+                "percent": round(memory.percent, 1)
+            }
         },
-        'clients': {
-            'total': len(connected_clients),
-            'list': list(connected_clients.keys())
-        },
-        'server': {
-            'cpu': cpu_percent,
-            'memory': {
-                'total': memory.total / (1024**3),  # GB
-                'used': memory.used / (1024**3),
-                'percent': memory.percent
-            },
-            'uptime': time.time() - psutil.boot_time(),
-            'timestamp': datetime.now().isoformat()
-        },
-        'connections': {
-            'websocket': len(active_websockets),
-            'socketio': len(client_connections),
-            'total': len(active_websockets) + len(client_connections)
-        }
+        "timestamp": datetime.now().isoformat()
     }
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "bots": len(bots_registry),
-        "clients": len(connected_clients),
-        "uptime": time.time() - psutil.boot_time()
-    }
-
-@app.get("/api/clients")
-async def get_clients():
-    """Get connected clients"""
-    clients_list = []
-    
-    for client_id, client_data in connected_clients.items():
-        client_info = {
-            "id": client_id,
-            "connected_at": client_data.get("connected_at"),
-            "last_seen": client_data.get("last_seen"),
-            "bot_count": client_data.get("bot_count", 0),
-            "platform": client_data.get("platform", "unknown"),
-            "sid": client_data.get("sid", "unknown")[:8] + "..."
-        }
-        
-        # Calculate if client is active (seen in last 60 seconds)
-        last_seen = datetime.fromisoformat(client_data.get("last_seen", datetime.now().isoformat()))
-        client_info["active"] = (datetime.now() - last_seen).total_seconds() < 60
-        
-        clients_list.append(client_info)
-    
-    return {
-        "clients": clients_list,
-        "total": len(clients_list),
-        "active": sum(1 for c in clients_list if c.get("active", False))
-    }
-
-@app.get("/api/download/{bot_id}")
-async def download_bot_files(bot_id: str):
-    """Download bot files"""
-    if bot_id in bots_registry:
-        bot = bots_registry[bot_id]
-        file_path = bot.get('file_path')
-        
-        if file_path and os.path.exists(file_path):
-            return FileResponse(
-                path=file_path,
-                filename=bot.get('original_filename', 'bot_files.zip'),
-                media_type='application/octet-stream'
-            )
-    
-    raise HTTPException(status_code=404, detail="Bot files not found")
-
-# Cleanup task for inactive clients
-async def cleanup_inactive_clients():
-    """Periodically clean up inactive clients"""
-    while True:
-        await asyncio.sleep(60)  # Run every minute
-        
-        now = datetime.now()
-        inactive_clients = []
-        
-        for client_id, client_data in connected_clients.items():
-            last_seen = datetime.fromisoformat(client_data.get("last_seen", datetime.now().isoformat()))
-            
-            # If client hasn't been seen in 5 minutes, mark as inactive
-            if (now - last_seen).total_seconds() > 300:  # 5 minutes
-                inactive_clients.append(client_id)
-        
-        # Remove inactive clients
-        for client_id in inactive_clients:
-            logger.warning(f"Removing inactive client: {client_id}")
-            await manager.unregister_client(client_id)
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     """Startup tasks"""
-    logger.info("Starting Discord Bot Hosting Server")
-    
-    # Start cleanup task
-    asyncio.create_task(cleanup_inactive_clients())
-    
-    logger.info(f"Server started at {datetime.now().isoformat()}")
+    logger.info("=" * 60)
+    logger.info("xotiicBotHosting Server Starting")
+    logger.info("=" * 60)
     logger.info(f"Upload directory: {UPLOAD_DIR}")
     logger.info(f"Bots directory: {BOTS_DIR}")
     logger.info(f"Logs directory: {LOGS_DIR}")
+    
+    # Start metrics update loop
+    asyncio.create_task(update_metrics_loop())
+    
+    logger.info("Server ready!")
+    logger.info("=" * 60)
 
 # Shutdown event
 @app.on_event("shutdown")
 async def shutdown_event():
     """Shutdown tasks"""
-    logger.info("Shutting down Discord Bot Hosting Server")
+    logger.info("Shutting down server...")
     
-    # Stop all running bots
-    for bot_id in list(bot_processes.keys()):
-        await manager.stop_bot_process(bot_id)
+    # Stop all bots
+    for bot_id in list(manager.bots.keys()):
+        await manager.stop_bot(bot_id)
     
     logger.info("Server shutdown complete")
 
-# For Render deployment
+# Export the socket_app for deployment
+application = socket_app
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -822,9 +790,9 @@ if __name__ == "__main__":
     logger.info(f"Starting server on {host}:{port}")
     
     uvicorn.run(
-        "main:app",
+        socket_app,
         host=host,
         port=port,
-        reload=False,  # Set to True for development
-        log_level="info"
+        log_level="info",
+        access_log=True
     )
