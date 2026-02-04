@@ -503,6 +503,77 @@ async def update_metrics_loop():
             logger.error(f"Error in metrics loop: {e}")
             await asyncio.sleep(5)
 
+import yaml  # Add to imports at the top
+
+# Add this class to handle config files
+class BotConfig:
+    @staticmethod
+    def parse_config(content: str) -> dict:
+        """Parse config file content in Discloud-like format"""
+        config = {}
+        
+        for line in content.strip().split('\n'):
+            if '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Handle special cases
+                if key in ['APT', 'AVATAR', 'MAIN', 'NAME', 'RUNTIME', 'TYPE', 'VERSION']:
+                    config[key] = value
+                elif key in ['AUTORESTART']:
+                    config[key] = value.lower() == 'true'
+                elif key in ['ID', 'RAM']:
+                    try:
+                        config[key] = int(value)
+                    except:
+                        config[key] = value
+        
+        return config
+    
+    @staticmethod
+    def create_default_config(bot_info: dict) -> str:
+        """Create a default config file"""
+        config = f"""APT=tools
+AUTORESTART=false
+AVATAR=https://imgur.com/a/PTTtQni.png
+ID={bot_info.get('id', str(int(time.time() * 1000)))}
+MAIN=bot.py
+NAME={bot_info.get('name', 'New Bot')}
+RAM={bot_info.get('ram', 100)}
+RUNTIME={bot_info.get('runtime', 'python==3.12.*')}
+TYPE=bot
+VERSION=latest
+"""
+        return config
+    
+    @staticmethod
+    def create_config_from_type(bot_type: str, name: str, token: str = None) -> dict:
+        """Create config based on bot type"""
+        config = {
+            'APT': 'tools',
+            'AUTORESTART': False,
+            'AVATAR': '',
+            'ID': str(int(time.time() * 1000)),
+            'NAME': name,
+            'RAM': 100,
+            'TYPE': 'bot',
+            'VERSION': 'latest'
+        }
+        
+        if bot_type == 'python':
+            config.update({
+                'MAIN': 'bot.py',
+                'RUNTIME': 'python==3.12.*'
+            })
+        elif bot_type == 'nodejs':
+            config.update({
+                'MAIN': 'bot.js',
+                'RUNTIME': 'node==20.*'
+            })
+        
+        return config
+
 # Socket.IO events
 @sio.event
 async def connect(sid, environ):
@@ -693,18 +764,48 @@ async def upload_bot(
     file: UploadFile = File(...),
     name: str = Form(...),
     token: str = Form(...),
-    bot_type: str = Form("python")
+    bot_type: str = Form("python"),
+    config_file: UploadFile = File(None)
 ):
-    """Upload bot files"""
+    """Upload bot files with optional config file"""
     try:
         bot_id = str(uuid.uuid4())
         bot_dir = os.path.join(BOTS_DIR, bot_id)
         os.makedirs(bot_dir, exist_ok=True)
         
+        # Process config file if provided
+        config_content = None
+        if config_file:
+            config_content = await config_file.read()
+            config_content = config_content.decode('utf-8')
+            config = BotConfig.parse_config(config_content)
+            
+            # Use config values if available
+            if 'NAME' in config:
+                name = config['NAME']
+            if 'MAIN' in config:
+                main_file = config['MAIN']
+            if 'RUNTIME' in config:
+                runtime = config['RUNTIME']
+                if 'python' in runtime.lower():
+                    bot_type = 'python'
+                elif 'node' in runtime.lower():
+                    bot_type = 'nodejs'
+        
         # Save uploaded file
         file_path = os.path.join(bot_dir, file.filename)
         with open(file_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
+        
+        # Create config file if not provided
+        if not config_content:
+            config = BotConfig.create_config_from_type(bot_type, name, token)
+            config_content = "\n".join([f"{k}={v}" for k, v in config.items()])
+        
+        # Save config file
+        config_path = os.path.join(bot_dir, 'config.txt')
+        with open(config_path, 'w') as f:
+            f.write(config_content)
         
         # Extract if zip
         if file.filename.endswith('.zip'):
@@ -715,6 +816,10 @@ async def upload_bot(
         # Create bot entry
         bot_id = await manager.create_bot_entry(name, bot_type, token)
         
+        # Update bot with config info
+        if bot_id in manager.bots:
+            manager.bots[bot_id]['config'] = config
+        
         await sio.emit('bot_deployed', {
             'bot_id': bot_id,
             'bot': manager.bots[bot_id]
@@ -723,7 +828,8 @@ async def upload_bot(
         return {
             "success": True,
             "bot_id": bot_id,
-            "message": "Bot uploaded successfully"
+            "message": "Bot uploaded successfully",
+            "config": config
         }
         
     except Exception as e:
@@ -796,3 +902,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
