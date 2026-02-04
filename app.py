@@ -511,13 +511,33 @@ async def worker_heartbeat(sid, data):
             'workers': list(connected_workers.values())
         })
 
+# Update the get_bots handler
 @sio.event
-async def get_bots(sid, data):
+async def get_bots(sid, data=None):
     """Get all bots"""
     await sio.emit('bots_list', {
         'bots': manager.get_all_bots(),
         'stats': manager.get_stats()
     }, room=sid)
+
+# Add get_laptops handler
+@sio.event
+async def get_laptops(sid, data=None):
+    """Get all workers/laptops"""
+    await sio.emit('laptops_list', {
+        'laptops': list(connected_workers.values()),
+        'count': len(connected_workers)
+    }, room=sid)
+
+# Add /api/laptops REST endpoint
+@app.get("/api/laptops")
+async def get_laptops_api():
+    """Get all connected laptops (alias for workers)"""
+    return {
+        "laptops": list(connected_workers.values()),
+        "count": len(connected_workers),
+        "timestamp": datetime.now().isoformat()
+    }
 
 @sio.event
 async def start_bot(sid, data):
@@ -767,3 +787,4 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
