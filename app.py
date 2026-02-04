@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 import socketio
 import asyncio
@@ -32,7 +31,7 @@ app = FastAPI(
     description="Premium Discord Bot Hosting Platform Backend"
 )
 
-# CORS middleware - Allow all origins for development
+# CORS configuration for Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,33 +46,24 @@ sio = socketio.AsyncServer(
     cors_allowed_origins='*',
     ping_timeout=120,
     ping_interval=30,
-    logger=True,
+    logger=False,
     engineio_logger=False
 )
 
-# Create necessary directories
-UPLOAD_DIR = "uploads"
-BOTS_DIR = "bots"
-LOGS_DIR = "logs"
-STATIC_DIR = "static"
+# For Vercel, use /tmp directory for file storage
+UPLOAD_DIR = "/tmp/uploads"
+BOTS_DIR = "/tmp/bots"
+LOGS_DIR = "/tmp/logs"
 
-for directory in [UPLOAD_DIR, BOTS_DIR, LOGS_DIR, STATIC_DIR]:
-    Path(directory).mkdir(exist_ok=True)
+for directory in [UPLOAD_DIR, BOTS_DIR, LOGS_DIR]:
+    Path(directory).mkdir(parents=True, exist_ok=True)
 
-# Mount static files
-try:
-    app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-    app.mount("/bots", StaticFiles(directory=BOTS_DIR), name="bots")
-except Exception as e:
-    logger.warning(f"Could not mount static directories: {e}")
-
-# In-memory storage
+# In-memory storage (Vercel serverless functions are stateless)
 connected_clients: Dict[str, dict] = {}
 connected_workers: Dict[str, dict] = {}
 bots_registry: Dict[str, dict] = {}
 bot_processes: Dict[str, subprocess.Popen] = {}
 bot_logs: Dict[str, List[dict]] = {}
-client_connections: Dict[str, str] = {}
 
 # Track bot start times for uptime calculation
 bot_start_times: Dict[str, datetime] = {}
@@ -301,18 +291,6 @@ client.login('{bot.get('token', 'YOUR_TOKEN_HERE')}');
                 with open(os.path.join(bot_dir, 'package.json'), 'w') as f:
                     json.dump(package_json, f, indent=2)
                 
-                # Install dependencies
-                npm_install = subprocess.run(
-                    ['npm', 'install'],
-                    cwd=bot_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                
-                if npm_install.returncode != 0:
-                    logger.error(f"npm install failed: {npm_install.stderr}")
-                
                 # Start the process
                 process = subprocess.Popen(
                     ['node', bot_file],
@@ -459,18 +437,6 @@ client.login('{bot.get('token', 'YOUR_TOKEN_HERE')}');
 
 # Initialize bot manager
 manager = BotManager()
-
-# Metrics update loop
-async def update_metrics_loop():
-    """Periodically update bot metrics"""
-    while True:
-        try:
-            for bot_id in list(manager.bots.keys()):
-                await manager.update_bot_metrics(bot_id)
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"Error in metrics loop: {e}")
-            await asyncio.sleep(5)
 
 # Socket.IO Event Handlers
 @sio.event
@@ -729,101 +695,62 @@ async def delete_bot_api(bot_id: str):
         return {"message": "Bot deleted", "bot_id": bot_id}
     raise HTTPException(status_code=404, detail="Bot not found")
 
-@app.post("/api/upload")
-async def upload_bot(
-    file: UploadFile = File(...),
-    name: str = Form(...),
-    token: str = Form(...),
-    bot_type: str = Form("python")
-):
-    """Upload bot files"""
-    try:
-        bot_id = str(uuid.uuid4())
-        bot_dir = os.path.join(BOTS_DIR, bot_id)
-        os.makedirs(bot_dir, exist_ok=True)
-        
-        # Save uploaded file
-        file_path = os.path.join(bot_dir, file.filename)
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        
-        # Extract if zip
-        if file.filename.endswith('.zip'):
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                zip_ref.extractall(bot_dir)
-            os.remove(file_path)
-        
-        # Create bot entry
-        bot_id = await manager.create_bot_entry(name, bot_type, token)
-        
-        await sio.emit('bot_deployed', {
-            'bot_id': bot_id,
-            'bot': manager.bots[bot_id]
-        })
-        
-        return {
-            "success": True,
-            "bot_id": bot_id,
-            "message": "Bot uploaded successfully"
-        }
-        
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/system/stats")
 async def system_stats():
     """Get system statistics"""
-    cpu_percent = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory()
-    
-    return {
-        "bots": manager.get_stats(),
-        "workers": {
-            "connected": len(connected_workers),
-            "total_capacity": sum(w.get('max_bots', 10) for w in connected_workers.values())
-        },
-        "system": {
-            "cpu": round(cpu_percent, 1),
-            "memory": {
-                "total": round(memory.total / (1024**3), 2),
-                "used": round(memory.used / (1024**3), 2),
-                "percent": round(memory.percent, 1)
-            }
-        },
-        "timestamp": datetime.now().isoformat()
-    }
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        
+        return {
+            "bots": manager.get_stats(),
+            "workers": {
+                "connected": len(connected_workers),
+                "total_capacity": sum(w.get('max_bots', 10) for w in connected_workers.values())
+            },
+            "system": {
+                "cpu": round(cpu_percent, 1),
+                "memory": {
+                    "total": round(memory.total / (1024**3), 2),
+                    "used": round(memory.used / (1024**3), 2),
+                    "percent": round(memory.percent, 1)
+                }
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting system stats: {e}")
+        return {
+            "bots": manager.get_stats(),
+            "workers": {
+                "connected": len(connected_workers),
+                "total_capacity": sum(w.get('max_bots', 10) for w in connected_workers.values())
+            },
+            "system": {
+                "cpu": 0,
+                "memory": {
+                    "total": 0,
+                    "used": 0,
+                    "percent": 0
+                }
+            },
+            "timestamp": datetime.now().isoformat()
+        }
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     """Startup tasks"""
     logger.info("=" * 60)
-    logger.info("xotiicBotHosting Server Starting")
+    logger.info("xotiicBotHosting Server Starting on Vercel")
     logger.info("=" * 60)
     logger.info(f"Upload directory: {UPLOAD_DIR}")
     logger.info(f"Bots directory: {BOTS_DIR}")
     logger.info(f"Logs directory: {LOGS_DIR}")
-    
-    # Start metrics update loop
-    asyncio.create_task(update_metrics_loop())
-    
     logger.info("Server ready!")
     logger.info("=" * 60)
 
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown tasks"""
-    logger.info("Shutting down server...")
-    
-    # Stop all bots
-    for bot_id in list(manager.bots.keys()):
-        await manager.stop_bot(bot_id)
-    
-    logger.info("Server shutdown complete")
-
-# Export the socket_app for deployment
+# Export the socket_app for Vercel
 application = socket_app
 
 if __name__ == "__main__":
@@ -838,6 +765,5 @@ if __name__ == "__main__":
         socket_app,
         host=host,
         port=port,
-        log_level="info",
-        access_log=True
+        log_level="info"
     )
