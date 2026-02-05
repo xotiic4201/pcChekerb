@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: xotiicsverify-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: REDIRECT_URI
+        value: https://xotiicsverify-api.onrender.com/oauth/callback
+      - key: API_URL
+        value: https://xotiicsverify-api.onrender.com
+      - key: FRONTEND_URL
+        value: https://xotiicsverify.vercel.app
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: API_SECRET_KEY
+        generateValue: true
