@@ -986,8 +986,46 @@ async def get_verification_url(guild_id: str):
         "embed_code": f"[Verify Here]({verification_url})"
     }
 
+@app.get("/api/dashboard/server/{guild_id}/verification-link")
+async def get_verification_link(guild_id: str, user: Dict[str, Any] = Depends(verify_token)):
+    """Get verification URL for a specific guild (dashboard version)"""
+    try:
+        api_url = os.environ.get('API_URL', 'https://bot-hosting-b.onrender.com')
+        
+        # Create a state for this verification
+        state = secrets.token_urlsafe(32)
+        db.save_oauth_state(
+            state=state,
+            guild_id=guild_id,
+            user_id=user.get('sub')
+        )
+        
+        # Build verification URL
+        params = {
+            'client_id': oauth.client_id,
+            'redirect_uri': oauth.redirect_uri,
+            'response_type': 'code',
+            'scope': 'identify guilds guilds.join',
+            'state': state,
+            'prompt': 'none'
+        }
+        
+        verification_url = f"https://discord.com/api/oauth2/authorize?{urllib.parse.urlencode(params)}"
+        
+        return {
+            "success": True,
+            "verification_url": verification_url,
+            "embed_code": f"[Verify Here]({verification_url})",
+            "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(verification_url)}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating verification link: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate verification link")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting API server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
 
