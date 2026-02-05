@@ -1,6 +1,5 @@
-# api/api.py
 from fastapi import FastAPI, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
@@ -35,7 +34,7 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,16 +46,12 @@ security = HTTPBearer()
 # Initialize Supabase
 supabase_url = os.environ.get('SUPABASE_URL')
 supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-supabase: Optional[Client] = None
 
-if supabase_url and supabase_key:
-    try:
-        supabase = create_client(supabase_url, supabase_key)
-        logger.info("Supabase connected successfully")
-    except Exception as e:
-        logger.error(f"Failed to connect to Supabase: {e}")
-else:
-    logger.warning("Supabase credentials not found in environment")
+if not supabase_url or not supabase_key:
+    logger.error("Missing Supabase credentials!")
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
+
+supabase: Client = create_client(supabase_url, supabase_key)
 
 # Rate limiting storage
 rate_limit_cache = {}
@@ -65,14 +60,30 @@ class DatabaseManager:
     def __init__(self):
         self.cipher_key = os.environ.get('ENCRYPTION_KEY')
         if not self.cipher_key:
-            self.cipher_key = Fernet.generate_key()
-        self.cipher = Fernet(base64.urlsafe_b64encode(self.cipher_key.encode()[:32]))
+            self.cipher_key = base64.urlsafe_b64encode(Fernet.generate_key())
+            logger.warning("Generated new encryption key")
+        
+        # Ensure key is proper format
+        if isinstance(self.cipher_key, str):
+            self.cipher_key = self.cipher_key.encode()
+        
+        # Pad or truncate to 32 bytes
+        key = base64.urlsafe_b64encode(self.cipher_key[:32].ljust(32, b'0'))
+        self.cipher = Fernet(key)
     
     def _encrypt(self, data: str) -> str:
-        return self.cipher.encrypt(data.encode()).decode()
+        try:
+            return self.cipher.encrypt(data.encode()).decode()
+        except Exception as e:
+            logger.error(f"Encryption error: {e}")
+            raise
     
     def _decrypt(self, encrypted_data: str) -> str:
-        return self.cipher.decrypt(encrypted_data.encode()).decode()
+        try:
+            return self.cipher.decrypt(encrypted_data.encode()).decode()
+        except Exception as e:
+            logger.error(f"Decryption error: {e}")
+            raise
     
     def save_oauth_state(self, state: str, user_id: str = None, guild_id: str = None, redirect_url: str = None):
         try:
@@ -80,20 +91,16 @@ class DatabaseManager:
                 'state': state,
                 'user_id': user_id,
                 'guild_id': guild_id,
-                'redirect_url': redirect_url
+                'redirect_url': redirect_url,
+                'created_at': datetime.now().isoformat()
             }
-            if supabase:
-                supabase.table('oauth_states').insert(data).execute()
-            return True
+            supabase.table('oauth_states').insert(data).execute()
+            logger.info(f"Saved OAuth state: {state[:10]}... for guild {guild_id}")
         except Exception as e:
             logger.error(f"Error saving OAuth state: {e}")
-            return False
     
     def get_oauth_state(self, state: str) -> Optional[Dict[str, Any]]:
         try:
-            if not supabase:
-                return None
-                
             response = supabase.table('oauth_states')\
                 .select('*')\
                 .eq('state', state)\
@@ -106,10 +113,12 @@ class DatabaseManager:
                 
                 return {
                     'state': state_data['state'],
-                    'user_id': state_data['user_id'],
-                    'guild_id': state_data['guild_id'],
-                    'redirect_url': state_data['redirect_url']
+                    'user_id': state_data.get('user_id'),
+                    'guild_id': state_data.get('guild_id'),
+                    'redirect_url': state_data.get('redirect_url')
                 }
+            else:
+                logger.warning(f"OAuth state not found: {state[:10]}...")
         except Exception as e:
             logger.error(f"Error getting OAuth state: {e}")
         return None
@@ -126,104 +135,50 @@ class DatabaseManager:
                 'refresh_token': self._encrypt(refresh_token),
                 'expires_at': expires_at.isoformat(),
                 'guild_id': guild_id,
-                'metadata': metadata or {}
+                'metadata': metadata or {},
+                'verified_at': datetime.now().isoformat()
             }
             
-            if supabase:
-                supabase.table('verified_users').upsert(data, on_conflict='discord_id').execute()
-                logger.info(f"Added/updated verified user: {username} ({discord_id})")
-                return True
-        except Exception as e:
-            logger.error(f"Error adding verified user: {e}")
-        return False
-    
-    def get_user_servers(self, user_id: str) -> List[Dict[str, Any]]:
-        try:
-            if not supabase:
-                return []
-                
-            # Get servers owned by user
-            response = supabase.table('server_settings')\
-                .select('guild_id, settings')\
-                .eq('owner_id', user_id)\
-                .execute()
-            
-            servers = []
-            for server in response.data:
-                # Get verified count for each server
-                count_response = supabase.table('verified_users')\
-                    .select('id', count='exact')\
-                    .eq('guild_id', server['guild_id'])\
-                    .execute()
-                
-                servers.append({
-                    'guild_id': server['guild_id'],
-                    'settings': server.get('settings', {}),
-                    'verified_count': count_response.count or 0
-                })
-            return servers
-        except Exception as e:
-            logger.error(f"Error getting user servers: {e}")
-            return []
-    
-    def update_server_settings(self, guild_id: str, owner_id: str, settings: dict) -> bool:
-        try:
-            if not supabase:
-                return False
-                
-            data = {
-                'guild_id': guild_id,
-                'owner_id': owner_id,
-                'settings': settings
-            }
-            supabase.table('server_settings').upsert(data, on_conflict='guild_id').execute()
+            supabase.table('verified_users').upsert(data, on_conflict='discord_id,guild_id').execute()
+            logger.info(f"Added/updated verified user: {username} ({discord_id}) for guild {guild_id}")
             return True
         except Exception as e:
-            logger.error(f"Error updating server settings: {e}")
+            logger.error(f"Error adding verified user: {e}")
             return False
-
-db = DatabaseManager()
 
 class OAuthHandler:
     def __init__(self):
         self.client_id = os.environ.get('DISCORD_CLIENT_ID')
         self.client_secret = os.environ.get('DISCORD_CLIENT_SECRET')
-        self.redirect_uri = os.environ.get('REDIRECT_URI', '')
+        self.redirect_uri = os.environ.get('REDIRECT_URI')
         self.bot_token = os.environ.get('DISCORD_BOT_TOKEN')
-        self.api_url = os.environ.get('API_URL', '')
         
-        # Ensure redirect_uri is properly set
-        if not self.redirect_uri and self.api_url:
-            self.redirect_uri = f"{self.api_url}/api/auth/callback"
-        
-        logger.info(f"OAuth initialized - Client ID: {self.client_id}")
-        logger.info(f"Redirect URI: {self.redirect_uri}")
-        logger.info(f"API URL: {self.api_url}")
+        if not all([self.client_id, self.client_secret, self.redirect_uri]):
+            logger.error("Missing OAuth configuration!")
+            raise ValueError("OAuth credentials are required")
     
     async def exchange_code(self, code: str) -> Optional[Dict[str, Any]]:
         try:
-            # Use the instance redirect_uri
             data = {
                 'client_id': self.client_id,
                 'client_secret': self.client_secret,
                 'grant_type': 'authorization_code',
                 'code': code,
                 'redirect_uri': self.redirect_uri,
-                'scope': 'identify guilds'
+                'scope': 'identify guilds.join'
             }
             
-            logger.info(f"Exchanging code with redirect_uri: {self.redirect_uri}")
-            logger.info(f"Client ID: {self.client_id}")
+            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
             
             async with aiohttp.ClientSession() as session:
-                async with session.post('https://discord.com/api/oauth2/token', data=data) as resp:
-                    response_text = await resp.text()
-                    logger.info(f"Token exchange response: {resp.status} - {response_text[:100]}")
-                    
+                async with session.post('https://discord.com/api/oauth2/token', data=data, headers=headers) as resp:
                     if resp.status == 200:
-                        return await resp.json()
+                        result = await resp.json()
+                        logger.info("Successfully exchanged code for tokens")
+                        return result
                     else:
-                        logger.error(f"Token exchange failed: {resp.status} - {response_text}")
+                        error_text = await resp.text()
+                        logger.error(f"Token exchange failed: {resp.status} - {error_text}")
         except Exception as e:
             logger.error(f"Error exchanging code: {e}")
         return None
@@ -236,307 +191,388 @@ class OAuthHandler:
                     if resp.status == 200:
                         return await resp.json()
                     else:
-                        error_text = await resp.text()
-                        logger.error(f"Failed to get user info: {resp.status} - {error_text}")
+                        logger.error(f"Failed to get user info: {resp.status}")
         except Exception as e:
             logger.error(f"Error getting user info: {e}")
         return None
     
-    async def get_user_guilds(self, access_token: str) -> Optional[list]:
+    async def add_user_to_guild(self, access_token: str, user_id: str, guild_id: str) -> bool:
         try:
-            headers = {'Authorization': f'Bearer {access_token}'}
+            headers = {
+                'Authorization': f'Bot {self.bot_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            data = {
+                'access_token': access_token
+            }
+            
+            url = f'https://discord.com/api/guilds/{guild_id}/members/{user_id}'
+            
             async with aiohttp.ClientSession() as session:
-                async with session.get('https://discord.com/api/users/@me/guilds', headers=headers) as resp:
-                    if resp.status == 200:
-                        guilds = await resp.json()
-                        # Filter to guilds where user has admin permissions
-                        admin_guilds = [g for g in guilds if (g.get('permissions', 0) & 0x8) == 0x8]
-                        logger.info(f"Found {len(admin_guilds)} admin guilds out of {len(guilds)} total")
-                        return admin_guilds
+                async with session.put(url, headers=headers, json=data) as resp:
+                    if resp.status in [200, 201, 204]:
+                        logger.info(f"Successfully added user {user_id} to guild {guild_id}")
+                        return True
+                    elif resp.status == 403:
+                        logger.warning(f"Missing permissions to add user {user_id}")
+                        return False
                     else:
                         error_text = await resp.text()
-                        logger.error(f"Failed to get user guilds: {resp.status} - {error_text}")
+                        logger.error(f"Failed to add user: {resp.status} - {error_text}")
+                        return False
         except Exception as e:
-            logger.error(f"Error getting user guilds: {e}")
-        return None
+            logger.error(f"Error adding user to guild: {e}")
+            return False
 
+# Initialize handlers
+db = DatabaseManager()
 oauth = OAuthHandler()
-
-def rate_limit(request: Request, limit: int = 10, window: int = 60) -> bool:
-    """Simple rate limiting"""
-    client_ip = request.client.host
-    key = f"{client_ip}_{request.url.path}"
-    
-    current_time = datetime.now().timestamp()
-    window_start = current_time - window
-    
-    # Clean old entries
-    rate_limit_cache[key] = [
-        timestamp for timestamp in rate_limit_cache.get(key, [])
-        if timestamp > window_start
-    ]
-    
-    if len(rate_limit_cache[key]) >= limit:
-        return False
-    
-    rate_limit_cache[key].append(current_time)
-    return True
-
-def verify_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
-    """Verify API token"""
-    token = credentials.credentials
-    api_key = os.environ.get('API_SECRET_KEY')
-    
-    if token != api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token"
-        )
-    
-    return {"authenticated": True}
 
 @app.get("/")
 async def root():
-    return {
-        "status": "online",
-        "service": "xotiicsverify API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "supabase": "connected" if supabase else "disconnected",
-        "oauth_configured": bool(oauth.client_id and oauth.client_secret)
-    }
+    """Root endpoint"""
+    return HTMLResponse("""
+    <html>
+        <head>
+            <title>xotiicsverify API</title>
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    margin: 0;
+                }
+                .container {
+                    text-align: center;
+                    background: rgba(0, 0, 0, 0.3);
+                    padding: 40px;
+                    border-radius: 20px;
+                    backdrop-filter: blur(10px);
+                }
+                h1 { font-size: 3em; margin: 0; }
+                p { font-size: 1.2em; margin: 20px 0; }
+                .status { color: #4ade80; font-weight: bold; }
+                a { color: #60a5fa; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔐 xotiicsverify API</h1>
+                <p class="status">✅ Online and Running</p>
+                <p>Secure Discord verification system</p>
+                <p><a href="/docs">📚 API Documentation</a></p>
+            </div>
+        </body>
+    </html>
+    """)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        supabase.table('verified_users').select('id').limit(1).execute()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "service": "xotiicsverify API",
+            "database": "connected"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+@app.get("/oauth/authorize")
+async def oauth_authorize(guild_id: str, redirect_url: str = None):
+    """Start OAuth flow for user verification"""
+    try:
+        # Generate state
+        state = secrets.token_urlsafe(32)
+        
+        # Save state to database
+        db.save_oauth_state(
+            state=state,
+            guild_id=guild_id,
+            redirect_url=redirect_url
+        )
+        
+        # Build authorization URL
+        params = {
+            'client_id': oauth.client_id,
+            'redirect_uri': oauth.redirect_uri,
+            'response_type': 'code',
+            'scope': 'identify guilds.join',
+            'state': state,
+            'prompt': 'none'  # Don't prompt if already authorized
+        }
+        
+        auth_url = f"https://discord.com/api/oauth2/authorize?{urllib.parse.urlencode(params)}"
+        logger.info(f"Redirecting to Discord OAuth for guild {guild_id}")
+        return RedirectResponse(auth_url)
+        
+    except Exception as e:
+        logger.error(f"OAuth authorize error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str, state: str):
-    """OAuth2 callback endpoint for bot verification"""
+    """Handle OAuth callback from Discord"""
     try:
-        if not rate_limit:
-            raise HTTPException(status_code=429, detail="Too many requests")
+        logger.info(f"Received OAuth callback with state: {state[:10]}...")
         
         # Verify state
         state_data = db.get_oauth_state(state)
         if not state_data:
-            raise HTTPException(status_code=400, detail="Invalid or expired state")
+            logger.error("Invalid or expired OAuth state")
+            return HTMLResponse("""
+                <html>
+                    <head>
+                        <title>Verification Failed</title>
+                        <style>
+                            body {
+                                font-family: sans-serif;
+                                background: #1a1a2e;
+                                color: white;
+                                display: flex;
+                                justify-content: center;
+                                align-items: center;
+                                height: 100vh;
+                                margin: 0;
+                            }
+                            .container {
+                                text-align: center;
+                                background: rgba(255, 0, 0, 0.1);
+                                padding: 40px;
+                                border-radius: 20px;
+                                border: 2px solid #f72585;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>❌ Verification Failed</h1>
+                            <p>Invalid or expired verification session.</p>
+                            <p>Please try again from your Discord server.</p>
+                        </div>
+                    </body>
+                </html>
+            """, status_code=400)
+        
+        guild_id = state_data.get('guild_id')
+        logger.info(f"Processing verification for guild {guild_id}")
         
         # Exchange code for tokens
         token_data = await oauth.exchange_code(code)
         if not token_data:
-            raise HTTPException(status_code=400, detail="Failed to exchange code")
+            logger.error("Failed to exchange code for tokens")
+            return HTMLResponse("""
+                <html>
+                    <head>
+                        <title>Verification Failed</title>
+                        <style>
+                            body {
+                                font-family: sans-serif;
+                                background: #1a1a2e;
+                                color: white;
+                                display: flex;
+                                justify-content: center;
+                                align-items: center;
+                                height: 100vh;
+                                margin: 0;
+                            }
+                            .container {
+                                text-align: center;
+                                background: rgba(255, 0, 0, 0.1);
+                                padding: 40px;
+                                border-radius: 20px;
+                                border: 2px solid #f72585;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>❌ Verification Failed</h1>
+                            <p>Could not verify your Discord account.</p>
+                            <p>Please try again.</p>
+                        </div>
+                    </body>
+                </html>
+            """, status_code=400)
         
         # Get user info
         user_info = await oauth.get_user_info(token_data['access_token'])
         if not user_info:
-            raise HTTPException(status_code=400, detail="Failed to get user info")
+            logger.error("Failed to get user info")
+            return HTMLResponse("""
+                <html>
+                    <head>
+                        <title>Verification Failed</title>
+                        <style>
+                            body {
+                                font-family: sans-serif;
+                                background: #1a1a2e;
+                                color: white;
+                                display: flex;
+                                justify-content: center;
+                                align-items: center;
+                                height: 100vh;
+                                margin: 0;
+                            }
+                            .container {
+                                text-align: center;
+                                background: rgba(255, 0, 0, 0.1);
+                                padding: 40px;
+                                border-radius: 20px;
+                                border: 2px solid #f72585;
+                            }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>❌ Verification Failed</h1>
+                            <p>Could not retrieve your user information.</p>
+                            <p>Please try again.</p>
+                        </div>
+                    </body>
+                </html>
+            """, status_code=400)
         
-        discord_id = user_info['id']
-        username = f"{user_info['username']}#{user_info['discriminator']}"
+        username = f"{user_info['username']}#{user_info.get('discriminator', '0')}"
+        user_id = user_info['id']
         
-        # Store verified user
+        logger.info(f"User {username} ({user_id}) verified")
+        
+        # Save user to database
         success = db.add_verified_user(
-            discord_id=discord_id,
+            discord_id=user_id,
             username=username,
             access_token=token_data['access_token'],
             refresh_token=token_data['refresh_token'],
             expires_in=token_data['expires_in'],
-            guild_id=state_data.get('guild_id', ''),
+            guild_id=guild_id,
             metadata={
                 'avatar': user_info.get('avatar'),
-                'verified': user_info.get('verified', False)
+                'email': user_info.get('email')
             }
         )
         
         if not success:
-            raise HTTPException(status_code=500, detail="Failed to store user data")
+            logger.error("Failed to save user to database")
         
-        # Redirect based on state
-        redirect_url = state_data.get('redirect_url') or os.environ.get('FRONTEND_URL', '')
-        if redirect_url:
-            return RedirectResponse(f"{redirect_url}/success?user_id={discord_id}")
-        
-        return {
-            "success": True,
-            "message": "Verification successful!",
-            "user_id": discord_id,
-            "username": username
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"OAuth callback error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/auth/discord")
-async def auth_discord(redirect_url: Optional[str] = None):
-    """Initiate Discord OAuth for web dashboard"""
-    try:
-        if not oauth.client_id:
-            raise HTTPException(status_code=500, detail="Discord OAuth not configured")
-        
-        state = secrets.token_urlsafe(32)
-        db.save_oauth_state(
-            state=state,
-            redirect_url=redirect_url
+        # Try to add user to guild immediately
+        added = await oauth.add_user_to_guild(
+            access_token=token_data['access_token'],
+            user_id=user_id,
+            guild_id=guild_id
         )
         
-        # Use the OAuth handler's redirect_uri
-        redirect_uri = oauth.redirect_uri
-        if not redirect_uri:
-            raise HTTPException(status_code=500, detail="Redirect URI not configured")
+        if added:
+            logger.info(f"Successfully added {username} to guild {guild_id}")
+        else:
+            logger.info(f"Could not immediately add {username} to guild - will retry with /restore")
         
-        params = {
-            'client_id': oauth.client_id,
-            'redirect_uri': redirect_uri,
-            'response_type': 'code',
-            'scope': 'identify guilds',
-            'state': state,
-            'prompt': 'none'
-        }
-        
-        auth_url = f"https://discord.com/api/oauth2/authorize?{urllib.parse.urlencode(params)}"
-        logger.info(f"Redirecting to Discord OAuth: {auth_url}")
-        return RedirectResponse(auth_url)
-        
-    except Exception as e:
-        logger.error(f"Auth discord error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/auth/callback")
-async def auth_callback(code: str, state: str):
-    """Callback for web dashboard authentication"""
-    try:
-        # Verify state
-        state_data = db.get_oauth_state(state)
-        if not state_data:
-            raise HTTPException(status_code=400, detail="Invalid or expired state")
-        
-        # Exchange code for tokens
-        token_data = await oauth.exchange_code(code)
-        if not token_data:
-            raise HTTPException(status_code=400, detail="Failed to exchange code")
-        
-        # Get user info
-        user_info = await oauth.get_user_info(token_data['access_token'])
-        if not user_info:
-            raise HTTPException(status_code=400, detail="Failed to get user info")
-        
-        # Get user's guilds
-        guilds = await oauth.get_user_guilds(token_data['access_token'])
-        
-        # Create session token
-        session_token = secrets.token_urlsafe(32)
-        
-        # Prepare user data
-        user_data = {
-            'id': user_info['id'],
-            'username': user_info['username'],
-            'discriminator': user_info['discriminator'],
-            'avatar': user_info.get('avatar'),
-            'guilds': guilds or [],
-            'access_token': token_data['access_token'],
-            'refresh_token': token_data['refresh_token'],
-            'expires_at': (datetime.now() + timedelta(seconds=token_data['expires_in'])).isoformat()
-        }
-        
-        logger.info(f"User authenticated: {user_info['username']}#{user_info['discriminator']} ({user_info['id']})")
-        
-        # Redirect to frontend
-        redirect_url = state_data.get('redirect_url') or os.environ.get('FRONTEND_URL', '')
-        if redirect_url:
-            # Encode user data in URL parameter
-            auth_data = {
-                'success': True,
-                'user': user_data,
-                'session_token': session_token
-            }
-            # URL-safe encoding
-            encoded_data = base64.urlsafe_b64encode(json.dumps(auth_data).encode()).decode()
-            return RedirectResponse(f"{redirect_url}/dashboard?auth={encoded_data}")
-        
-        return {
-            "success": True,
-            "user": user_data,
-            "session_token": session_token
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Auth callback error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/api/servers")
-async def get_servers(user_id: str, auth: dict = Depends(verify_auth)):
-    """Get servers owned by the authenticated user"""
-    try:
-        servers = db.get_user_servers(user_id)
-        
-        return {
-            "success": True,
-            "servers": servers
-        }
+        # Return success page
+        return HTMLResponse("""
+            <html>
+                <head>
+                    <title>Verification Successful</title>
+                    <style>
+                        body {
+                            font-family: 'Segoe UI', Tahoma, sans-serif;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            color: white;
+                            display: flex;
+                            justify-content: center;
+                            align-items: center;
+                            height: 100vh;
+                            margin: 0;
+                        }
+                        .container {
+                            text-align: center;
+                            background: rgba(0, 0, 0, 0.3);
+                            padding: 60px 40px;
+                            border-radius: 20px;
+                            backdrop-filter: blur(10px);
+                            border: 2px solid #4ade80;
+                            max-width: 500px;
+                        }
+                        h1 {
+                            font-size: 3em;
+                            margin: 0 0 20px 0;
+                        }
+                        p {
+                            font-size: 1.2em;
+                            margin: 15px 0;
+                            line-height: 1.6;
+                        }
+                        .success {
+                            color: #4ade80;
+                            font-weight: bold;
+                        }
+                        .info {
+                            color: #60a5fa;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>✅ Verification Successful!</h1>
+                        <p class="success">Your account has been verified.</p>
+                        <p class="info">You should now have access to the server!</p>
+                        <p>If you're not in the server yet, an admin can use the <code>/verify restore</code> command to add you.</p>
+                        <p style="margin-top: 30px; font-size: 0.9em; opacity: 0.7;">You can close this window now.</p>
+                    </div>
+                </body>
+            </html>
+        """)
         
     except Exception as e:
-        logger.error(f"Get servers error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/api/restore")
-async def trigger_restore(guild_id: str, auth: dict = Depends(verify_auth)):
-    """Trigger restoration of verified users"""
-    try:
-        return {
-            "success": True,
-            "message": "Restoration process started",
-            "guild_id": guild_id,
-            "task_id": secrets.token_urlsafe(16),
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Trigger restore error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.put("/api/settings/{guild_id}")
-async def update_settings(
-    guild_id: str,
-    settings: Dict[str, Any],
-    auth: dict = Depends(verify_auth)
-):
-    """Update server settings"""
-    try:
-        # Get user_id from settings or request
-        user_id = settings.get('owner_id')
-        if not user_id:
-            raise HTTPException(status_code=400, detail="Owner ID required")
-        
-        success = db.update_server_settings(
-            guild_id=guild_id,
-            owner_id=user_id,
-            settings=settings
-        )
-        
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to update settings")
-        
-        return {
-            "success": True,
-            "message": "Settings updated successfully",
-            "guild_id": guild_id
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Update settings error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"OAuth callback error: {e}", exc_info=True)
+        return HTMLResponse("""
+            <html>
+                <head>
+                    <title>Verification Error</title>
+                    <style>
+                        body {
+                            font-family: sans-serif;
+                            background: #1a1a2e;
+                            color: white;
+                            display: flex;
+                            justify-content: center;
+                            align-items: center;
+                            height: 100vh;
+                            margin: 0;
+                        }
+                        .container {
+                            text-align: center;
+                            background: rgba(255, 0, 0, 0.1);
+                            padding: 40px;
+                            border-radius: 20px;
+                            border: 2px solid #f72585;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <h1>❌ An Error Occurred</h1>
+                        <p>Something went wrong during verification.</p>
+                        <p>Please try again from your Discord server.</p>
+                    </div>
+                </body>
+            </html>
+        """, status_code=500)
 
 @app.get("/api/stats/{guild_id}")
-async def get_stats(guild_id: str, auth: dict = Depends(verify_auth)):
+async def get_stats(guild_id: str):
     """Get server statistics"""
     try:
-        if not supabase:
-            raise HTTPException(status_code=500, detail="Database not connected")
-            
         # Get verified count
         response = supabase.table('verified_users')\
             .select('id', count='exact')\
@@ -567,60 +603,7 @@ async def get_stats(guild_id: str, auth: dict = Depends(verify_auth)):
         logger.error(f"Get stats error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    try:
-        # Test database connection
-        if supabase:
-            supabase.table('verified_users').select('id').limit(1).execute()
-            db_status = "connected"
-        else:
-            db_status = "disconnected"
-        
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "service": "xotiicsverify API",
-            "database": db_status,
-            "oauth_configured": bool(oauth.client_id and oauth.client_secret and oauth.redirect_uri)
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=500, detail="Database connection failed")
-
-@app.get("/debug/oauth-config")
-async def debug_oauth_config():
-    """Debug OAuth configuration"""
-    return {
-        "client_id": oauth.client_id,
-        "client_secret_set": bool(oauth.client_secret),
-        "redirect_uri": oauth.redirect_uri,
-        "api_url": oauth.api_url,
-        "expected_redirect_uri": f"{oauth.api_url}/api/auth/callback" if oauth.api_url else None,
-        "environment": {
-            "REDIRECT_URI": os.environ.get('REDIRECT_URI'),
-            "API_URL": os.environ.get('API_URL'),
-            "DISCORD_CLIENT_ID": os.environ.get('DISCORD_CLIENT_ID'),
-            "SUPABASE_URL": bool(os.environ.get('SUPABASE_URL'))
-        }
-    }
-
-@app.get("/test")
-async def test_endpoint():
-    """Test endpoint for debugging"""
-    return {
-        "message": "API is working",
-        "timestamp": datetime.now().isoformat(),
-        "environment": {
-            "supabase_configured": bool(os.environ.get('SUPABASE_URL')),
-            "discord_configured": bool(os.environ.get('DISCORD_CLIENT_ID')),
-            "api_url": os.environ.get('API_URL'),
-            "frontend_url": os.environ.get('FRONTEND_URL'),
-            "redirect_uri": os.environ.get('REDIRECT_URI')
-        }
-    }
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting API server on port {port}")
     uvicorn.run("api:app", host="0.0.0.0", port=port, reload=False)
