@@ -1,3 +1,4 @@
+# api/api.py
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +8,7 @@ import os
 import logging
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List  # IMPORTANT: Added List here
 import json
 import aiohttp
 from supabase import create_client, Client
@@ -34,7 +35,7 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,7 +47,16 @@ security = HTTPBearer()
 # Initialize Supabase
 supabase_url = os.environ.get('SUPABASE_URL')
 supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-supabase: Client = create_client(supabase_url, supabase_key)
+supabase: Optional[Client] = None
+
+if supabase_url and supabase_key:
+    try:
+        supabase = create_client(supabase_url, supabase_key)
+        logger.info("Supabase connected successfully")
+    except Exception as e:
+        logger.error(f"Failed to connect to Supabase: {e}")
+else:
+    logger.warning("Supabase credentials not found in environment")
 
 # Rate limiting storage
 rate_limit_cache = {}
@@ -72,12 +82,18 @@ class DatabaseManager:
                 'guild_id': guild_id,
                 'redirect_url': redirect_url
             }
-            supabase.table('oauth_states').insert(data).execute()
+            if supabase:
+                supabase.table('oauth_states').insert(data).execute()
+            return True
         except Exception as e:
             logger.error(f"Error saving OAuth state: {e}")
+            return False
     
     def get_oauth_state(self, state: str) -> Optional[Dict[str, Any]]:
         try:
+            if not supabase:
+                return None
+                
             response = supabase.table('oauth_states')\
                 .select('*')\
                 .eq('state', state)\
@@ -113,15 +129,19 @@ class DatabaseManager:
                 'metadata': metadata or {}
             }
             
-            supabase.table('verified_users').upsert(data, on_conflict='discord_id').execute()
-            logger.info(f"Added/updated verified user: {username} ({discord_id})")
-            return True
+            if supabase:
+                supabase.table('verified_users').upsert(data, on_conflict='discord_id').execute()
+                logger.info(f"Added/updated verified user: {username} ({discord_id})")
+                return True
         except Exception as e:
             logger.error(f"Error adding verified user: {e}")
-            return False
+        return False
     
     def get_user_servers(self, user_id: str) -> List[Dict[str, Any]]:
         try:
+            if not supabase:
+                return []
+                
             # Get servers owned by user
             response = supabase.table('server_settings')\
                 .select('guild_id, settings')\
@@ -146,8 +166,11 @@ class DatabaseManager:
             logger.error(f"Error getting user servers: {e}")
             return []
     
-    def update_server_settings(self, guild_id: str, owner_id: str, settings: dict):
+    def update_server_settings(self, guild_id: str, owner_id: str, settings: dict) -> bool:
         try:
+            if not supabase:
+                return False
+                
             data = {
                 'guild_id': guild_id,
                 'owner_id': owner_id,
@@ -158,6 +181,8 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error updating server settings: {e}")
             return False
+
+db = DatabaseManager()
 
 class OAuthHandler:
     def __init__(self):
@@ -216,7 +241,6 @@ class OAuthHandler:
             logger.error(f"Error getting user guilds: {e}")
         return None
 
-db = DatabaseManager()
 oauth = OAuthHandler()
 
 def rate_limit(request: Request, limit: int = 10, window: int = 60) -> bool:
@@ -258,7 +282,8 @@ async def root():
         "status": "online",
         "service": "xotiicsverify API",
         "version": "1.0.0",
-        "docs": "/docs"
+        "docs": "/docs",
+        "supabase": "connected" if supabase else "disconnected"
     }
 
 @app.get("/oauth/callback")
@@ -333,7 +358,7 @@ async def auth_discord(redirect_url: Optional[str] = None):
         
         params = {
             'client_id': oauth.client_id,
-            'redirect_uri': f"{os.environ.get('API_URL')}/api/auth/callback",
+            'redirect_uri': f"{os.environ.get('API_URL', '')}/api/auth/callback",
             'response_type': 'code',
             'scope': 'identify guilds',
             'state': state
@@ -371,7 +396,7 @@ async def auth_callback(code: str, state: str):
         # Create session token
         session_token = secrets.token_urlsafe(32)
         
-        # Store user session (in production, use Redis)
+        # Store user session
         user_data = {
             'id': user_info['id'],
             'username': user_info['username'],
@@ -424,9 +449,6 @@ async def get_servers(user_id: str, auth: dict = Depends(verify_auth)):
 async def trigger_restore(guild_id: str, auth: dict = Depends(verify_auth)):
     """Trigger restoration of verified users"""
     try:
-        # In production, this would trigger an async task or webhook
-        # For now, return success
-        
         return {
             "success": True,
             "message": "Restoration process started",
@@ -477,6 +499,9 @@ async def update_settings(
 async def get_stats(guild_id: str, auth: dict = Depends(verify_auth)):
     """Get server statistics"""
     try:
+        if not supabase:
+            raise HTTPException(status_code=500, detail="Database not connected")
+            
         # Get verified count
         response = supabase.table('verified_users')\
             .select('id', count='exact')\
@@ -494,27 +519,12 @@ async def get_stats(guild_id: str, auth: dict = Depends(verify_auth)):
         
         restored_count = restored_response.count or 0
         
-        # Get daily stats
-        daily_response = supabase.table('verified_users')\
-            .select('verified_at')\
-            .eq('guild_id', guild_id)\
-            .order('verified_at', desc=True)\
-            .limit(100)\
-            .execute()
-        
-        daily_stats = {}
-        for user in daily_response.data:
-            if user['verified_at']:
-                date = datetime.fromisoformat(user['verified_at'].replace('Z', '+00:00')).strftime('%Y-%m-%d')
-                daily_stats[date] = daily_stats.get(date, 0) + 1
-        
         return {
             "success": True,
             "stats": {
                 "total_verified": total_verified,
                 "restored": restored_count,
-                "pending": total_verified - restored_count,
-                "daily_stats": daily_stats
+                "pending": total_verified - restored_count
             }
         }
         
@@ -527,17 +537,35 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Test database connection
-        supabase.table('verified_users').select('id').limit(1).execute()
+        if supabase:
+            supabase.table('verified_users').select('id').limit(1).execute()
+            db_status = "connected"
+        else:
+            db_status = "disconnected"
         
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "service": "xotiicsverify API",
-            "database": "connected"
+            "database": db_status
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
+
+@app.get("/test")
+async def test_endpoint():
+    """Test endpoint for debugging"""
+    return {
+        "message": "API is working",
+        "timestamp": datetime.now().isoformat(),
+        "environment": {
+            "supabase_configured": bool(os.environ.get('SUPABASE_URL')),
+            "discord_configured": bool(os.environ.get('DISCORD_CLIENT_ID')),
+            "api_url": os.environ.get('API_URL'),
+            "frontend_url": os.environ.get('FRONTEND_URL')
+        }
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
