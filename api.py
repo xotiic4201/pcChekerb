@@ -736,25 +736,57 @@ async def get_dashboard_user(user: Dict[str, Any] = Depends(verify_token)):
 
 @app.get("/api/dashboard/servers")
 async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
-    """Get user's guilds with bot status"""
+    """Get user's guilds where bot is present, with verified counts"""
     try:
-        # Get guilds where bot is present (this would require bot to have access)
-        # For now, return mock data or use Discord API
-        return {
-            "success": True,
-            "servers": [
-                {
-                    "id": "123456789",
-                    "name": "Test Server",
-                    "icon": None,
-                    "permissions": 8,
-                    "bot_member": True
-                }
-            ]
-        }
+        access_token = user.get('access_token')
+        if not access_token:
+            raise HTTPException(status_code=400, detail="User access token missing")
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        bot_token = os.environ.get("DISCORD_BOT_TOKEN")
+        if not bot_token:
+            raise HTTPException(status_code=500, detail="Bot token not configured")
+
+        # Fetch user guilds from Discord
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://discord.com/api/users/@me/guilds", headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Failed to fetch user guilds: {resp.status} - {text}")
+                    raise HTTPException(status_code=resp.status, detail="Failed to fetch user guilds")
+                user_guilds = await resp.json()
+
+            # Fetch bot guilds to filter only where bot is present
+            async with session.get("https://discord.com/api/users/@me/guilds", headers={"Authorization": f"Bot {bot_token}"}) as bot_resp:
+                if bot_resp.status != 200:
+                    bot_guilds_data = []
+                    logger.warning("Could not fetch bot guilds; defaulting to user guilds only")
+                else:
+                    bot_guilds_data = await bot_resp.json()
+                    bot_guild_ids = {g['id'] for g in bot_guilds_data}
+
+        servers = []
+        for guild in user_guilds:
+            guild_id = guild['id']
+            if bot_guild_ids and guild_id not in bot_guild_ids:
+                continue  # skip guilds where bot is not present
+
+            # Get verified count from database
+            verified_count = len(db.get_guild_users(guild_id, status="verified"))
+            servers.append({
+                "id": guild_id,
+                "name": guild.get("name"),
+                "icon": guild.get("icon"),
+                "member_count": guild.get("approximate_member_count") or 0,
+                "verified_count": verified_count
+            })
+
+        return {"success": True, "servers": servers}
+
     except Exception as e:
-        logger.error(f"Error getting user servers: {e}")
+        logger.error(f"Error getting user servers: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get servers")
+
 
 @app.get("/api/dashboard/server/{guild_id}/stats")
 async def get_server_stats(guild_id: str, user: Dict[str, Any] = Depends(verify_token)):
@@ -958,3 +990,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting API server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
