@@ -362,46 +362,152 @@ async def oauth_callback(code: str, state: str):
                         added_to_guild = False
         
         return HTMLResponse(f"""
-            <html>
-                <head>
-                    <title>Verification Successful</title>
-                    <style>
-                        body {{
-                            font-family: 'Segoe UI', sans-serif;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                            color: white;
-                            display: flex;
-                            justify-content: center;
-                            align-items: center;
-                            height: 100vh;
-                            margin: 0;
-                        }}
-                        .container {{
-                            text-align: center;
-                            background: rgba(0, 0, 0, 0.3);
-                            padding: 60px 40px;
-                            border-radius: 20px;
-                            backdrop-filter: blur(10px);
-                            border: 2px solid #4ade80;
-                            max-width: 500px;
-                        }}
-                        h1 {{ font-size: 3em; margin: 0 0 20px 0; }}
-                        .success {{ color: #4ade80; font-weight: bold; }}
-                        .info {{ color: #60a5fa; margin: 15px 0; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>✅ Verification Successful!</h1>
-                        <p class="success">Welcome, {username}!</p>
-                        <p class="info">Your account has been verified and saved.</p>
-                        <p class="info">You should now have access to the server!</p>
-                        <p class="info">An admin can use <code>/verify restore</code> to add you with a role.</p>
-                        <p style="margin-top: 30px; font-size: 0.9em; opacity: 0.7;">You can close this window now.</p>
-                    </div>
-                </body>
-            </html>
-        """)
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verification Successful</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --primary: #4361ee;
+            --secondary: #7209b7;
+            --success: #4ade80;
+            --dark: #1a1a2e;
+            --light: #f8f9fa;
+        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            overflow: hidden;
+        }}
+        .container {{
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 25px;
+            padding: 60px 50px;
+            text-align: center;
+            border: 2px solid var(--success);
+            backdrop-filter: blur(15px);
+            max-width: 500px;
+            width: 90%;
+            position: relative;
+            animation: fadeIn 0.8s ease-out forwards;
+        }}
+        h1 {{
+            font-size: 3rem;
+            color: var(--success);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+        }}
+        h1 i {{
+            animation: pop 1s ease infinite alternate;
+            font-size: 3.5rem;
+        }}
+        p {{
+            color: var(--light);
+            margin: 10px 0;
+            font-size: 1.1rem;
+        }}
+        .username {{
+            font-weight: 700;
+            font-size: 1.4rem;
+            background: linear-gradient(45deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .checkmark-circle {{
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 5px solid var(--success);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 25px auto;
+            animation: bounce 0.8s ease forwards;
+        }}
+        .checkmark-circle i {{
+            font-size: 3.5rem;
+            color: var(--success);
+        }}
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(50px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        @keyframes pop {{
+            0% {{ transform: scale(1); }}
+            100% {{ transform: scale(1.2); }}
+        }}
+        @keyframes bounce {{
+            0% {{ transform: scale(0.5); opacity: 0; }}
+            60% {{ transform: scale(1.1); opacity: 1; }}
+            100% {{ transform: scale(1); }}
+        }}
+        .close-btn {{
+            margin-top: 30px;
+            padding: 12px 30px;
+            background: linear-gradient(45deg, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }}
+        .close-btn:hover {{
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.3);
+        }}
+        .bg-particles {{
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            overflow: hidden;
+            z-index: 0;
+        }}
+        .bg-particles span {{
+            position: absolute;
+            display: block;
+            width: 15px;
+            height: 15px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 50%;
+            animation: float 6s linear infinite;
+        }}
+        @keyframes float {{
+            0% {{ transform: translateY(100vh) scale(0.5); }}
+            100% {{ transform: translateY(-10vh) scale(1); }}
+        }}
+    </style>
+    <script src="https://kit.fontawesome.com/a076d05399.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="bg-particles">
+        {''.join([f'<span style="left:{i*10}%; animation-delay:{i*0.5}s;"></span>' for i in range(20)])}
+    </div>
+    <div class="container">
+        <div class="checkmark-circle">
+            <i class="fas fa-check"></i>
+        </div>
+        <h1>✅ Verification Successful!</h1>
+        <p class="username">Welcome, {username}!</p>
+        <p>Your account has been verified and saved.</p>
+        <p>You should now have access to the server!</p>
+        <button class="close-btn" onclick="window.close()">Close Window</button>
+    </div>
+</body>
+</html>
+""")
+
         
     except Exception as e:
         logger.error(f"OAuth callback error: {e}", exc_info=True)
@@ -422,3 +528,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting API server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
