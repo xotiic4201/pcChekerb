@@ -16,11 +16,11 @@ services:
       - key: DISCORD_CLIENT_SECRET
         sync: false
       - key: REDIRECT_URI
-        value: https://xotiicsverify-api.onrender.com/oauth/callback
+        value: https://bot-hosting-b.onrender.com/oauth/callback
       - key: API_URL
-        value: https://xotiicsverify-api.onrender.com
+        value: https://bot-hosting-b.onrender.com
       - key: FRONTEND_URL
-        value: https://xotiicsverify.vercel.app
+        value: https://bothostingf.vercel.app
       - key: ENCRYPTION_KEY
         generateValue: true
       - key: API_SECRET_KEY
