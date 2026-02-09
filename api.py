@@ -513,10 +513,28 @@ class OAuthHandler:
     def __init__(self):
         self.client_id = Config.DISCORD_CLIENT_ID
         self.client_secret = Config.DISCORD_CLIENT_SECRET
-        self.redirect_uri = Config.REDIRECT_URI
         self.bot_token = Config.DISCORD_BOT_TOKEN
     
-    async def exchange_code(self, code: str) -> Optional[Dict[str, Any]]:
+    def get_authorization_url(self, redirect_uri: str, state: str, guild_id: str = None) -> str:
+        """Generate Discord authorization URL"""
+        params = {
+            "client_id": self.client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "state": state,
+            "prompt": "none"
+        }
+        
+        if guild_id:
+            # For user verification - need guilds.join permission
+            params["scope"] = "identify guilds guilds.join"
+        else:
+            # For dashboard login - only need identify and guilds
+            params["scope"] = "identify guilds"
+        
+        return f"https://discord.com/api/oauth2/authorize?{urllib.parse.urlencode(params)}"
+    
+    async def exchange_code(self, code: str, redirect_uri: str) -> Optional[Dict[str, Any]]:
         """Exchange authorization code for tokens"""
         try:
             data = {
@@ -524,8 +542,7 @@ class OAuthHandler:
                 "client_secret": self.client_secret,
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": self.redirect_uri,
-                "scope": "identify guilds guilds.join"
+                "redirect_uri": redirect_uri
             }
             
             headers = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -586,32 +603,6 @@ class OAuthHandler:
             logger.error(f"Error getting user guilds: {e}")
         
         return []
-    
-    async def refresh_token(self, refresh_token: str) -> Optional[Dict[str, Any]]:
-        """Refresh access token"""
-        try:
-            data = {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token
-            }
-            
-            headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://discord.com/api/oauth2/token",
-                    data=data,
-                    headers=headers
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                        
-        except Exception as e:
-            logger.error(f"Error refreshing token: {e}")
-        
-        return None
 
 # ==================== INITIALIZE ====================
 db = DatabaseManager()
@@ -662,26 +653,6 @@ async def verify_token(
         )
     
     return user_data
-
-def generate_verification_url(guild_id: str = None) -> Tuple[str, str]:
-    """Generate verification URL and state"""
-    state = secrets.token_urlsafe(32)
-    
-    params = {
-        "client_id": oauth.client_id,
-        "redirect_uri": oauth.redirect_uri,
-        "response_type": "code",
-        "scope": "identify guilds guilds.join",
-        "state": state,
-        "prompt": "none"
-    }
-    
-    if guild_id:
-        params["scope"] = "identify guilds guilds.join"
-    
-    verification_url = f"https://discord.com/api/oauth2/authorize?{urllib.parse.urlencode(params)}"
-    
-    return verification_url, state
 
 # ==================== RATE LIMITING ====================
 class RateLimiter:
@@ -773,20 +744,26 @@ async def health_check():
             detail="Service unhealthy"
         )
 
-# Authentication endpoints
+# ==================== AUTHENTICATION ENDPOINTS ====================
+
 @app.get("/api/auth/discord")
 async def discord_auth_endpoint(redirect_url: str = None):
-    """Handle Discord authentication"""
+    """Handle Discord authentication for dashboard"""
     try:
-        verification_url, state = generate_verification_url()
+        state = secrets.token_urlsafe(32)
         
+        # Save state for dashboard authentication
         db.save_oauth_state(
             state=state,
             redirect_url=redirect_url,
             type="dashboard_auth"
         )
         
-        return RedirectResponse(verification_url)
+        # Use the API callback for dashboard login
+        redirect_uri = f"{Config.API_URL}/api/auth/callback"
+        auth_url = oauth.get_authorization_url(redirect_uri, state)
+        
+        return RedirectResponse(auth_url)
         
     except Exception as e:
         logger.error(f"Discord auth error: {e}")
@@ -804,14 +781,26 @@ async def dashboard_auth(redirect_url: str = None):
 async def auth_callback(code: str, state: str):
     """Handle dashboard login callback"""
     try:
+        logger.info(f"Processing dashboard callback with state: {state[:10]}...")
+        
         state_data = db.get_oauth_state(state)
         if not state_data:
+            logger.error(f"Invalid state for dashboard callback: {state}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid or expired state"
             )
         
-        token_data = await oauth.exchange_code(code)
+        # Verify this is a dashboard auth request
+        if state_data.get("type") != "dashboard_auth":
+            logger.error(f"Invalid auth type for dashboard: {state_data.get('type')}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authentication type"
+            )
+        
+        redirect_uri = f"{Config.API_URL}/api/auth/callback"
+        token_data = await oauth.exchange_code(code, redirect_uri)
         if not token_data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -834,6 +823,7 @@ async def auth_callback(code: str, state: str):
             "username": f"{user_info['username']}#{user_info.get('discriminator', '0')}",
             "avatar": user_info.get("avatar"),
             "email": user_info.get("email"),
+            "access_token": token_data["access_token"],  # Store for future API calls
             "guilds": user_guilds
         }
         
@@ -847,13 +837,44 @@ async def auth_callback(code: str, state: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Auth callback error: {e}")
+        logger.error(f"Auth callback error: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
         )
 
-# User verification endpoint
+# ==================== USER VERIFICATION ENDPOINTS ====================
+
+@app.get("/api/verify/{guild_id}")
+async def start_verification(guild_id: str):
+    """Start verification process for a specific guild"""
+    try:
+        state = secrets.token_urlsafe(32)
+        
+        # Save state with guild ID for verification
+        db.save_oauth_state(
+            state=state,
+            guild_id=guild_id,
+            type="verification"
+        )
+        
+        # Use the user verification callback
+        redirect_uri = f"{Config.API_URL}/oauth/callback"
+        auth_url = oauth.get_authorization_url(redirect_uri, state, guild_id)
+        
+        return {
+            "success": True,
+            "verification_url": auth_url,
+            "embed_code": f"[Verify Here]({auth_url})"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error starting verification: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to start verification"
+        )
+
 @app.get("/oauth/callback")
 async def oauth_callback(code: str, state: str):
     """Handle OAuth callback for Discord server verification"""
@@ -862,6 +883,7 @@ async def oauth_callback(code: str, state: str):
         
         state_data = db.get_oauth_state(state)
         if not state_data:
+            logger.error(f"Invalid state for OAuth callback: {state}")
             return HTMLResponse("""
                 <html>
                     <head>
@@ -902,8 +924,52 @@ async def oauth_callback(code: str, state: str):
                 </html>
             """, status_code=400)
         
+        # Verify this is a verification request
+        if state_data.get("type") != "verification":
+            logger.error(f"Invalid auth type for verification: {state_data.get('type')}")
+            return HTMLResponse("""
+                <html>
+                    <head>
+                        <title>Invalid Request</title>
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <style>
+                            body {
+                                font-family: 'Segoe UI', sans-serif;
+                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
+                                color: white;
+                                display: flex;
+                                justify-content: center;
+                                align-items: center;
+                                height: 100vh;
+                                margin: 0;
+                                padding: 20px;
+                            }
+                            .container {
+                                text-align: center;
+                                background: rgba(255,165,0,0.1);
+                                padding: 40px;
+                                border-radius: 20px;
+                                border: 2px solid #ffa500;
+                                max-width: 500px;
+                                backdrop-filter: blur(10px);
+                            }
+                            h1 { margin-bottom: 20px; }
+                            p { margin: 10px 0; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>⚠️ Invalid Request</h1>
+                            <p>This verification link is invalid.</p>
+                            <p>Please use the correct verification link from your Discord server.</p>
+                        </div>
+                    </body>
+                </html>
+            """, status_code=400)
+        
         guild_id = state_data.get("guild_id")
         if not guild_id:
+            logger.error("No guild_id in verification state")
             return HTMLResponse("""
                 <html>
                     <head>
@@ -943,8 +1009,10 @@ async def oauth_callback(code: str, state: str):
                 </html>
             """, status_code=400)
         
-        token_data = await oauth.exchange_code(code)
+        redirect_uri = f"{Config.API_URL}/oauth/callback"
+        token_data = await oauth.exchange_code(code, redirect_uri)
         if not token_data:
+            logger.error("Failed to exchange code for verification")
             return HTMLResponse("""
                 <html>
                     <head>
@@ -986,6 +1054,7 @@ async def oauth_callback(code: str, state: str):
         
         user_info = await oauth.get_user_info(token_data["access_token"])
         if not user_info:
+            logger.error("Failed to get user info for verification")
             return HTMLResponse("""
                 <html>
                     <head>
@@ -1043,7 +1112,49 @@ async def oauth_callback(code: str, state: str):
             }
         )
         
-        db.add_verified_user(user_data)
+        success = db.add_verified_user(user_data)
+        
+        if not success:
+            logger.error("Failed to save user to database")
+            return HTMLResponse("""
+                <html>
+                    <head>
+                        <title>Database Error</title>
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <style>
+                            body {
+                                font-family: 'Segoe UI', sans-serif;
+                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
+                                color: white;
+                                display: flex;
+                                justify-content: center;
+                                align-items: center;
+                                height: 100vh;
+                                margin: 0;
+                                padding: 20px;
+                            }
+                            .container {
+                                text-align: center;
+                                background: rgba(255,0,0,0.1);
+                                padding: 40px;
+                                border-radius: 20px;
+                                border: 2px solid #f72585;
+                                max-width: 500px;
+                                backdrop-filter: blur(10px);
+                            }
+                            h1 { margin-bottom: 20px; }
+                            p { margin: 10px 0; }
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>❌ Database Error</h1>
+                            <p>Failed to save verification data.</p>
+                            <p>Please try again later.</p>
+                        </div>
+                    </body>
+                </html>
+            """, status_code=500)
         
         # Add log entry
         db.add_log(
@@ -1068,36 +1179,40 @@ async def oauth_callback(code: str, state: str):
             url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_info['id']}"
             
             async with aiohttp.ClientSession() as session:
-                async with session.put(url, headers=headers, json=data) as resp:
-                    if resp.status in [200, 201, 204]:
-                        logger.info(f"Added user {username} to guild {guild_id}")
-                        added_to_guild = True
-                        
-                        # Try to get server config for default role
-                        server_config = db.get_server_config(guild_id)
-                        if server_config.get("verification_role"):
-                            role_id = server_config["verification_role"]
+                try:
+                    async with session.put(url, headers=headers, json=data) as resp:
+                        if resp.status in [200, 201, 204]:
+                            logger.info(f"Added user {username} to guild {guild_id}")
+                            added_to_guild = True
                             
-                            # Add role to user
-                            role_url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_info['id']}/roles/{role_id}"
-                            async with session.put(role_url, headers=headers) as role_resp:
-                                if role_resp.status in [200, 201, 204]:
-                                    logger.info(f"Added role {role_id} to user {username}")
-                        
-                        # Mark as restored
-                        db.mark_user_restored(user_info["id"], guild_id, role_id)
-                        
-                        # Add log
-                        db.add_log(
-                            log_type="restoration",
-                            message=f"User {username} added to guild with role {role_id or 'no role'}",
-                            guild_id=guild_id,
-                            user_id=user_info["id"],
-                            metadata={"role_id": role_id, "auto_added": True}
-                        )
-                    else:
-                        logger.warning(f"Could not add user to guild: {resp.status}")
-                        added_to_guild = False
+                            # Try to get server config for default role
+                            server_config = db.get_server_config(guild_id)
+                            if server_config.get("verification_role"):
+                                role_id = server_config["verification_role"]
+                                
+                                # Add role to user
+                                role_url = f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_info['id']}/roles/{role_id}"
+                                async with session.put(role_url, headers=headers) as role_resp:
+                                    if role_resp.status in [200, 201, 204]:
+                                        logger.info(f"Added role {role_id} to user {username}")
+                            
+                            # Mark as restored
+                            db.mark_user_restored(user_info["id"], guild_id, role_id)
+                            
+                            # Add log
+                            db.add_log(
+                                log_type="restoration",
+                                message=f"User {username} added to guild with role {role_id or 'no role'}",
+                                guild_id=guild_id,
+                                user_id=user_info["id"],
+                                metadata={"role_id": role_id, "auto_added": True}
+                            )
+                        else:
+                            logger.warning(f"Could not add user to guild: {resp.status}")
+                            added_to_guild = False
+                except Exception as e:
+                    logger.error(f"Error adding user to guild: {e}")
+                    added_to_guild = False
         
         # Return success page
         success_html = f"""
@@ -1418,10 +1533,9 @@ async def get_verification_link(
 ):
     """Get verification URL for a specific guild"""
     try:
-        # Generate verification URL
-        verification_url, state = generate_verification_url(guild_id)
+        state = secrets.token_urlsafe(32)
         
-        # Save state with guild ID
+        # Save state with guild ID for verification
         db.save_oauth_state(
             state=state,
             guild_id=guild_id,
@@ -1433,14 +1547,18 @@ async def get_verification_link(
             }
         )
         
+        # Use the user verification callback
+        redirect_uri = f"{Config.API_URL}/oauth/callback"
+        auth_url = oauth.get_authorization_url(redirect_uri, state, guild_id)
+        
         # Generate QR code
-        qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(verification_url)}"
+        qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(auth_url)}"
         
         return {
             "success": True,
-            "verification_url": verification_url,
+            "verification_url": auth_url,
             "qr_code_url": qr_code_url,
-            "embed_code": f"[Verify Here]({verification_url})",
+            "embed_code": f"[Verify Here]({auth_url})",
             "state": state,
             "expires_in": "10 minutes"
         }
@@ -1711,20 +1829,24 @@ async def bot_restore_members(guild_id: str, request: Request):
 async def get_verification_url_public(guild_id: str):
     """Get verification URL for a specific guild (public)"""
     try:
-        verification_url, state = generate_verification_url(guild_id)
+        state = secrets.token_urlsafe(32)
         
-        # Save state with guild ID
+        # Save state with guild ID for verification
         db.save_oauth_state(
             state=state,
             guild_id=guild_id,
             type="public_verification"
         )
         
+        # Use the user verification callback
+        redirect_uri = f"{Config.API_URL}/oauth/callback"
+        auth_url = oauth.get_authorization_url(redirect_uri, state, guild_id)
+        
         return {
             "success": True,
-            "verification_url": verification_url,
-            "embed_code": f"[Verify Here]({verification_url})",
-            "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(verification_url)}"
+            "verification_url": auth_url,
+            "embed_code": f"[Verify Here]({auth_url})",
+            "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(auth_url)}"
         }
         
     except Exception as e:
@@ -1777,4 +1899,3 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
-
