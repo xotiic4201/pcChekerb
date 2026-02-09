@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 import logging
@@ -17,9 +16,6 @@ from cryptography.fernet import Fernet
 import base64
 import jwt
 from pydantic import BaseModel, Field
-import asyncpg
-import asyncio
-from contextlib import asynccontextmanager
 import time
 import uuid
 
@@ -66,9 +62,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
     logger.info(f"CORS Origins: {Config.CORS_ORIGINS}")
     
-    # Create database tables if they don't exist
-    await DatabaseManager.create_tables()
-    logger.info("Database tables initialized")
+    # Verify database connection
+    try:
+        supabase.table("verified_users").select("id").limit(1).execute()
+        logger.info("Database connection verified")
+    except Exception as e:
+        logger.error(f"Database connection failed: {e}")
+        raise
     
     yield
     
@@ -148,128 +148,6 @@ class DatabaseManager:
         key = base64.urlsafe_b64encode(self.cipher_key[:32].ljust(32, b'0'))
         self.cipher = Fernet(key)
     
-    @staticmethod
-    async def create_tables():
-        """Create required tables if they don't exist"""
-        try:
-            # OAuth states table
-            supabase.table("oauth_states").create(
-                {
-                    "name": "oauth_states",
-                    "columns": [
-                        {"name": "id", "type": "uuid", "default": "gen_random_uuid()", "primary_key": True},
-                        {"name": "state", "type": "text", "unique": True, "not_null": True},
-                        {"name": "user_id", "type": "text"},
-                        {"name": "guild_id", "type": "text"},
-                        {"name": "redirect_url", "type": "text"},
-                        {"name": "created_at", "type": "timestamptz", "default": "now()"},
-                        {"name": "expires_at", "type": "timestamptz", "default": "now() + interval '10 minutes'"}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            # Verified users table
-            supabase.table("verified_users").create(
-                {
-                    "name": "verified_users",
-                    "columns": [
-                        {"name": "id", "type": "uuid", "default": "gen_random_uuid()", "primary_key": True},
-                        {"name": "discord_id", "type": "text", "not_null": True},
-                        {"name": "username", "type": "text", "not_null": True},
-                        {"name": "access_token", "type": "text", "not_null": True},
-                        {"name": "refresh_token", "type": "text", "not_null": True},
-                        {"name": "expires_at", "type": "timestamptz", "not_null": True},
-                        {"name": "guild_id", "type": "text", "not_null": True},
-                        {"name": "metadata", "type": "jsonb", "default": "'{}'::jsonb"},
-                        {"name": "verified_at", "type": "timestamptz", "default": "now()"},
-                        {"name": "restored", "type": "boolean", "default": "false"},
-                        {"name": "restored_at", "type": "timestamptz"},
-                        {"name": "restored_role_id", "type": "text"},
-                        {"name": "status", "type": "text", "default": "'verified'"},
-                        {"name": "created_at", "type": "timestamptz", "default": "now()"},
-                        {"name": "updated_at", "type": "timestamptz", "default": "now()"}
-                    ],
-                    "indexes": [
-                        {"name": "idx_verified_users_discord_guild", "columns": ["discord_id", "guild_id"], "unique": True},
-                        {"name": "idx_verified_users_guild_status", "columns": ["guild_id", "status"]},
-                        {"name": "idx_verified_users_verified_at", "columns": ["verified_at"]}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            # Bot configs table
-            supabase.table("bot_configs").create(
-                {
-                    "name": "bot_configs",
-                    "columns": [
-                        {"name": "user_id", "type": "text", "primary_key": True},
-                        {"name": "config", "type": "jsonb", "default": "'{}'::jsonb"},
-                        {"name": "updated_at", "type": "timestamptz", "default": "now()"}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            # Server configs table
-            supabase.table("server_configs").create(
-                {
-                    "name": "server_configs",
-                    "columns": [
-                        {"name": "guild_id", "type": "text", "primary_key": True},
-                        {"name": "config", "type": "jsonb", "default": "'{}'::jsonb"},
-                        {"name": "updated_at", "type": "timestamptz", "default": "now()"}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            # Logs table
-            supabase.table("logs").create(
-                {
-                    "name": "logs",
-                    "columns": [
-                        {"name": "id", "type": "uuid", "default": "gen_random_uuid()", "primary_key": True},
-                        {"name": "guild_id", "type": "text", "not_null": True},
-                        {"name": "type", "type": "text", "not_null": True},
-                        {"name": "message", "type": "text", "not_null": True},
-                        {"name": "user_id", "type": "text"},
-                        {"name": "metadata", "type": "jsonb", "default": "'{}'::jsonb"},
-                        {"name": "created_at", "type": "timestamptz", "default": "now()"}
-                    ],
-                    "indexes": [
-                        {"name": "idx_logs_guild_created", "columns": ["guild_id", "created_at"]},
-                        {"name": "idx_logs_type", "columns": ["type"]}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            # API keys table
-            supabase.table("api_keys").create(
-                {
-                    "name": "api_keys",
-                    "columns": [
-                        {"name": "id", "type": "uuid", "default": "gen_random_uuid()", "primary_key": True},
-                        {"name": "key", "type": "text", "unique": True, "not_null": True},
-                        {"name": "user_id", "type": "text", "not_null": True},
-                        {"name": "name", "type": "text"},
-                        {"name": "permissions", "type": "jsonb", "default": "'{}'::jsonb"},
-                        {"name": "last_used", "type": "timestamptz"},
-                        {"name": "expires_at", "type": "timestamptz"},
-                        {"name": "created_at", "type": "timestamptz", "default": "now()"}
-                    ]
-                },
-                if_not_exists=True
-            ).execute()
-            
-            logger.info("All tables created or verified")
-            
-        except Exception as e:
-            logger.error(f"Error creating tables: {e}")
-            raise
-    
     def _encrypt(self, data: str) -> str:
         """Encrypt sensitive data"""
         try:
@@ -296,14 +174,19 @@ class DatabaseManager:
                 "guild_id": kwargs.get("guild_id"),
                 "redirect_url": kwargs.get("redirect_url"),
                 "type": kwargs.get("type", "auth"),
-                "metadata": kwargs.get("metadata", {})
+                "metadata": kwargs.get("metadata", {}),
+                "created_at": datetime.now().isoformat(),
+                "expires_at": (datetime.now() + timedelta(minutes=10)).isoformat()
             }
             
             # Clean expired states first
-            supabase.table("oauth_states")\
-                .delete()\
-                .lt("expires_at", datetime.now().isoformat())\
-                .execute()
+            try:
+                supabase.table("oauth_states")\
+                    .delete()\
+                    .lt("expires_at", datetime.now().isoformat())\
+                    .execute()
+            except:
+                pass  # Table might not exist yet
             
             supabase.table("oauth_states").insert(data).execute()
             logger.info(f"Saved OAuth state: {state[:8]}...")
@@ -356,7 +239,8 @@ class DatabaseManager:
                 "expires_at": expires_at.isoformat(),
                 "guild_id": user_data.guild_id,
                 "metadata": user_data.metadata,
-                "status": "verified"
+                "status": "verified",
+                "verified_at": datetime.now().isoformat()
             }
             
             supabase.table("verified_users").upsert(
@@ -1275,7 +1159,7 @@ async def oauth_callback(code: str, state: str):
             log_type="error",
             message=f"Verification error: {str(e)}",
             guild_id=guild_id,
-            metadata={"error": str(e), "traceback": str(e.__traceback__)}
+            metadata={"error": str(e)}
         )
         
         return HTMLResponse("""
@@ -1326,7 +1210,14 @@ async def get_dashboard_user(user: Dict[str, Any] = Depends(verify_token)):
     """Get current user data for dashboard"""
     try:
         # Get additional user info from Discord
-        user_guilds = await oauth.get_user_guilds(user.get("access_token", ""))
+        access_token = user.get("access_token", "")
+        user_guilds = []
+        
+        if access_token:
+            try:
+                user_guilds = await oauth.get_user_guilds(access_token)
+            except:
+                pass  # Skip if we can't get guilds
         
         return {
             "success": True,
@@ -1351,27 +1242,34 @@ async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
     try:
         # Get user guilds from Discord
         headers = {"Authorization": f"Bearer {user.get('access_token', '')}"}
+        user_guilds = []
         
-        async with aiohttp.ClientSession() as session:
-            # Get user guilds
-            async with session.get(
-                "https://discord.com/api/users/@me/guilds",
-                headers=headers
-            ) as resp:
-                if resp.status != 200:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Failed to fetch user guilds"
-                    )
-                user_guilds = await resp.json()
-            
-            # Get bot guilds
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Get user guilds
+                async with session.get(
+                    "https://discord.com/api/users/@me/guilds",
+                    headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        user_guilds = await resp.json()
+        except:
+            pass
+        
+        # Get bot guilds
+        bot_guilds = []
+        if Config.DISCORD_BOT_TOKEN:
             bot_headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
-            async with session.get(
-                "https://discord.com/api/users/@me/guilds",
-                headers=bot_headers
-            ) as bot_resp:
-                bot_guilds = await bot_resp.json() if bot_resp.status == 200 else []
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://discord.com/api/users/@me/guilds",
+                        headers=bot_headers
+                    ) as bot_resp:
+                        if bot_resp.status == 200:
+                            bot_guilds = await bot_resp.json()
+            except:
+                pass
         
         # Create set of bot guild IDs for fast lookup
         bot_guild_ids = {guild["id"] for guild in bot_guilds}
@@ -1694,18 +1592,24 @@ async def get_bot_status():
     """Get bot status"""
     try:
         # Check Discord API connectivity
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
-            async with session.get(
-                "https://discord.com/api/v10/gateway/bot",
-                headers=headers
-            ) as resp:
-                if resp.status == 200:
-                    discord_data = await resp.json()
-                    discord_status = "connected"
-                else:
-                    discord_status = "disconnected"
-                    discord_data = {}
+        discord_status = "unknown"
+        discord_data = {}
+        
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+                    async with session.get(
+                        "https://discord.com/api/v10/gateway/bot",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            discord_data = await resp.json()
+                            discord_status = "connected"
+                        else:
+                            discord_status = "disconnected"
+            except:
+                discord_status = "error"
         
         # Get database stats
         try:
@@ -1865,7 +1769,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
-        "main:app",
+        "api:app",
         host="0.0.0.0",
         port=port,
         reload=os.getenv("ENVIRONMENT") == "development",
