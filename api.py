@@ -1901,62 +1901,45 @@ async def get_dashboard_user(user: Dict[str, Any] = Depends(verify_token)):
 
 @app.get("/api/dashboard/servers")
 async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
-    """Get user's guilds where bot is present"""
+    """Get user's guilds where bot is present - SIMPLIFIED VERSION"""
     try:
-        # Get user guilds from Discord
-        headers = {"Authorization": f"Bearer {user.get('access_token', '')}"}
-        user_guilds = []
+        print(f"Getting servers for user: {user.get('sub')}")
         
-        try:
+        # Get bot guilds directly (no need to check user permissions for now)
+        bot_guilds = []
+        if Config.DISCORD_BOT_TOKEN:
+            headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
             async with aiohttp.ClientSession() as session:
-                # Get user guilds
                 async with session.get(
                     "https://discord.com/api/users/@me/guilds",
                     headers=headers
                 ) as resp:
                     if resp.status == 200:
-                        user_guilds = await resp.json()
-        except:
-            pass
-        
-        # Get bot guilds
-        bot_guilds = []
-        if Config.DISCORD_BOT_TOKEN:
-            bot_headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        "https://discord.com/api/users/@me/guilds",
-                        headers=bot_headers
-                    ) as bot_resp:
-                        if bot_resp.status == 200:
-                            bot_guilds = await bot_resp.json()
-            except:
-                pass
-        
-        # Create set of bot guild IDs for fast lookup
-        bot_guild_ids = {guild["id"] for guild in bot_guilds}
+                        bot_guilds = await resp.json()
+                        print(f"Bot is in {len(bot_guilds)} guilds")
         
         servers = []
-        for guild in user_guilds:
+        for guild in bot_guilds:
             guild_id = guild["id"]
             
-            # Check if bot is in guild and user has admin permissions
-            if guild_id in bot_guild_ids and (int(guild.get("permissions", 0)) & 0x8):  # ADMINISTRATOR permission
-                # Get verified count from database
-                verified_count = db.get_guild_users_count(guild_id, status="verified")
-                
-                servers.append({
-                    "id": guild_id,
-                    "name": guild.get("name", "Unknown Server"),
-                    "icon": guild.get("icon"),
-                    "icon_url": f"https://cdn.discordapp.com/icons/{guild_id}/{guild['icon']}.png" if guild.get("icon") else None,
-                    "member_count": guild.get("approximate_member_count", 0),
-                    "verified_count": verified_count,
-                    "owner": guild.get("owner", False),
-                    "permissions": guild.get("permissions", 0)
-                })
+            # Get verified count
+            try:
+                verified_count = db.get_guild_users_count(guild_id)
+            except:
+                verified_count = 0
+            
+            servers.append({
+                "id": guild_id,
+                "name": guild.get("name", "Unknown Server"),
+                "icon": guild.get("icon"),
+                "icon_url": f"https://cdn.discordapp.com/icons/{guild_id}/{guild['icon']}.png" if guild.get("icon") else None,
+                "member_count": guild.get("approximate_member_count", 0),
+                "verified_count": verified_count,
+                "owner": guild.get("owner", False),
+                "permissions": guild.get("permissions", 0)
+            })
         
+        print(f"Returning {len(servers)} servers to dashboard")
         return {
             "success": True,
             "servers": servers,
@@ -1964,11 +1947,15 @@ async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
         }
         
     except Exception as e:
-        logger.error(f"Error getting user servers: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to get servers"
-        )
+        print(f"ERROR in get_user_servers: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "servers": [],
+            "count": 0,
+            "error": str(e)
+        }
 
 @app.get("/api/dashboard/servers/available")
 async def get_available_servers(user: Dict[str, Any] = Depends(verify_token)):
@@ -2888,3 +2875,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
