@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from contextlib import asynccontextmanager
 import uvicorn
 import os
 import logging
@@ -1776,3 +1777,4 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
