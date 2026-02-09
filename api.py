@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi import FastAPI, HTTPException, Request, Depends, status, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -19,6 +19,7 @@ import jwt
 from pydantic import BaseModel, Field
 import time
 import uuid
+import asyncio
 
 # ==================== CONFIGURATION ====================
 class Config:
@@ -34,6 +35,8 @@ class Config:
     JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", base64.urlsafe_b64encode(Fernet.generate_key()).decode())
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+    TRANSFER_BATCH_SIZE = int(os.getenv("TRANSFER_BATCH_SIZE", 50))
+    MAX_TRANSFER_USERS = int(os.getenv("MAX_TRANSFER_USERS", 1000))
 
     @classmethod
     def validate(cls):
@@ -71,16 +74,141 @@ async def lifespan(app: FastAPI):
         logger.error(f"Database connection failed: {e}")
         raise
     
+    # Initialize tables if they don't exist
+    await initialize_tables()
+    
     yield
     
     # Shutdown
     logger.info("Shutting down xotiicsverify API...")
 
+async def initialize_tables():
+    """Initialize database tables if they don't exist"""
+    try:
+        # Create verified_users table if not exists
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'verified_users',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                discord_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                guild_id TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}'::jsonb,
+                status TEXT DEFAULT 'verified',
+                verified_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                restored BOOLEAN DEFAULT FALSE,
+                restored_at TIMESTAMP WITH TIME ZONE,
+                restored_role_id TEXT,
+                transferred_from TEXT,
+                transferred_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                UNIQUE(discord_id, guild_id)
+            '''
+        }).execute()
+        
+        # Create indexes
+        supabase.rpc('create_index_if_not_exists', {
+            'table_name': 'verified_users',
+            'index_name': 'idx_verified_users_guild_status',
+            'index_sql': 'CREATE INDEX IF NOT EXISTS idx_verified_users_guild_status ON verified_users(guild_id, status)'
+        }).execute()
+        
+        supabase.rpc('create_index_if_not_exists', {
+            'table_name': 'verified_users',
+            'index_name': 'idx_verified_users_discord_id',
+            'index_sql': 'CREATE INDEX IF NOT EXISTS idx_verified_users_discord_id ON verified_users(discord_id)'
+        }).execute()
+        
+        # Create oauth_states table
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'oauth_states',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                state TEXT NOT NULL UNIQUE,
+                user_id TEXT,
+                guild_id TEXT,
+                redirect_url TEXT,
+                type TEXT DEFAULT 'auth',
+                metadata JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+            '''
+        }).execute()
+        
+        # Create bot_configs table
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'bot_configs',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL UNIQUE,
+                config JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            '''
+        }).execute()
+        
+        # Create server_configs table
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'server_configs',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                guild_id TEXT NOT NULL UNIQUE,
+                config JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            '''
+        }).execute()
+        
+        # Create logs table
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'logs',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                guild_id TEXT,
+                type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                user_id TEXT,
+                metadata JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            '''
+        }).execute()
+        
+        # Create transfer_jobs table
+        supabase.rpc('create_table_if_not_exists', {
+            'table_name': 'transfer_jobs',
+            'table_schema': '''
+                id BIGSERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL UNIQUE,
+                source_guild_id TEXT NOT NULL,
+                target_guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                config JSONB DEFAULT '{}'::jsonb,
+                result JSONB DEFAULT '{}'::jsonb,
+                total_users INTEGER DEFAULT 0,
+                processed_users INTEGER DEFAULT 0,
+                transferred_users INTEGER DEFAULT 0,
+                failed_users INTEGER DEFAULT 0,
+                started_at TIMESTAMP WITH TIME ZONE,
+                completed_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            '''
+        }).execute()
+        
+        logger.info("Database tables initialized")
+        
+    except Exception as e:
+        logger.warning(f"Could not initialize tables (they may already exist): {e}")
+
 # ==================== FASTAPI APP ====================
 app = FastAPI(
     title="xotiicsverify API",
     description="Secure Discord verification system backend with dashboard",
-    version="4.0.0",
+    version="5.0.0",
     docs_url="/docs" if os.getenv("ENVIRONMENT") == "development" else None,
     redoc_url=None,
     lifespan=lifespan
@@ -117,6 +245,7 @@ class BotConfig(BaseModel):
     require_email: bool = True
     enable_captcha: bool = False
     welcome_message: Optional[str] = None
+    max_transfer_users: int = Field(1000, ge=1, le=5000)
 
 class ServerConfig(BaseModel):
     verification_channel: Optional[str] = None
@@ -125,6 +254,8 @@ class ServerConfig(BaseModel):
     enable_auto_verification: bool = True
     log_channel: Optional[str] = None
     admin_roles: List[str] = []
+    allow_user_transfers: bool = True
+    auto_approve_transfers: bool = False
 
 class UserCreate(BaseModel):
     discord_id: str
@@ -134,6 +265,24 @@ class UserCreate(BaseModel):
     expires_in: int
     guild_id: str
     metadata: Dict[str, Any] = {}
+
+class TransferRequest(BaseModel):
+    source_guild_id: str
+    target_guild_id: str
+    user_ids: List[str] = []
+    limit: Optional[int] = Field(None, ge=1, le=1000)
+    assign_role_id: Optional[str] = None
+    remove_from_source: bool = False
+    transfer_all: bool = False
+
+class TransferJob(BaseModel):
+    job_id: str
+    source_guild_id: str
+    target_guild_id: str
+    user_id: str
+    config: Dict[str, Any]
+    status: str = "pending"
+    result: Dict[str, Any] = {}
 
 # ==================== DATABASE MANAGER ====================
 class DatabaseManager:
@@ -241,15 +390,31 @@ class DatabaseManager:
                 "guild_id": user_data.guild_id,
                 "metadata": user_data.metadata,
                 "status": "verified",
-                "verified_at": datetime.now().isoformat()
+                "verified_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat()
             }
             
-            supabase.table("verified_users").upsert(
-                data,
-                on_conflict="discord_id,guild_id"
-            ).execute()
+            # Check if user already exists
+            existing = supabase.table("verified_users")\
+                .select("id")\
+                .eq("discord_id", user_data.discord_id)\
+                .eq("guild_id", user_data.guild_id)\
+                .execute()
             
-            logger.info(f"User added/updated: {user_data.username} ({user_data.discord_id})")
+            if existing.data:
+                # Update existing
+                supabase.table("verified_users")\
+                    .update(data)\
+                    .eq("discord_id", user_data.discord_id)\
+                    .eq("guild_id", user_data.guild_id)\
+                    .execute()
+                logger.info(f"User updated: {user_data.username} ({user_data.discord_id})")
+            else:
+                # Insert new
+                data["created_at"] = datetime.now().isoformat()
+                supabase.table("verified_users").insert(data).execute()
+                logger.info(f"User added: {user_data.username} ({user_data.discord_id})")
+            
             return True
             
         except Exception as e:
@@ -267,19 +432,29 @@ class DatabaseManager:
             
             if response.data:
                 user = response.data[0]
+                try:
+                    access_token = self._decrypt(user["access_token"])
+                    refresh_token = self._decrypt(user["refresh_token"])
+                except:
+                    # If decryption fails, return without tokens
+                    access_token = ""
+                    refresh_token = ""
+                
                 return {
                     "discord_id": user["discord_id"],
                     "username": user["username"],
-                    "access_token": self._decrypt(user["access_token"]),
-                    "refresh_token": self._decrypt(user["refresh_token"]),
-                    "expires_at": datetime.fromisoformat(user["expires_at"].replace("Z", "+00:00")),
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_at": datetime.fromisoformat(user["expires_at"].replace("Z", "+00:00")) if user.get("expires_at") else None,
                     "guild_id": user["guild_id"],
                     "metadata": user.get("metadata", {}),
                     "verified_at": datetime.fromisoformat(user["verified_at"].replace("Z", "+00:00")) if user.get("verified_at") else None,
                     "restored": user.get("restored", False),
                     "restored_at": datetime.fromisoformat(user["restored_at"].replace("Z", "+00:00")) if user.get("restored_at") else None,
                     "restored_role_id": user.get("restored_role_id"),
-                    "status": user.get("status", "pending")
+                    "status": user.get("status", "pending"),
+                    "transferred_from": user.get("transferred_from"),
+                    "transferred_at": datetime.fromisoformat(user["transferred_at"].replace("Z", "+00:00")) if user.get("transferred_at") else None
                 }
                 
         except Exception as e:
@@ -287,20 +462,26 @@ class DatabaseManager:
         
         return None
     
-    def get_guild_users(self, guild_id: str, **kwargs) -> List[Dict[str, Any]]:
+    def get_users_by_guild(self, guild_id: str, **kwargs) -> List[Dict[str, Any]]:
         """Get users for a guild with filtering"""
         try:
             query = supabase.table("verified_users")\
-                .select("*")\
+                .select("discord_id, username, guild_id, verified_at, restored, restored_at, restored_role_id, status, metadata, transferred_from, transferred_at")\
                 .eq("guild_id", guild_id)\
                 .order("verified_at", desc=True)
             
             # Apply filters
-            if kwargs.get("status"):
+            if kwargs.get("status") and kwargs["status"] != "all":
                 query = query.eq("status", kwargs["status"])
             
             if kwargs.get("restored") is not None:
                 query = query.eq("restored", kwargs["restored"])
+            
+            if kwargs.get("transferred") is not None:
+                if kwargs["transferred"]:
+                    query = query.not_.is_("transferred_from", "null")
+                else:
+                    query = query.is_("transferred_from", "null")
             
             if kwargs.get("limit"):
                 query = query.limit(kwargs["limit"])
@@ -321,7 +502,9 @@ class DatabaseManager:
                     "restored_at": user.get("restored_at"),
                     "restored_role_id": user.get("restored_role_id"),
                     "status": user.get("status", "pending"),
-                    "metadata": user.get("metadata", {})
+                    "metadata": user.get("metadata", {}),
+                    "transferred_from": user.get("transferred_from"),
+                    "transferred_at": user.get("transferred_at")
                 })
             
             return users
@@ -330,23 +513,37 @@ class DatabaseManager:
             logger.error(f"Error getting guild users: {e}")
             return []
     
+    def get_guild_users_count(self, guild_id: str, **kwargs) -> int:
+        """Get count of users for a guild with filtering"""
+        try:
+            query = supabase.table("verified_users")\
+                .select("id", count="exact")\
+                .eq("guild_id", guild_id)
+            
+            if kwargs.get("status") and kwargs["status"] != "all":
+                query = query.eq("status", kwargs["status"])
+            
+            if kwargs.get("restored") is not None:
+                query = query.eq("restored", kwargs["restored"])
+            
+            response = query.execute()
+            return response.count or 0
+            
+        except Exception as e:
+            logger.error(f"Error getting guild users count: {e}")
+            return 0
+    
     def get_guild_stats(self, guild_id: str) -> Dict[str, Any]:
         """Get statistics for a guild"""
         try:
             # Total verified
-            total_resp = supabase.table("verified_users")\
-                .select("id", count="exact")\
-                .eq("guild_id", guild_id)\
-                .execute()
-            total = total_resp.count or 0
+            total = self.get_guild_users_count(guild_id)
             
             # Restored
-            restored_resp = supabase.table("verified_users")\
-                .select("id", count="exact")\
-                .eq("guild_id", guild_id)\
-                .eq("restored", True)\
-                .execute()
-            restored = restored_resp.count or 0
+            restored = self.get_guild_users_count(guild_id, restored=True)
+            
+            # Pending (not restored)
+            pending = self.get_guild_users_count(guild_id, restored=False)
             
             # Verified today
             today = datetime.now().date().isoformat()
@@ -366,12 +563,21 @@ class DatabaseManager:
                 .execute()
             week_count = week_resp.count or 0
             
+            # Transferred users
+            transferred_resp = supabase.table("verified_users")\
+                .select("id", count="exact")\
+                .eq("guild_id", guild_id)\
+                .not_.is_("transferred_from", "null")\
+                .execute()
+            transferred_count = transferred_resp.count or 0
+            
             return {
                 "total_verified": total,
                 "restored": restored,
-                "pending": total - restored,
+                "pending": pending,
                 "verified_today": today_count,
-                "verified_week": week_count
+                "verified_week": week_count,
+                "transferred_users": transferred_count
             }
             
         except Exception as e:
@@ -381,7 +587,8 @@ class DatabaseManager:
                 "restored": 0,
                 "pending": 0,
                 "verified_today": 0,
-                "verified_week": 0
+                "verified_week": 0,
+                "transferred_users": 0
             }
     
     def mark_user_restored(self, discord_id: str, guild_id: str, role_id: str = None):
@@ -405,6 +612,208 @@ class DatabaseManager:
             
         except Exception as e:
             logger.error(f"Error marking user restored: {e}")
+    
+    # User Transfer Methods
+    def transfer_user(self, discord_id: str, source_guild_id: str, target_guild_id: str, **kwargs) -> bool:
+        """Transfer a user from one guild to another"""
+        try:
+            # Get user from source guild
+            user = self.get_user(discord_id, source_guild_id)
+            if not user:
+                logger.error(f"User {discord_id} not found in source guild {source_guild_id}")
+                return False
+            
+            # Check if user already exists in target guild
+            existing = self.get_user(discord_id, target_guild_id)
+            if existing:
+                logger.warning(f"User {discord_id} already exists in target guild {target_guild_id}")
+                # Update existing user with transfer info
+                update_data = {
+                    "transferred_from": source_guild_id,
+                    "transferred_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now().isoformat()
+                }
+                
+                if kwargs.get("metadata"):
+                    update_data["metadata"] = {**existing.get("metadata", {}), **kwargs["metadata"]}
+                
+                supabase.table("verified_users")\
+                    .update(update_data)\
+                    .eq("discord_id", discord_id)\
+                    .eq("guild_id", target_guild_id)\
+                    .execute()
+                return True
+            
+            # Prepare new user data for target guild
+            user_data = UserCreate(
+                discord_id=discord_id,
+                username=user["username"],
+                access_token=user["access_token"] or "",  # Note: May need to refresh token
+                refresh_token=user["refresh_token"] or "",
+                expires_in=int((user["expires_at"] - datetime.now()).total_seconds()) if user.get("expires_at") else 604800,
+                guild_id=target_guild_id,
+                metadata={
+                    **user.get("metadata", {}),
+                    "transferred_from": source_guild_id,
+                    "transferred_at": datetime.now().isoformat(),
+                    "transfer_metadata": kwargs.get("metadata", {})
+                }
+            )
+            
+            # Add user to target guild
+            success = self.add_verified_user(user_data)
+            
+            if success and kwargs.get("remove_from_source"):
+                # Remove from source guild if requested
+                supabase.table("verified_users")\
+                    .delete()\
+                    .eq("discord_id", discord_id)\
+                    .eq("guild_id", source_guild_id)\
+                    .execute()
+                logger.info(f"Removed user {discord_id} from source guild {source_guild_id}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error transferring user {discord_id}: {e}")
+            return False
+    
+    def get_users_for_transfer(self, source_guild_id: str, **kwargs) -> List[Dict[str, Any]]:
+        """Get users available for transfer from a guild"""
+        try:
+            query = supabase.table("verified_users")\
+                .select("discord_id, username, verified_at, restored, status, metadata")\
+                .eq("guild_id", source_guild_id)\
+                .order("verified_at", desc=True)
+            
+            # Filter by status if specified
+            if kwargs.get("status"):
+                query = query.eq("status", kwargs["status"])
+            
+            # Filter by restored status if specified
+            if kwargs.get("restored") is not None:
+                query = query.eq("restored", kwargs["restored"])
+            
+            # Apply limit
+            limit = kwargs.get("limit", Config.MAX_TRANSFER_USERS)
+            query = query.limit(min(limit, Config.MAX_TRANSFER_USERS))
+            
+            response = query.execute()
+            
+            users = []
+            for user in response.data:
+                users.append({
+                    "discord_id": user["discord_id"],
+                    "username": user["username"],
+                    "verified_at": user.get("verified_at"),
+                    "restored": user.get("restored", False),
+                    "status": user.get("status", "verified"),
+                    "metadata": user.get("metadata", {})
+                })
+            
+            return users
+            
+        except Exception as e:
+            logger.error(f"Error getting users for transfer: {e}")
+            return []
+    
+    # Transfer Job Management
+    def create_transfer_job(self, job_data: TransferJob) -> bool:
+        """Create a new transfer job"""
+        try:
+            data = {
+                "job_id": job_data.job_id,
+                "source_guild_id": job_data.source_guild_id,
+                "target_guild_id": job_data.target_guild_id,
+                "user_id": job_data.user_id,
+                "status": job_data.status,
+                "config": job_data.config,
+                "result": job_data.result,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            supabase.table("transfer_jobs").insert(data).execute()
+            logger.info(f"Created transfer job: {job_data.job_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating transfer job: {e}")
+            return False
+    
+    def update_transfer_job(self, job_id: str, **kwargs) -> bool:
+        """Update a transfer job"""
+        try:
+            update_data = {"updated_at": datetime.now().isoformat()}
+            
+            if "status" in kwargs:
+                update_data["status"] = kwargs["status"]
+            
+            if "result" in kwargs:
+                update_data["result"] = kwargs["result"]
+            
+            if "total_users" in kwargs:
+                update_data["total_users"] = kwargs["total_users"]
+            
+            if "processed_users" in kwargs:
+                update_data["processed_users"] = kwargs["processed_users"]
+            
+            if "transferred_users" in kwargs:
+                update_data["transferred_users"] = kwargs["transferred_users"]
+            
+            if "failed_users" in kwargs:
+                update_data["failed_users"] = kwargs["failed_users"]
+            
+            if "started_at" in kwargs:
+                update_data["started_at"] = kwargs["started_at"]
+            
+            if "completed_at" in kwargs:
+                update_data["completed_at"] = kwargs["completed_at"]
+            
+            supabase.table("transfer_jobs")\
+                .update(update_data)\
+                .eq("job_id", job_id)\
+                .execute()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating transfer job: {e}")
+            return False
+    
+    def get_transfer_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get a transfer job by ID"""
+        try:
+            response = supabase.table("transfer_jobs")\
+                .select("*")\
+                .eq("job_id", job_id)\
+                .execute()
+            
+            if response.data:
+                return response.data[0]
+                
+        except Exception as e:
+            logger.error(f"Error getting transfer job: {e}")
+        
+        return None
+    
+    def get_user_transfer_jobs(self, user_id: str, guild_id: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get transfer jobs for a user"""
+        try:
+            query = supabase.table("transfer_jobs")\
+                .select("*")\
+                .eq("user_id", user_id)\
+                .order("created_at", desc=True)\
+                .limit(limit)
+            
+            if guild_id:
+                query = query.or_(f"source_guild_id.eq.{guild_id},target_guild_id.eq.{guild_id}")
+            
+            response = query.execute()
+            return response.data
+            
+        except Exception as e:
+            logger.error(f"Error getting user transfer jobs: {e}")
+            return []
     
     # Configuration Management
     def save_bot_config(self, user_id: str, config: Dict[str, Any]):
@@ -603,6 +1012,24 @@ class OAuthHandler:
             logger.error(f"Error getting user guilds: {e}")
         
         return []
+    
+    async def get_bot_guilds(self) -> List[Dict[str, Any]]:
+        """Get guilds the bot is in"""
+        try:
+            headers = {"Authorization": f"Bot {self.bot_token}"}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://discord.com/api/users/@me/guilds",
+                    headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                        
+        except Exception as e:
+            logger.error(f"Error getting bot guilds: {e}")
+        
+        return []
 
 # ==================== INITIALIZE ====================
 db = DatabaseManager()
@@ -612,10 +1039,11 @@ oauth = OAuthHandler()
 def create_jwt(user_data: Dict[str, Any], expires_days: int = 7) -> str:
     """Create JWT token"""
     payload = {
-        "sub": user_data["id"],
-        "username": user_data["username"],
+        "sub": user_data.get("id"),
+        "username": user_data.get("username"),
         "avatar": user_data.get("avatar"),
         "email": user_data.get("email"),
+        "access_token": user_data.get("access_token", ""),  # Store for API calls
         "exp": datetime.now() + timedelta(days=expires_days),
         "iat": datetime.now(),
         "type": "access"
@@ -653,6 +1081,113 @@ async def verify_token(
         )
     
     return user_data
+
+# ==================== TRANSFER MANAGER ====================
+class TransferManager:
+    def __init__(self):
+        self.active_transfers = {}
+    
+    async def process_transfer(self, job_id: str, source_guild_id: str, target_guild_id: str, 
+                               user_ids: List[str], user_data: Dict[str, Any], config: Dict[str, Any]):
+        """Process a user transfer"""
+        try:
+            db.update_transfer_job(job_id, 
+                status="processing",
+                started_at=datetime.now().isoformat(),
+                total_users=len(user_ids)
+            )
+            
+            transferred = []
+            failed = []
+            
+            for i, discord_id in enumerate(user_ids):
+                try:
+                    # Get user data for transfer
+                    metadata = {
+                        "transferred_by": user_data.get("username"),
+                        "transferred_by_id": user_data.get("sub"),
+                        "assign_role_id": config.get("assign_role_id"),
+                        "remove_from_source": config.get("remove_from_source", False)
+                    }
+                    
+                    # Transfer user
+                    success = db.transfer_user(
+                        discord_id=discord_id,
+                        source_guild_id=source_guild_id,
+                        target_guild_id=target_guild_id,
+                        metadata=metadata,
+                        remove_from_source=config.get("remove_from_source", False)
+                    )
+                    
+                    if success:
+                        transferred.append(discord_id)
+                    else:
+                        failed.append(discord_id)
+                    
+                    # Update progress
+                    if (i + 1) % Config.TRANSFER_BATCH_SIZE == 0 or (i + 1) == len(user_ids):
+                        db.update_transfer_job(job_id,
+                            processed_users=i + 1,
+                            transferred_users=len(transferred),
+                            failed_users=len(failed)
+                        )
+                    
+                    # Rate limiting
+                    await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    logger.error(f"Error transferring user {discord_id}: {e}")
+                    failed.append(discord_id)
+            
+            # Mark job as completed
+            db.update_transfer_job(job_id,
+                status="completed",
+                completed_at=datetime.now().isoformat(),
+                result={
+                    "transferred": transferred,
+                    "failed": failed,
+                    "total_transferred": len(transferred),
+                    "total_failed": len(failed)
+                }
+            )
+            
+            # Add log entry
+            db.add_log(
+                log_type="transfer",
+                message=f"Transfer completed: {len(transferred)} users transferred from {source_guild_id} to {target_guild_id}",
+                guild_id=target_guild_id,
+                user_id=user_data.get("sub"),
+                metadata={
+                    "job_id": job_id,
+                    "source_guild": source_guild_id,
+                    "target_guild": target_guild_id,
+                    "transferred_count": len(transferred),
+                    "failed_count": len(failed)
+                }
+            )
+            
+            logger.info(f"Transfer job {job_id} completed: {len(transferred)} transferred, {len(failed)} failed")
+            
+        except Exception as e:
+            logger.error(f"Transfer job {job_id} failed: {e}")
+            db.update_transfer_job(job_id,
+                status="failed",
+                completed_at=datetime.now().isoformat(),
+                result={"error": str(e)}
+            )
+            
+            db.add_log(
+                log_type="error",
+                message=f"Transfer job failed: {str(e)}",
+                guild_id=target_guild_id,
+                user_id=user_data.get("sub"),
+                metadata={
+                    "job_id": job_id,
+                    "error": str(e)
+                }
+            )
+
+transfer_manager = TransferManager()
 
 # ==================== RATE LIMITING ====================
 class RateLimiter:
@@ -705,13 +1240,15 @@ async def root():
     return JSONResponse({
         "status": "online",
         "service": "xotiicsverify API",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "dashboard": True,
+        "features": ["verification", "user_transfer", "dashboard", "bot_integration"],
         "docs": "/docs" if os.getenv("ENVIRONMENT") == "development" else None,
         "endpoints": {
             "auth": "/api/auth/discord",
             "dashboard": "/api/dashboard/*",
             "bot": "/api/bot/*",
+            "transfer": "/api/transfer/*",
             "callback": "/oauth/callback",
             "health": "/health"
         }
@@ -726,16 +1263,23 @@ async def health_check():
         supabase.table("verified_users").select("id").limit(1).execute()
         
         # Check Discord API
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://discord.com/api/v10/gateway") as resp:
-                discord_status = resp.status == 200
+        discord_status = False
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+                    async with session.get("https://discord.com/api/v10/gateway/bot", headers=headers) as resp:
+                        discord_status = resp.status == 200
+            except:
+                pass
         
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "database": "connected",
             "discord_api": "reachable" if discord_status else "unreachable",
-            "version": "4.0.0"
+            "version": "5.0.0",
+            "active_transfers": len(transfer_manager.active_transfers)
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -865,7 +1409,8 @@ async def start_verification(guild_id: str):
         return {
             "success": True,
             "verification_url": auth_url,
-            "embed_code": f"[Verify Here]({auth_url})"
+            "embed_code": f"[Verify Here]({auth_url})",
+            "guild_id": guild_id
         }
         
     except Exception as e:
@@ -1108,7 +1653,8 @@ async def oauth_callback(code: str, state: str):
                 "avatar": user_info.get("avatar"),
                 "email": user_info.get("email"),
                 "locale": user_info.get("locale"),
-                "verified": user_info.get("verified", False)
+                "verified": user_info.get("verified", False),
+                "mfa_enabled": user_info.get("mfa_enabled", False)
             }
         )
         
@@ -1342,6 +1888,7 @@ async def get_dashboard_user(user: Dict[str, Any] = Depends(verify_token)):
                 "username": user.get("username"),
                 "avatar": user.get("avatar"),
                 "email": user.get("email"),
+                "access_token": access_token,
                 "guilds": user_guilds
             }
         }
@@ -1397,7 +1944,7 @@ async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
             # Check if bot is in guild and user has admin permissions
             if guild_id in bot_guild_ids and (int(guild.get("permissions", 0)) & 0x8):  # ADMINISTRATOR permission
                 # Get verified count from database
-                verified_count = len(db.get_guild_users(guild_id, status="verified"))
+                verified_count = db.get_guild_users_count(guild_id, status="verified")
                 
                 servers.append({
                     "id": guild_id,
@@ -1423,6 +1970,76 @@ async def get_user_servers(user: Dict[str, Any] = Depends(verify_token)):
             detail="Failed to get servers"
         )
 
+@app.get("/api/dashboard/servers/available")
+async def get_available_servers(user: Dict[str, Any] = Depends(verify_token)):
+    """Get list of servers the bot can transfer from"""
+    try:
+        # Get user's guilds
+        access_token = user.get("access_token", "")
+        user_guilds = []
+        
+        if access_token:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bearer {access_token}"}
+                    async with session.get(
+                        "https://discord.com/api/users/@me/guilds",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            user_guilds = await resp.json()
+            except:
+                pass
+        
+        # Get bot guilds
+        bot_guilds = []
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                bot_guilds = await oauth.get_bot_guilds()
+            except:
+                pass
+        
+        # Create set of bot guild IDs for fast lookup
+        bot_guild_ids = {guild["id"] for guild in bot_guilds}
+        
+        available_guilds = []
+        
+        for guild in user_guilds:
+            guild_id = guild["id"]
+            guild_name = guild.get("name", "Unknown Server")
+            
+            # Check if bot is in guild and user has admin permissions
+            if guild_id in bot_guild_ids and (int(guild.get("permissions", 0)) & 0x8):  # ADMIN permission
+                # Get verified count
+                verified_count = db.get_guild_users_count(guild_id)
+                
+                # Get stats
+                stats = db.get_guild_stats(guild_id)
+                
+                available_guilds.append({
+                    "id": guild_id,
+                    "name": guild_name,
+                    "icon": guild.get("icon"),
+                    "icon_url": f"https://cdn.discordapp.com/icons/{guild_id}/{guild['icon']}.png" if guild.get("icon") else None,
+                    "verified_count": verified_count,
+                    "stats": stats,
+                    "owner": guild.get("owner", False),
+                    "permissions": guild.get("permissions", 0)
+                })
+        
+        return {
+            "success": True,
+            "servers": available_guilds,
+            "count": len(available_guilds)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting available servers: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get available servers"
+        )
+
 # Server endpoints
 @app.get("/api/dashboard/server/{guild_id}/stats")
 async def get_server_stats(guild_id: str, user: Dict[str, Any] = Depends(verify_token)):
@@ -1444,21 +2061,25 @@ async def get_server_stats(guild_id: str, user: Dict[str, Any] = Depends(verify_
 @app.get("/api/dashboard/server/{guild_id}/members")
 async def get_server_members(
     guild_id: str,
-    status: str = None,
+    status: str = "all",
     restored: bool = None,
+    transferred: bool = None,
     limit: int = 50,
     offset: int = 0,
     user: Dict[str, Any] = Depends(verify_token)
 ):
     """Get server members with pagination"""
     try:
-        members = db.get_guild_users(
+        members = db.get_users_by_guild(
             guild_id,
             status=status,
             restored=restored,
+            transferred=transferred,
             limit=limit,
             offset=offset
         )
+        
+        total_count = db.get_guild_users_count(guild_id)
         
         return {
             "success": True,
@@ -1466,8 +2087,8 @@ async def get_server_members(
             "pagination": {
                 "limit": limit,
                 "offset": offset,
-                "total": len(members),
-                "has_more": len(members) == limit
+                "total": total_count,
+                "has_more": (offset + len(members)) < total_count
             }
         }
     except Exception as e:
@@ -1568,6 +2189,293 @@ async def get_verification_link(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate verification link"
+        )
+
+# Transfer endpoints
+@app.get("/api/dashboard/transfer/servers")
+async def get_transfer_servers(user: Dict[str, Any] = Depends(verify_token)):
+    """Get servers available for transfer (both source and target)"""
+    try:
+        # Get user's guilds where bot is present and user has admin
+        available_servers = await get_available_servers(user)
+        
+        if not available_servers.get("success"):
+            raise HTTPException(status_code=500, detail="Failed to get servers")
+        
+        servers = available_servers.get("servers", [])
+        
+        return {
+            "success": True,
+            "servers": servers,
+            "max_transfer_users": Config.MAX_TRANSFER_USERS
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting transfer servers: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get transfer servers"
+        )
+
+@app.post("/api/dashboard/transfer/preview")
+async def preview_transfer(
+    request: Request,
+    user: Dict[str, Any] = Depends(verify_token)
+):
+    """Preview a transfer before executing"""
+    try:
+        data = await request.json()
+        
+        source_guild_id = data.get("source_guild_id")
+        target_guild_id = data.get("target_guild_id")
+        limit = data.get("limit", Config.MAX_TRANSFER_USERS)
+        status_filter = data.get("status", "verified")
+        restored_filter = data.get("restored")
+        
+        if not source_guild_id or not target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guild IDs are required"
+            )
+        
+        if source_guild_id == target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guilds cannot be the same"
+            )
+        
+        # Get users from source guild
+        users = db.get_users_for_transfer(
+            source_guild_id,
+            status=status_filter,
+            restored=restored_filter,
+            limit=limit
+        )
+        
+        # Get server info
+        source_guild_info = None
+        target_guild_info = None
+        
+        # Try to get guild names from Discord API
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+                    
+                    # Get source guild info
+                    async with session.get(
+                        f"https://discord.com/api/v10/guilds/{source_guild_id}",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            source_guild_info = await resp.json()
+                    
+                    # Get target guild info
+                    async with session.get(
+                        f"https://discord.com/api/v10/guilds/{target_guild_id}",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            target_guild_info = await resp.json()
+            except:
+                pass
+        
+        return {
+            "success": True,
+            "preview": {
+                "source_guild": {
+                    "id": source_guild_id,
+                    "name": source_guild_info.get("name") if source_guild_info else "Unknown Server",
+                    "user_count": len(users)
+                },
+                "target_guild": {
+                    "id": target_guild_id,
+                    "name": target_guild_info.get("name") if target_guild_info else "Unknown Server"
+                },
+                "users": users[:10],  # Return first 10 users for preview
+                "total_users": len(users),
+                "estimated_time": f"{len(users) * 0.1:.1f} seconds"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error previewing transfer: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to preview transfer: {str(e)}"
+        )
+
+@app.post("/api/dashboard/transfer/execute")
+async def execute_transfer(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    user: Dict[str, Any] = Depends(verify_token)
+):
+    """Execute a user transfer between servers"""
+    try:
+        data = await request.json()
+        
+        source_guild_id = data.get("source_guild_id")
+        target_guild_id = data.get("target_guild_id")
+        user_ids = data.get("user_ids", [])
+        limit = data.get("limit")
+        assign_role_id = data.get("assign_role_id")
+        remove_from_source = data.get("remove_from_source", False)
+        transfer_all = data.get("transfer_all", False)
+        
+        if not source_guild_id or not target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guild IDs are required"
+            )
+        
+        if source_guild_id == target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guilds cannot be the same"
+            )
+        
+        # Get user IDs to transfer
+        if transfer_all:
+            # Get all users from source guild
+            users = db.get_users_for_transfer(
+                source_guild_id,
+                limit=limit or Config.MAX_TRANSFER_USERS
+            )
+            user_ids = [user["discord_id"] for user in users]
+        elif not user_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No users specified for transfer"
+            )
+        
+        # Apply limit if specified
+        if limit and len(user_ids) > limit:
+            user_ids = user_ids[:limit]
+        
+        # Check if user has permission in both guilds
+        # (This would require checking Discord API for user's permissions in each guild)
+        
+        # Create transfer job
+        job_id = str(uuid.uuid4())
+        
+        job_data = TransferJob(
+            job_id=job_id,
+            source_guild_id=source_guild_id,
+            target_guild_id=target_guild_id,
+            user_id=user.get("sub"),
+            config={
+                "assign_role_id": assign_role_id,
+                "remove_from_source": remove_from_source,
+                "limit": limit,
+                "total_users": len(user_ids)
+            }
+        )
+        
+        db.create_transfer_job(job_data)
+        
+        # Add log entry
+        db.add_log(
+            log_type="transfer",
+            message=f"Started transfer job {job_id}: {len(user_ids)} users from {source_guild_id} to {target_guild_id}",
+            guild_id=target_guild_id,
+            user_id=user.get("sub"),
+            metadata={
+                "job_id": job_id,
+                "source_guild": source_guild_id,
+                "target_guild": target_guild_id,
+                "user_count": len(user_ids),
+                "assign_role_id": assign_role_id
+            }
+        )
+        
+        # Start background transfer task
+        background_tasks.add_task(
+            transfer_manager.process_transfer,
+            job_id,
+            source_guild_id,
+            target_guild_id,
+            user_ids,
+            user,
+            job_data.config
+        )
+        
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": f"Transfer started for {len(user_ids)} users",
+            "status": "pending",
+            "estimated_time": f"{len(user_ids) * 0.1:.1f} seconds"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error executing transfer: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to execute transfer: {str(e)}"
+        )
+
+@app.get("/api/dashboard/transfer/jobs")
+async def get_transfer_jobs(
+    guild_id: Optional[str] = None,
+    limit: int = 10,
+    user: Dict[str, Any] = Depends(verify_token)
+):
+    """Get transfer jobs for the current user"""
+    try:
+        jobs = db.get_user_transfer_jobs(
+            user_id=user.get("sub"),
+            guild_id=guild_id,
+            limit=limit
+        )
+        
+        return {
+            "success": True,
+            "jobs": jobs,
+            "count": len(jobs)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting transfer jobs: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get transfer jobs"
+        )
+
+@app.get("/api/dashboard/transfer/job/{job_id}")
+async def get_transfer_job_status(
+    job_id: str,
+    user: Dict[str, Any] = Depends(verify_token)
+):
+    """Get status of a specific transfer job"""
+    try:
+        job = db.get_transfer_job(job_id)
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Transfer job not found"
+            )
+        
+        # Check if user owns this job
+        if job.get("user_id") != user.get("sub"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to view this job"
+            )
+        
+        return {
+            "success": True,
+            "job": job
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting transfer job status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get transfer job status"
         )
 
 # Configuration endpoints
@@ -1742,13 +2650,18 @@ async def get_bot_status():
         return {
             "status": "online",
             "timestamp": datetime.now().isoformat(),
-            "version": "4.0.0",
+            "version": "5.0.0",
             "discord": discord_status,
             "database": "connected",
             "stats": {
                 "total_users": total_users_count,
                 "shards": discord_data.get("shards", 1),
                 "session_start_limit": discord_data.get("session_start_limit", {})
+            },
+            "features": {
+                "verification": True,
+                "transfers": True,
+                "dashboard": True
             }
         }
         
@@ -1757,7 +2670,7 @@ async def get_bot_status():
         return {
             "status": "error",
             "timestamp": datetime.now().isoformat(),
-            "version": "4.0.0",
+            "version": "5.0.0",
             "error": str(e)
         }
 
@@ -1765,7 +2678,7 @@ async def get_bot_status():
 async def get_guild_verified_users(guild_id: str):
     """Get verified users for a guild (for bot restoration)"""
     try:
-        users = db.get_guild_users(guild_id, status="verified", restored=False)
+        users = db.get_users_by_guild(guild_id, status="verified", restored=False)
         return {
             "success": True,
             "users": users,
@@ -1823,6 +2736,81 @@ async def bot_restore_members(guild_id: str, request: Request):
             detail="Restoration failed"
         )
 
+@app.post("/api/bot/transfer-users")
+async def bot_transfer_users(request: Request):
+    """Bot endpoint to transfer users between servers"""
+    try:
+        data = await request.json()
+        
+        source_guild_id = data.get("source_guild_id")
+        target_guild_id = data.get("target_guild_id")
+        user_ids = data.get("user_ids", [])
+        role_id = data.get("role_id")
+        remove_from_source = data.get("remove_from_source", False)
+        
+        if not source_guild_id or not target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guild IDs are required"
+            )
+        
+        if not user_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No user IDs provided"
+            )
+        
+        transferred = []
+        failed = []
+        
+        for user_id in user_ids:
+            success = db.transfer_user(
+                discord_id=user_id,
+                source_guild_id=source_guild_id,
+                target_guild_id=target_guild_id,
+                metadata={"bot_transfer": True, "role_id": role_id},
+                remove_from_source=remove_from_source
+            )
+            
+            if success:
+                transferred.append(user_id)
+                
+                # Mark as restored in target guild
+                db.mark_user_restored(user_id, target_guild_id, role_id)
+            else:
+                failed.append(user_id)
+        
+        # Add log entry
+        db.add_log(
+            log_type="transfer",
+            message=f"Bot transferred {len(transferred)} users from {source_guild_id} to {target_guild_id}",
+            guild_id=target_guild_id,
+            metadata={
+                "source_guild": source_guild_id,
+                "target_guild": target_guild_id,
+                "transferred": transferred,
+                "failed": failed,
+                "role_id": role_id,
+                "remove_from_source": remove_from_source,
+                "source": "bot_api"
+            }
+        )
+        
+        return {
+            "success": True,
+            "transferred": len(transferred),
+            "failed": len(failed),
+            "transferred_ids": transferred,
+            "failed_ids": failed
+        }
+        
+    except Exception as e:
+        logger.error(f"Bot transfer error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Transfer failed: {str(e)}"
+        )
+
 # ==================== UTILITY ENDPOINTS ====================
 
 @app.get("/api/verify/{guild_id}")
@@ -1846,7 +2834,8 @@ async def get_verification_url_public(guild_id: str):
             "success": True,
             "verification_url": auth_url,
             "embed_code": f"[Verify Here]({auth_url})",
-            "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(auth_url)}"
+            "qr_code": f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(auth_url)}",
+            "guild_id": guild_id
         }
         
     except Exception as e:
