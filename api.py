@@ -1866,6 +1866,407 @@ async def oauth_callback(code: str, state: str):
 
 # ==================== DASHBOARD API ====================
 
+# ==================== MISSING BOT ENDPOINTS ====================
+
+@app.post("/api/bot/verify-manual")
+async def manual_verification(request: Request):
+    """Manual verification endpoint for bot commands"""
+    try:
+        data = await request.json()
+        
+        user_data = UserCreate(
+            discord_id=data.get("discord_id"),
+            username=data.get("username"),
+            access_token=data.get("access_token", "manual"),
+            refresh_token=data.get("refresh_token", "manual"),
+            expires_in=data.get("expires_in", 604800),
+            guild_id=data.get("guild_id"),
+            metadata=data.get("metadata", {})
+        )
+        
+        success = db.add_verified_user(user_data)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "User manually verified",
+                "user_id": user_data.discord_id
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to save user to database"
+            )
+            
+    except Exception as e:
+        logger.error(f"Manual verification error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid request: {str(e)}"
+        )
+
+@app.get("/api/bot/guild/{guild_id}/verified")
+async def get_guild_verified_users_simple(guild_id: str):
+    """Get verified users for a guild (simplified for bot)"""
+    try:
+        users = db.get_users_by_guild(guild_id, status="verified")
+        
+        # Format for bot response
+        formatted_users = []
+        for user in users:
+            formatted_users.append({
+                "discord_id": user["discord_id"],
+                "username": user["username"],
+                "restored": user.get("restored", False),
+                "verified_at": user.get("verified_at"),
+                "status": user.get("status", "verified")
+            })
+        
+        return {
+            "success": True,
+            "users": formatted_users,
+            "count": len(formatted_users)
+        }
+    except Exception as e:
+        logger.error(f"Error getting guild verified users: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get verified users"
+        )
+
+@app.post("/api/bot/guild/{guild_id}/send-verification")
+async def bot_send_verification_embed(
+    guild_id: str,
+    request: Request
+):
+    """Bot endpoint to send verification embed"""
+    try:
+        data = await request.json()
+        channel_id = data.get("channel_id")
+        
+        if not channel_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Channel ID is required"
+            )
+        
+        # Generate verification URL
+        state = secrets.token_urlsafe(32)
+        verification_url = f"{Config.API_URL}/verify/{guild_id}"
+        
+        # Save state
+        db.save_oauth_state(
+            state=state,
+            guild_id=guild_id,
+            type="verification",
+            metadata={"channel_id": channel_id}
+        )
+        
+        # Add log
+        db.add_log(
+            log_type="verification",
+            message=f"Verification embed generated for channel {channel_id}",
+            guild_id=guild_id,
+            metadata={
+                "channel_id": channel_id,
+                "verification_url": verification_url
+            }
+        )
+        
+        return {
+            "success": True,
+            "verification_url": verification_url,
+            "channel_id": channel_id,
+            "embed_code": f"[Verify Here]({verification_url})"
+        }
+        
+    except Exception as e:
+        logger.error(f"Bot send verification error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate verification: {str(e)}"
+        )
+
+# ==================== DASHBOARD ENDPOINTS ENHANCEMENT ====================
+
+@app.get("/api/dashboard/servers")
+async def get_user_servers_enhanced(user: Dict[str, Any] = Depends(verify_token)):
+    """Enhanced server list for dashboard"""
+    try:
+        print(f"Getting servers for user: {user.get('username')}")
+        
+        # Get bot guilds
+        bot_guilds = []
+        if Config.DISCORD_BOT_TOKEN:
+            headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://discord.com/api/users/@me/guilds",
+                    headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        bot_guilds = await resp.json()
+                        print(f"Bot is in {len(bot_guilds)} guilds")
+                    else:
+                        print(f"Failed to get bot guilds: {resp.status}")
+        
+        # Get user's access token
+        access_token = user.get("access_token", "")
+        user_guilds = []
+        
+        if access_token:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bearer {access_token}"}
+                    async with session.get(
+                        "https://discord.com/api/users/@me/guilds",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            user_guilds = await resp.json()
+            except Exception as e:
+                print(f"Error getting user guilds: {e}")
+        
+        # Create set of bot guild IDs for quick lookup
+        bot_guild_ids = {guild["id"] for guild in bot_guilds}
+        
+        # Prepare response
+        servers = []
+        for guild in bot_guilds:
+            guild_id = guild["id"]
+            
+            # Check if user has permission in this guild
+            user_has_access = False
+            user_permissions = 0
+            
+            for user_guild in user_guilds:
+                if user_guild["id"] == guild_id:
+                    user_has_access = True
+                    user_permissions = int(user_guild.get("permissions", 0))
+                    break
+            
+            # Skip if user doesn't have access
+            if not user_has_access:
+                continue
+            
+            # Check if user has admin permissions
+            has_admin = (user_permissions & 0x8) != 0  # ADMINISTRATOR permission
+            
+            # Get verified count
+            verified_count = db.get_guild_users_count(guild_id)
+            
+            # Get stats
+            stats = db.get_guild_stats(guild_id)
+            
+            # Get server config
+            config = db.get_server_config(guild_id)
+            
+            servers.append({
+                "id": guild_id,
+                "name": guild.get("name", "Unknown Server"),
+                "icon": guild.get("icon"),
+                "icon_url": f"https://cdn.discordapp.com/icons/{guild_id}/{guild['icon']}.png" if guild.get("icon") else None,
+                "member_count": guild.get("approximate_member_count", 0),
+                "verified_count": verified_count,
+                "owner": guild.get("owner", False),
+                "permissions": user_permissions,
+                "has_admin": has_admin,
+                "stats": stats,
+                "config_configured": bool(config),
+                "verification_channel": config.get("verification_channel") if config else None,
+                "verification_role": config.get("verification_role") if config else None
+            })
+        
+        print(f"Returning {len(servers)} servers to dashboard")
+        return {
+            "success": True,
+            "servers": servers,
+            "count": len(servers),
+            "user_permissions": {
+                "username": user.get("username"),
+                "id": user.get("sub"),
+                "can_manage_servers": len(servers) > 0
+            }
+        }
+        
+    except Exception as e:
+        print(f"ERROR in get_user_servers: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "servers": [],
+            "count": 0,
+            "error": str(e)
+        }
+
+# ==================== TRANSFER ENDPOINTS ENHANCEMENT ====================
+
+@app.post("/api/dashboard/transfer/preview")
+async def transfer_preview_enhanced(
+    request: Request,
+    user: Dict[str, Any] = Depends(verify_token)
+):
+    """Enhanced transfer preview"""
+    try:
+        data = await request.json()
+        
+        source_guild_id = data.get("source_guild_id")
+        target_guild_id = data.get("target_guild_id")
+        limit = data.get("limit", 100)
+        status_filter = data.get("status", "verified")
+        restored_filter = data.get("restored")
+        
+        if not source_guild_id or not target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guild IDs are required"
+            )
+        
+        if source_guild_id == target_guild_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Source and target guilds cannot be the same"
+            )
+        
+        # Get users from source guild
+        users = db.get_users_for_transfer(
+            source_guild_id,
+            status=status_filter,
+            restored=restored_filter,
+            limit=limit
+        )
+        
+        # Get server names
+        source_guild_name = "Source Server"
+        target_guild_name = "Target Server"
+        
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+                    
+                    # Get source guild info
+                    async with session.get(
+                        f"https://discord.com/api/v10/guilds/{source_guild_id}",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            source_guild_info = await resp.json()
+                            source_guild_name = source_guild_info.get("name", source_guild_name)
+                    
+                    # Get target guild info
+                    async with session.get(
+                        f"https://discord.com/api/v10/guilds/{target_guild_id}",
+                        headers=headers
+                    ) as resp:
+                        if resp.status == 200:
+                            target_guild_info = await resp.json()
+                            target_guild_name = target_guild_info.get("name", target_guild_name)
+            except:
+                pass
+        
+        return {
+            "success": True,
+            "preview": {
+                "source_guild": {
+                    "id": source_guild_id,
+                    "name": source_guild_name,
+                    "user_count": len(users)
+                },
+                "target_guild": {
+                    "id": target_guild_id,
+                    "name": target_guild_name
+                },
+                "users": users[:10],  # First 10 users
+                "total_users": len(users),
+                "estimated_time": f"{(len(users) * 0.2):.1f} seconds"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Transfer preview error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to preview transfer: {str(e)}"
+        )
+
+# ==================== HEALTH ENDPOINT ====================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Check database
+        supabase.table("verified_users").select("id").limit(1).execute()
+        
+        # Check Discord API
+        discord_status = False
+        if Config.DISCORD_BOT_TOKEN:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {"Authorization": f"Bot {Config.DISCORD_BOT_TOKEN}"}
+                    async with session.get(
+                        "https://discord.com/api/v10/gateway/bot",
+                        headers=headers
+                    ) as resp:
+                        discord_status = resp.status == 200
+            except:
+                pass
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected",
+            "discord_api": "reachable" if discord_status else "unreachable",
+            "version": "5.0.0",
+            "active_transfers": len(transfer_manager.active_transfers)
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unhealthy"
+        )
+
+# ==================== VERIFICATION ENDPOINT ====================
+
+@app.get("/api/verify/{guild_id}")
+async def get_verification_url(guild_id: str):
+    """Get verification URL for a guild"""
+    try:
+        state = secrets.token_urlsafe(32)
+        
+        # Save state
+        db.save_oauth_state(
+            state=state,
+            guild_id=guild_id,
+            type="verification"
+        )
+        
+        # Generate verification URL
+        redirect_uri = f"{Config.API_URL}/oauth/callback"
+        auth_url = oauth.get_authorization_url(redirect_uri, state, guild_id)
+        
+        # QR code
+        qr_code_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={urllib.parse.quote(auth_url)}"
+        
+        return {
+            "success": True,
+            "verification_url": auth_url,
+            "qr_code_url": qr_code_url,
+            "embed_code": f"[Verify Here]({auth_url})",
+            "guild_id": guild_id,
+            "expires_in": "10 minutes"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating verification URL: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate verification URL"
+        )
+
 # User endpoints
 @app.get("/api/dashboard/user")
 async def get_dashboard_user(user: Dict[str, Any] = Depends(verify_token)):
@@ -2875,4 +3276,5 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
+
 
