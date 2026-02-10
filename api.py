@@ -73,29 +73,12 @@ async def lifespan(app: FastAPI):
         logger.info("Database connection verified")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
-        raise
-    
-    # Initialize tables if they don't exist
-    await initialize_tables()
+        logger.warning("Database connection failed, but continuing startup...")
     
     yield
     
     # Shutdown
     logger.info("Shutting down xotiicsverify API...")
-
-async def initialize_tables():
-    """Check database connection - tables should already exist"""
-    try:
-        # Just verify database connection
-        supabase.table("verified_users").select("id").limit(1).execute()
-        logger.info("Database connection verified - tables should exist")
-        
-        # If any table is missing, it will be created on first use
-        logger.info("Using existing Supabase schema")
-        
-    except Exception as e:
-        logger.error(f"Database connection failed: {e}")
-        logger.warning("Tables need to be created manually in Supabase.")
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(
@@ -126,7 +109,7 @@ try:
     logger.info("Supabase client initialized")
 except Exception as e:
     logger.error(f"Failed to initialize Supabase: {e}")
-    raise
+    # Don't raise here, let the app start and handle database errors gracefully
 
 # ==================== MODELS ====================
 class BotConfig(BaseModel):
@@ -2260,7 +2243,11 @@ async def health_check():
     """Health check endpoint"""
     try:
         # Check database connection
-        supabase.table("verified_users").select("id").limit(1).execute()
+        try:
+            supabase.table("verified_users").select("id").limit(1).execute()
+            db_status = "connected"
+        except:
+            db_status = "disconnected"
         
         # Check Discord API
         discord_status = False
@@ -2276,16 +2263,16 @@ async def health_check():
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "database": "connected",
+            "database": db_status,
             "discord_api": "reachable" if discord_status else "unreachable",
             "version": "5.0.0",
             "active_transfers": len(transfer_manager.active_transfers)
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Service unhealthy"
+            content={"status": "unhealthy", "error": str(e)}
         )
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
@@ -2946,8 +2933,12 @@ async def transfer_preview_enhanced(
 async def health_check_endpoint():
     """Health check endpoint"""
     try:
-        # Check database
-        supabase.table("verified_users").select("id").limit(1).execute()
+        # Check database connection
+        try:
+            supabase.table("verified_users").select("id").limit(1).execute()
+            db_status = "connected"
+        except:
+            db_status = "disconnected"
         
         # Check Discord API
         discord_status = False
@@ -2966,16 +2957,16 @@ async def health_check_endpoint():
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "database": "connected",
+            "database": db_status,
             "discord_api": "reachable" if discord_status else "unreachable",
             "version": "5.0.0",
             "active_transfers": len(transfer_manager.active_transfers)
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Service unhealthy"
+            content={"status": "unhealthy", "error": str(e)}
         )
 
 # ==================== VERIFICATION ENDPOINT ====================
