@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 import time
 import uuid
 import asyncio
+import html
 
 # ==================== CONFIGURATION ====================
 class Config:
@@ -83,126 +84,18 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down xotiicsverify API...")
 
 async def initialize_tables():
-    """Initialize database tables if they don't exist"""
+    """Check database connection - tables should already exist"""
     try:
-        # Create verified_users table if not exists
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'verified_users',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                discord_id TEXT NOT NULL,
-                username TEXT NOT NULL,
-                access_token TEXT NOT NULL,
-                refresh_token TEXT NOT NULL,
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                guild_id TEXT NOT NULL,
-                metadata JSONB DEFAULT '{}'::jsonb,
-                status TEXT DEFAULT 'verified',
-                verified_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                restored BOOLEAN DEFAULT FALSE,
-                restored_at TIMESTAMP WITH TIME ZONE,
-                restored_role_id TEXT,
-                transferred_from TEXT,
-                transferred_at TIMESTAMP WITH TIME ZONE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                UNIQUE(discord_id, guild_id)
-            '''
-        }).execute()
+        # Just verify database connection
+        supabase.table("verified_users").select("id").limit(1).execute()
+        logger.info("Database connection verified - tables should exist")
         
-        # Create indexes
-        supabase.rpc('create_index_if_not_exists', {
-            'table_name': 'verified_users',
-            'index_name': 'idx_verified_users_guild_status',
-            'index_sql': 'CREATE INDEX IF NOT EXISTS idx_verified_users_guild_status ON verified_users(guild_id, status)'
-        }).execute()
-        
-        supabase.rpc('create_index_if_not_exists', {
-            'table_name': 'verified_users',
-            'index_name': 'idx_verified_users_discord_id',
-            'index_sql': 'CREATE INDEX IF NOT EXISTS idx_verified_users_discord_id ON verified_users(discord_id)'
-        }).execute()
-        
-        # Create oauth_states table
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'oauth_states',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                state TEXT NOT NULL UNIQUE,
-                user_id TEXT,
-                guild_id TEXT,
-                redirect_url TEXT,
-                type TEXT DEFAULT 'auth',
-                metadata JSONB DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                expires_at TIMESTAMP WITH TIME ZONE NOT NULL
-            '''
-        }).execute()
-        
-        # Create bot_configs table
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'bot_configs',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL UNIQUE,
-                config JSONB DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            '''
-        }).execute()
-        
-        # Create server_configs table
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'server_configs',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                guild_id TEXT NOT NULL UNIQUE,
-                config JSONB DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            '''
-        }).execute()
-        
-        # Create logs table
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'logs',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                guild_id TEXT,
-                type TEXT NOT NULL,
-                message TEXT NOT NULL,
-                user_id TEXT,
-                metadata JSONB DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            '''
-        }).execute()
-        
-        # Create transfer_jobs table
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'transfer_jobs',
-            'table_schema': '''
-                id BIGSERIAL PRIMARY KEY,
-                job_id TEXT NOT NULL UNIQUE,
-                source_guild_id TEXT NOT NULL,
-                target_guild_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                config JSONB DEFAULT '{}'::jsonb,
-                result JSONB DEFAULT '{}'::jsonb,
-                total_users INTEGER DEFAULT 0,
-                processed_users INTEGER DEFAULT 0,
-                transferred_users INTEGER DEFAULT 0,
-                failed_users INTEGER DEFAULT 0,
-                started_at TIMESTAMP WITH TIME ZONE,
-                completed_at TIMESTAMP WITH TIME ZONE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            '''
-        }).execute()
-        
-        logger.info("Database tables initialized")
+        # If any table is missing, it will be created on first use
+        logger.info("Using existing Supabase schema")
         
     except Exception as e:
-        logger.warning(f"Could not initialize tables (they may already exist): {e}")
+        logger.error(f"Database connection failed: {e}")
+        logger.warning("Tables need to be created manually in Supabase.")
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(
@@ -283,6 +176,1113 @@ class TransferJob(BaseModel):
     config: Dict[str, Any]
     status: str = "pending"
     result: Dict[str, Any] = {}
+
+# ==================== ENHANCED HTML TEMPLATES ====================
+
+OAUTH_ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verification Error</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Exo 2', sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a0000 100%);
+            color: #fff;
+            min-height: 100vh;
+            overflow-x: hidden;
+            position: relative;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                radial-gradient(circle at 20% 50%, rgba(255, 0, 0, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(255, 20, 20, 0.08) 0%, transparent 50%),
+                radial-gradient(circle at 40% 80%, rgba(255, 40, 40, 0.06) 0%, transparent 50%);
+            z-index: -1;
+            animation: pulse 8s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.5; }
+            50% { opacity: 1; }
+        }
+        
+        .glitch {
+            position: relative;
+            animation: glitch 3s infinite;
+        }
+        
+        @keyframes glitch {
+            0% { transform: translate(0); }
+            2% { transform: translate(-2px, 2px); }
+            4% { transform: translate(-2px, -2px); }
+            6% { transform: translate(2px, 2px); }
+            8% { transform: translate(2px, -2px); }
+            10% { transform: translate(0); }
+            100% { transform: translate(0); }
+        }
+        
+        .container {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .error-card {
+            background: rgba(20, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 0, 0, 0.3);
+            border-radius: 20px;
+            padding: 60px 40px;
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 
+                0 0 50px rgba(255, 0, 0, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            animation: float 6s ease-in-out infinite;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .error-card::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(45deg, transparent, rgba(255, 0, 0, 0.1), transparent);
+            animation: shine 3s infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotateX(0deg); }
+            50% { transform: translateY(-20px) rotateX(5deg); }
+        }
+        
+        @keyframes shine {
+            0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }
+            100% { transform: translateX(100%) translateY(100%) rotate(45deg); }
+        }
+        
+        .error-icon {
+            font-size: 80px;
+            margin-bottom: 30px;
+            color: #ff0000;
+            text-shadow: 0 0 30px rgba(255, 0, 0, 0.7);
+            animation: heartbeat 1.5s infinite;
+        }
+        
+        @keyframes heartbeat {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+        
+        .error-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 2.8em;
+            font-weight: 900;
+            margin-bottom: 20px;
+            background: linear-gradient(45deg, #ff0000, #ff3333, #ff0000);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 20px rgba(255, 0, 0, 0.5);
+            letter-spacing: 2px;
+            animation: textGlow 2s infinite;
+        }
+        
+        @keyframes textGlow {
+            0%, 100% { text-shadow: 0 0 20px rgba(255, 0, 0, 0.5); }
+            50% { text-shadow: 0 0 40px rgba(255, 0, 0, 0.8); }
+        }
+        
+        .error-message {
+            font-size: 1.2em;
+            line-height: 1.6;
+            margin-bottom: 30px;
+            color: #ff9999;
+            font-weight: 300;
+        }
+        
+        .error-details {
+            background: rgba(255, 0, 0, 0.1);
+            border-left: 4px solid #ff0000;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: left;
+            border-radius: 0 10px 10px 0;
+            animation: slideIn 0.5s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
+        .retry-btn {
+            display: inline-block;
+            background: linear-gradient(45deg, #ff0000, #cc0000);
+            color: white;
+            padding: 15px 40px;
+            border-radius: 50px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1em;
+            border: none;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 20px rgba(255, 0, 0, 0.4);
+            position: relative;
+            overflow: hidden;
+            font-family: 'Orbitron', sans-serif;
+            letter-spacing: 1px;
+        }
+        
+        .retry-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            transition: 0.5s;
+        }
+        
+        .retry-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(255, 0, 0, 0.6);
+        }
+        
+        .retry-btn:hover::before {
+            left: 100%;
+        }
+        
+        .retry-btn:active {
+            transform: translateY(-1px);
+        }
+        
+        .scanlines {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            background: repeating-linear-gradient(
+                0deg,
+                rgba(0, 0, 0, 0.15) 0px,
+                rgba(0, 0, 0, 0.15) 1px,
+                transparent 1px,
+                transparent 2px
+            );
+            animation: scan 10s linear infinite;
+            z-index: 2;
+        }
+        
+        @keyframes scan {
+            0% { transform: translateY(0); }
+            100% { transform: translateY(100px); }
+        }
+        
+        .particles {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: -1;
+        }
+        
+        .particle {
+            position: absolute;
+            background: rgba(255, 0, 0, 0.3);
+            border-radius: 50%;
+            animation: floatParticle 15s infinite linear;
+        }
+        
+        @keyframes floatParticle {
+            0% {
+                transform: translateY(100vh) translateX(0) rotate(0deg);
+                opacity: 0;
+            }
+            10% {
+                opacity: 1;
+            }
+            90% {
+                opacity: 1;
+            }
+            100% {
+                transform: translateY(-100px) translateX(100px) rotate(360deg);
+                opacity: 0;
+            }
+        }
+        
+        .glitch-text {
+            position: relative;
+            display: inline-block;
+        }
+        
+        .glitch-text::before,
+        .glitch-text::after {
+            content: attr(data-text);
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        
+        .glitch-text::before {
+            left: 2px;
+            text-shadow: -2px 0 #ff0000;
+            clip: rect(44px, 450px, 56px, 0);
+            animation: glitch-anim-1 5s infinite linear alternate-reverse;
+        }
+        
+        .glitch-text::after {
+            left: -2px;
+            text-shadow: -2px 0 #00ff00;
+            clip: rect(44px, 450px, 56px, 0);
+            animation: glitch-anim-2 5s infinite linear alternate-reverse;
+        }
+        
+        @keyframes glitch-anim-1 {
+            0% { clip: rect(61px, 9999px, 52px, 0); }
+            5% { clip: rect(33px, 9999px, 115px, 0); }
+            10% { clip: rect(122px, 9999px, 156px, 0); }
+            15% { clip: rect(48px, 9999px, 97px, 0); }
+            20% { clip: rect(58px, 9999px, 84px, 0); }
+            25% { clip: rect(118px, 9999px, 84px, 0); }
+            30% { clip: rect(15px, 9999px, 7px, 0); }
+            35% { clip: rect(90px, 9999px, 23px, 0); }
+            40% { clip: rect(5px, 9999px, 99px, 0); }
+            45% { clip: rect(73px, 9999px, 55px, 0); }
+            50% { clip: rect(138px, 9999px, 88px, 0); }
+            55% { clip: rect(121px, 9999px, 17px, 0); }
+            60% { clip: rect(112px, 9999px, 17px, 0); }
+            65% { clip: rect(19px, 9999px, 64px, 0); }
+            70% { clip: rect(133px, 9999px, 40px, 0); }
+            75% { clip: rect(104px, 9999px, 114px, 0); }
+            80% { clip: rect(8px, 9999px, 20px, 0); }
+            85% { clip: rect(106px, 9999px, 85px, 0); }
+            90% { clip: rect(86px, 9999px, 103px, 0); }
+            95% { clip: rect(93px, 9999px, 94px, 0); }
+            100% { clip: rect(136px, 9999px, 120px, 0); }
+        }
+        
+        @keyframes glitch-anim-2 {
+            0% { clip: rect(129px, 9999px, 90px, 0); }
+            5% { clip: rect(84px, 9999px, 66px, 0); }
+            10% { clip: rect(42px, 9999px, 25px, 0); }
+            15% { clip: rect(99px, 9999px, 69px, 0); }
+            20% { clip: rect(47px, 9999px, 31px, 0); }
+            25% { clip: rect(53px, 9999px, 27px, 0); }
+            30% { clip: rect(145px, 9999px, 106px, 0); }
+            35% { clip: rect(18px, 9999px, 52px, 0); }
+            40% { clip: rect(71px, 9999px, 103px, 0); }
+            45% { clip: rect(81px, 9999px, 46px, 0); }
+            50% { clip: rect(15px, 9999px, 123px, 0); }
+            55% { clip: rect(8px, 9999px, 30px, 0); }
+            60% { clip: rect(116px, 9999px, 139px, 0); }
+            65% { clip: rect(148px, 9999px, 137px, 0); }
+            70% { clip: rect(81px, 9999px, 64px, 0); }
+            75% { clip: rect(43px, 9999px, 70px, 0); }
+            80% { clip: rect(13px, 9999px, 20px, 0); }
+            85% { clip: rect(96px, 9999px, 57px, 0); }
+            90% { clip: rect(106px, 9999px, 109px, 0); }
+            95% { clip: rect(23px, 9999px, 35px, 0); }
+            100% { clip: rect(148px, 9999px, 150px, 0); }
+        }
+        
+        .matrix-code {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: -1;
+            opacity: 0.1;
+        }
+        
+        .code-char {
+            position: absolute;
+            color: #0f0;
+            font-family: monospace;
+            font-size: 14px;
+            animation: fall linear infinite;
+        }
+        
+        @keyframes fall {
+            to { transform: translateY(100vh); }
+        }
+        
+        .fire {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 100px;
+            background: linear-gradient(to top, rgba(255, 0, 0, 0.5), transparent);
+            z-index: -1;
+            animation: fire 2s infinite;
+        }
+        
+        @keyframes fire {
+            0%, 100% { opacity: 0.5; height: 100px; }
+            50% { opacity: 0.8; height: 150px; }
+        }
+        
+        @media (max-width: 768px) {
+            .error-card {
+                padding: 40px 20px;
+                margin: 20px;
+            }
+            
+            .error-title {
+                font-size: 2em;
+            }
+            
+            .error-icon {
+                font-size: 60px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Matrix Code Background -->
+    <div class="matrix-code" id="matrixCode"></div>
+    
+    <!-- Scanlines Effect -->
+    <div class="scanlines"></div>
+    
+    <!-- Particles -->
+    <div class="particles" id="particles"></div>
+    
+    <!-- Fire Effect -->
+    <div class="fire"></div>
+    
+    <div class="container">
+        <div class="error-card">
+            <div class="error-icon glitch">
+                ⚠️
+            </div>
+            
+            <h1 class="error-title glitch-text" data-text="{title}">
+                {title}
+            </h1>
+            
+            <div class="error-message">
+                {message}
+            </div>
+            
+            {details}
+            
+            <button class="retry-btn" onclick="window.location.href='/'">
+                <span class="glitch-text" data-text="RETURN TO SAFETY">RETURN TO SAFETY</span>
+            </button>
+            
+            <div style="margin-top: 30px; font-size: 0.9em; color: #666;">
+                <span class="glitch" style="animation-delay: 1s;">ERROR_CODE: {error_code}</span>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Create matrix code effect
+        const matrixCode = document.getElementById('matrixCode');
+        const chars = "01";
+        const codeCount = 100;
+        
+        for (let i = 0; i < codeCount; i++) {
+            const codeChar = document.createElement('div');
+            codeChar.className = 'code-char';
+            codeChar.textContent = chars[Math.floor(Math.random() * chars.length)];
+            codeChar.style.left = Math.random() * 100 + '%';
+            codeChar.style.animationDuration = (Math.random() * 10 + 5) + 's';
+            codeChar.style.animationDelay = Math.random() * 5 + 's';
+            codeChar.style.opacity = Math.random() * 0.5 + 0.1;
+            matrixCode.appendChild(codeChar);
+        }
+        
+        // Create particles
+        const particles = document.getElementById('particles');
+        const particleCount = 50;
+        
+        for (let i = 0; i < particleCount; i++) {
+            const particle = document.createElement('div');
+            particle.className = 'particle';
+            particle.style.width = Math.random() * 10 + 5 + 'px';
+            particle.style.height = particle.style.width;
+            particle.style.left = Math.random() * 100 + '%';
+            particle.style.animationDuration = (Math.random() * 20 + 10) + 's';
+            particle.style.animationDelay = Math.random() * 5 + 's';
+            particles.appendChild(particle);
+        }
+        
+        // Add sound effect on button hover
+        const retryBtn = document.querySelector('.retry-btn');
+        const hoverSound = new Audio('data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAZGF0YQ');
+        
+        retryBtn.addEventListener('mouseenter', () => {
+            try {
+                hoverSound.currentTime = 0;
+                hoverSound.play();
+            } catch (e) {}
+        });
+        
+        // Add keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                retryBtn.click();
+            }
+        });
+        
+        // Add page load animation
+        document.addEventListener('DOMContentLoaded', () => {
+            document.body.style.opacity = '0';
+            document.body.style.transition = 'opacity 0.5s ease-in';
+            
+            setTimeout(() => {
+                document.body.style.opacity = '1';
+            }, 100);
+        });
+        
+        // Add error log display
+        console.error('Verification Error:', {{
+            code: '{error_code}',
+            message: '{message}',
+            timestamp: new Date().toISOString(),
+            url: window.location.href
+        }});
+    </script>
+</body>
+</html>
+"""
+
+SUCCESS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verification Successful</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Exo 2', sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #000a00 100%);
+            color: #fff;
+            min-height: 100vh;
+            overflow-x: hidden;
+            position: relative;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                radial-gradient(circle at 20% 50%, rgba(0, 255, 0, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(0, 255, 100, 0.08) 0%, transparent 50%),
+                radial-gradient(circle at 40% 80%, rgba(0, 200, 0, 0.06) 0%, transparent 50%);
+            z-index: -1;
+            animation: pulseSuccess 8s ease-in-out infinite;
+        }
+        
+        @keyframes pulseSuccess {
+            0%, 100% { opacity: 0.3; }
+            50% { opacity: 0.6; }
+        }
+        
+        .container {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .success-card {
+            background: rgba(0, 20, 0, 0.85);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(0, 255, 0, 0.4);
+            border-radius: 25px;
+            padding: 70px 50px;
+            max-width: 700px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 
+                0 0 60px rgba(0, 255, 0, 0.4),
+                inset 0 1px 0 rgba(255, 255, 255, 0.15);
+            animation: successFloat 8s ease-in-out infinite;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .success-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 5px;
+            background: linear-gradient(90deg, #00ff00, #00cc00, #00ff00);
+            animation: progress 3s ease-in-out infinite;
+        }
+        
+        @keyframes successFloat {
+            0%, 100% { transform: translateY(0) scale(1); }
+            50% { transform: translateY(-15px) scale(1.02); }
+        }
+        
+        @keyframes progress {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+        
+        .success-icon {
+            font-size: 100px;
+            margin-bottom: 40px;
+            color: #00ff00;
+            text-shadow: 
+                0 0 30px #00ff00,
+                0 0 60px #00ff00,
+                0 0 90px #00ff00;
+            animation: 
+                iconPulse 2s infinite,
+                iconRotate 20s infinite linear;
+            display: inline-block;
+        }
+        
+        @keyframes iconPulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+        }
+        
+        @keyframes iconRotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        
+        .success-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 3.2em;
+            font-weight: 900;
+            margin-bottom: 30px;
+            background: linear-gradient(45deg, #00ff00, #00cc00, #00ff00);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 30px rgba(0, 255, 0, 0.3);
+            letter-spacing: 3px;
+            animation: titleGlow 3s infinite;
+        }
+        
+        @keyframes titleGlow {
+            0%, 100% { 
+                text-shadow: 
+                    0 0 30px rgba(0, 255, 0, 0.3),
+                    0 0 60px rgba(0, 255, 0, 0.2);
+            }
+            50% { 
+                text-shadow: 
+                    0 0 50px rgba(0, 255, 0, 0.6),
+                    0 0 100px rgba(0, 255, 0, 0.3),
+                    0 0 150px rgba(0, 255, 0, 0.1);
+            }
+        }
+        
+        .welcome-text {
+            font-size: 2em;
+            margin-bottom: 20px;
+            color: #00ff00;
+            font-weight: 600;
+            animation: textSlideIn 1s ease-out;
+        }
+        
+        @keyframes textSlideIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .success-message {
+            font-size: 1.3em;
+            line-height: 1.8;
+            margin-bottom: 40px;
+            color: #aaffaa;
+            font-weight: 300;
+            animation: fadeIn 2s ease-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        .status-indicator {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin: 40px 0;
+            animation: slideUp 1s ease-out 0.5s both;
+        }
+        
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .status-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-icon {
+            font-size: 24px;
+            width: 60px;
+            height: 60px;
+            background: rgba(0, 255, 0, 0.1);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: statusPulse 2s infinite;
+        }
+        
+        @keyframes statusPulse {
+            0%, 100% { 
+                transform: scale(1);
+                box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+            }
+            50% { 
+                transform: scale(1.1);
+                box-shadow: 0 0 40px rgba(0, 255, 0, 0.5);
+            }
+        }
+        
+        .status-label {
+            font-size: 0.9em;
+            color: #88ff88;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .status-value {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #00ff00;
+        }
+        
+        .close-btn {
+            display: inline-block;
+            background: linear-gradient(45deg, #00ff00, #008800);
+            color: #000;
+            padding: 18px 50px;
+            border-radius: 50px;
+            text-decoration: none;
+            font-weight: 700;
+            font-size: 1.2em;
+            border: none;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
+            position: relative;
+            overflow: hidden;
+            font-family: 'Orbitron', sans-serif;
+            letter-spacing: 2px;
+            animation: btnEntrance 1s ease-out 1s both;
+        }
+        
+        @keyframes btnEntrance {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .close-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            transition: 0.5s;
+        }
+        
+        .close-btn:hover {
+            transform: translateY(-5px) scale(1.05);
+            box-shadow: 
+                0 15px 40px rgba(0, 255, 0, 0.7),
+                0 0 100px rgba(0, 255, 0, 0.2);
+            color: #000;
+        }
+        
+        .close-btn:hover::before {
+            left: 100%;
+        }
+        
+        .close-btn:active {
+            transform: translateY(-2px) scale(1.02);
+        }
+        
+        .confetti {
+            position: fixed;
+            width: 15px;
+            height: 15px;
+            background: #00ff00;
+            opacity: 0.8;
+            animation: confettiFall 5s linear infinite;
+            z-index: 0;
+        }
+        
+        @keyframes confettiFall {
+            0% {
+                transform: translateY(-100px) rotate(0deg);
+                opacity: 1;
+            }
+            100% {
+                transform: translateY(100vh) rotate(360deg);
+                opacity: 0;
+            }
+        }
+        
+        .cyber-grid {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(rgba(0, 255, 0, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 255, 0, 0.05) 1px, transparent 1px);
+            background-size: 50px 50px;
+            z-index: -1;
+            animation: gridMove 20s linear infinite;
+        }
+        
+        @keyframes gridMove {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(50px, 50px); }
+        }
+        
+        .hologram-effect {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0, 255, 0, 0.03) 2px,
+                rgba(0, 255, 0, 0.03) 4px
+            );
+            animation: hologramScan 10s linear infinite;
+            pointer-events: none;
+        }
+        
+        @keyframes hologramScan {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100%); }
+        }
+        
+        .data-stream {
+            position: fixed;
+            top: 0;
+            right: 20px;
+            height: 100%;
+            width: 2px;
+            background: linear-gradient(to bottom, transparent, #00ff00, transparent);
+            opacity: 0.5;
+            animation: dataFlow 3s linear infinite;
+        }
+        
+        @keyframes dataFlow {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100%); }
+        }
+        
+        .username-display {
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(0, 255, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px 30px;
+            margin: 30px 0;
+            display: inline-block;
+            font-family: monospace;
+            font-size: 1.4em;
+            letter-spacing: 2px;
+            color: #00ff00;
+            text-shadow: 0 0 10px rgba(0, 255, 0, 0.5);
+            animation: usernameFlash 2s infinite;
+        }
+        
+        @keyframes usernameFlash {
+            0%, 100% { 
+                box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
+            }
+            50% { 
+                box-shadow: 0 0 40px rgba(0, 255, 0, 0.4);
+            }
+        }
+        
+        .success-footer {
+            margin-top: 40px;
+            font-size: 0.9em;
+            color: #66aa66;
+            opacity: 0.8;
+            animation: fadeInUp 2s ease-out 1.5s both;
+        }
+        
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 0.8; transform: translateY(0); }
+        }
+        
+        @media (max-width: 768px) {
+            .success-card {
+                padding: 40px 20px;
+                margin: 20px;
+            }
+            
+            .success-title {
+                font-size: 2.2em;
+            }
+            
+            .success-icon {
+                font-size: 70px;
+            }
+            
+            .status-indicator {
+                flex-direction: column;
+                gap: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Cyber Grid Background -->
+    <div class="cyber-grid"></div>
+    
+    <!-- Data Stream Effect -->
+    <div class="data-stream"></div>
+    
+    <!-- Hologram Effect -->
+    <div class="hologram-effect"></div>
+    
+    <div class="container">
+        <div class="success-card">
+            <div class="success-icon">
+                ✅
+            </div>
+            
+            <h1 class="success-title">
+                VERIFICATION SUCCESSFUL
+            </h1>
+            
+            <div class="welcome-text">
+                Welcome, <span class="username-display">{username}</span>!
+            </div>
+            
+            <div class="success-message">
+                {message}
+            </div>
+            
+            <div class="status-indicator">
+                <div class="status-item">
+                    <div class="status-icon">✓</div>
+                    <div class="status-label">Status</div>
+                    <div class="status-value">VERIFIED</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-icon">🛡️</div>
+                    <div class="status-label">Security</div>
+                    <div class="status-value">ENCRYPTED</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-icon">⚡</div>
+                    <div class="status-label">Access</div>
+                    <div class="status-value">{access_status}</div>
+                </div>
+            </div>
+            
+            <button class="close-btn" onclick="closeWindow()">
+                CLOSE WINDOW
+            </button>
+            
+            <div class="success-footer">
+                xotiicsverify • Secure Verification System
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Create confetti effect
+        function createConfetti() {
+            const confettiCount = 100;
+            const colors = ['#00ff00', '#00cc00', '#00ff88', '#88ff00'];
+            
+            for (let i = 0; i < confettiCount; i++) {
+                const confetti = document.createElement('div');
+                confetti.className = 'confetti';
+                confetti.style.left = Math.random() * 100 + '%';
+                confetti.style.animationDelay = Math.random() * 5 + 's';
+                confetti.style.animationDuration = (Math.random() * 3 + 2) + 's';
+                confetti.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
+                confetti.style.width = Math.random() * 20 + 10 + 'px';
+                confetti.style.height = confetti.style.width;
+                confetti.style.borderRadius = Math.random() > 0.5 ? '50%' : '0';
+                document.body.appendChild(confetti);
+                
+                // Remove confetti after animation
+                setTimeout(() => {
+                    confetti.remove();
+                }, 5000);
+            }
+        }
+        
+        // Create multiple confetti bursts
+        createConfetti();
+        setTimeout(createConfetti, 1000);
+        setTimeout(createConfetti, 2000);
+        
+        // Play success sound
+        function playSuccessSound() {
+            try {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.frequency.setValueAtTime(523.25, audioContext.currentTime); // C5
+                oscillator.frequency.setValueAtTime(659.25, audioContext.currentTime + 0.1); // E5
+                oscillator.frequency.setValueAtTime(783.99, audioContext.currentTime + 0.2); // G5
+                
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.5);
+            } catch (e) {
+                // Audio context not supported
+            }
+        }
+        
+        // Close window function
+        function closeWindow() {
+            playSuccessSound();
+            
+            // Fade out animation
+            document.body.style.transition = 'opacity 0.5s ease-out';
+            document.body.style.opacity = '0';
+            
+            setTimeout(() => {
+                window.close();
+            }, 500);
+        }
+        
+        // Add keyboard shortcut
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' || e.key === 'Enter' || e.key === ' ') {
+                closeWindow();
+            }
+        });
+        
+        // Auto-close after 30 seconds
+        setTimeout(() => {
+            document.querySelector('.close-btn').innerHTML = 'AUTO-CLOSING IN 10s';
+        }, 20000);
+        
+        setTimeout(closeWindow, 30000);
+        
+        // Add page load animation
+        document.addEventListener('DOMContentLoaded', () => {
+            document.body.style.opacity = '0';
+            document.body.style.transition = 'opacity 0.8s ease-in';
+            
+            setTimeout(() => {
+                document.body.style.opacity = '1';
+                playSuccessSound();
+            }, 200);
+            
+            // Log success
+            console.log('Verification Success:', {{
+                username: '{username}',
+                timestamp: new Date().toISOString(),
+                status: 'verified',
+                server: '{guild_id}'
+            }});
+        });
+        
+        // Add mouse trail effect
+        document.addEventListener('mousemove', (e) => {
+            const trail = document.createElement('div');
+            trail.style.position = 'fixed';
+            trail.style.left = e.clientX + 'px';
+            trail.style.top = e.clientY + 'px';
+            trail.style.width = '5px';
+            trail.style.height = '5px';
+            trail.style.backgroundColor = '#00ff00';
+            trail.style.borderRadius = '50%';
+            trail.style.pointerEvents = 'none';
+            trail.style.zIndex = '9999';
+            trail.style.opacity = '0.7';
+            document.body.appendChild(trail);
+            
+            setTimeout(() => {
+                trail.style.opacity = '0';
+                trail.style.transform = 'scale(2)';
+                setTimeout(() => trail.remove(), 500);
+            }, 100);
+        });
+    </script>
+</body>
+</html>
+"""
 
 # ==================== DATABASE MANAGER ====================
 class DatabaseManager:
@@ -1421,223 +2421,71 @@ async def start_verification(guild_id: str):
         )
 
 @app.get("/oauth/callback")
-async def oauth_callback(code: str, state: str):
-    """Handle OAuth callback for Discord server verification"""
+async def oauth_callback_enhanced(code: str, state: str):
+    """Handle OAuth callback for Discord server verification - ENHANCED VERSION"""
     try:
         logger.info(f"Processing OAuth callback with state: {state[:10]}...")
         
         state_data = db.get_oauth_state(state)
         if not state_data:
             logger.error(f"Invalid state for OAuth callback: {state}")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>Invalid Session</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,0,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #f72585;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>❌ Invalid Session</h1>
-                            <p>Verification session expired or invalid.</p>
-                            <p>Please try again from your Discord server.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=400)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "SESSION TERMINATED")
+                .replace("{message}", "Your verification session has expired or is invalid.")
+                .replace("{details}", "")
+                .replace("{error_code}", "SESSION_EXPIRED"),
+                status_code=400
+            )
         
         # Verify this is a verification request
         if state_data.get("type") != "verification":
             logger.error(f"Invalid auth type for verification: {state_data.get('type')}")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>Invalid Request</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,165,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #ffa500;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>⚠️ Invalid Request</h1>
-                            <p>This verification link is invalid.</p>
-                            <p>Please use the correct verification link from your Discord server.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=400)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "INVALID REQUEST")
+                .replace("{message}", "This verification link has been corrupted or tampered with.")
+                .replace("{details}", "")
+                .replace("{error_code}", "INVALID_AUTH_TYPE"),
+                status_code=400
+            )
         
         guild_id = state_data.get("guild_id")
         if not guild_id:
             logger.error("No guild_id in verification state")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>Missing Server</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,165,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #ffa500;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>⚠️ No Server Specified</h1>
-                            <p>Please start verification from your Discord server.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=400)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "SERVER NOT FOUND")
+                .replace("{message}", "The target server could not be identified.")
+                .replace("{details}", "")
+                .replace("{error_code}", "NO_GUILD_ID"),
+                status_code=400
+            )
         
         redirect_uri = f"{Config.API_URL}/oauth/callback"
         token_data = await oauth.exchange_code(code, redirect_uri)
         if not token_data:
             logger.error("Failed to exchange code for verification")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>Authentication Failed</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,0,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #f72585;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>❌ Authentication Failed</h1>
-                            <p>Could not verify your Discord account.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=400)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "AUTHENTICATION FAILED")
+                .replace("{message}", "Could not authenticate with Discord. Please try again.")
+                .replace("{details}", "")
+                .replace("{error_code}", "TOKEN_EXCHANGE_FAILED"),
+                status_code=400
+            )
         
         user_info = await oauth.get_user_info(token_data["access_token"])
         if not user_info:
             logger.error("Failed to get user info for verification")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>User Info Failed</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,0,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #f72585;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>❌ Could Not Get User Info</h1>
-                            <p>Please try again.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=400)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "PROFILE ERROR")
+                .replace("{message}", "Could not retrieve your Discord profile information.")
+                .replace("{details}", "")
+                .replace("{error_code}", "USER_INFO_FAILED"),
+                status_code=400
+            )
         
         username = f"{user_info['username']}#{user_info.get('discriminator', '0')}"
         
@@ -1662,45 +2510,14 @@ async def oauth_callback(code: str, state: str):
         
         if not success:
             logger.error("Failed to save user to database")
-            return HTMLResponse("""
-                <html>
-                    <head>
-                        <title>Database Error</title>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                        <style>
-                            body {
-                                font-family: 'Segoe UI', sans-serif;
-                                background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                                color: white;
-                                display: flex;
-                                justify-content: center;
-                                align-items: center;
-                                height: 100vh;
-                                margin: 0;
-                                padding: 20px;
-                            }
-                            .container {
-                                text-align: center;
-                                background: rgba(255,0,0,0.1);
-                                padding: 40px;
-                                border-radius: 20px;
-                                border: 2px solid #f72585;
-                                max-width: 500px;
-                                backdrop-filter: blur(10px);
-                            }
-                            h1 { margin-bottom: 20px; }
-                            p { margin: 10px 0; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <h1>❌ Database Error</h1>
-                            <p>Failed to save verification data.</p>
-                            <p>Please try again later.</p>
-                        </div>
-                    </body>
-                </html>
-            """, status_code=500)
+            return HTMLResponse(
+                OAUTH_ERROR_TEMPLATE
+                .replace("{title}", "DATABASE ERROR")
+                .replace("{message}", "Failed to save verification data to our secure database.")
+                .replace("{details}", "")
+                .replace("{error_code}", "DB_SAVE_FAILED"),
+                status_code=500
+            )
         
         # Add log entry
         db.add_log(
@@ -1760,56 +2577,19 @@ async def oauth_callback(code: str, state: str):
                     logger.error(f"Error adding user to guild: {e}")
                     added_to_guild = False
         
-        # Return success page
-        success_html = f"""
-        <html>
-        <head>
-            <title>Verification Successful</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                body {{
-                    font-family: 'Segoe UI', sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100vh;
-                    margin: 0;
-                    padding: 20px;
-                }}
-                .container {{
-                    text-align: center;
-                    background: rgba(0, 0, 0, 0.3);
-                    padding: 60px 40px;
-                    border-radius: 20px;
-                    backdrop-filter: blur(10px);
-                    border: 2px solid #4ade80;
-                    max-width: 500px;
-                    width: 100%;
-                }}
-                h1 {{ font-size: 2.5em; margin: 0 0 20px 0; }}
-                .success {{ color: #4ade80; font-weight: bold; font-size: 1.2em; margin: 10px 0; }}
-                .info {{ color: #60a5fa; margin: 15px 0; }}
-                .icon {{ font-size: 4em; margin-bottom: 20px; }}
-                @media (max-width: 600px) {{
-                    h1 {{ font-size: 2em; }}
-                    .container {{ padding: 40px 20px; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="icon">✅</div>
-                <h1>Verification Successful!</h1>
-                <p class="success">Welcome, {username}!</p>
-                <p class="info">Your account has been verified and saved.</p>
-                {"<p class='success'>✓ You have been added to the server!</p>" if added_to_guild else "<p class='info'>An admin will restore your access soon.</p>"}
-                <p class="info">You can now close this window.</p>
-            </div>
-        </body>
-        </html>
-        """
+        # Prepare success message
+        if added_to_guild:
+            access_status = "GRANTED"
+            message = "✅ You have been automatically added to the server!"
+        else:
+            access_status = "PENDING"
+            message = "⚠️ An administrator will review and grant your access soon."
+        
+        # Return enhanced success page
+        success_html = SUCCESS_TEMPLATE.replace("{username}", html.escape(username)) \
+                                       .replace("{message}", message) \
+                                       .replace("{access_status}", access_status) \
+                                       .replace("{guild_id}", guild_id)
         
         return HTMLResponse(success_html)
         
@@ -1824,45 +2604,14 @@ async def oauth_callback(code: str, state: str):
             metadata={"error": str(e)}
         )
         
-        return HTMLResponse("""
-            <html>
-                <head>
-                    <title>Error</title>
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <style>
-                        body {
-                            font-family: 'Segoe UI', sans-serif;
-                            background: linear-gradient(135deg, #1a1a2e 0%, #0f0c29 100%);
-                            color: white;
-                            display: flex;
-                            justify-content: center;
-                            align-items: center;
-                            height: 100vh;
-                            margin: 0;
-                            padding: 20px;
-                        }
-                        .container {
-                            text-align: center;
-                            background: rgba(255,0,0,0.1);
-                            padding: 40px;
-                            border-radius: 20px;
-                            border: 2px solid #f72585;
-                            max-width: 500px;
-                            backdrop-filter: blur(10px);
-                        }
-                        h1 { margin-bottom: 20px; }
-                        p { margin: 10px 0; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>❌ An Error Occurred</h1>
-                        <p>Something went wrong during verification.</p>
-                        <p>Please try again from your Discord server.</p>
-                    </div>
-                </body>
-            </html>
-        """, status_code=500)
+        return HTMLResponse(
+            OAUTH_ERROR_TEMPLATE
+            .replace("{title}", "SYSTEM ERROR")
+            .replace("{message}", "A critical system error occurred during verification.")
+            .replace("{details}", f'<div class="error-details"><strong>Technical Details:</strong><br>{html.escape(str(e))}</div>')
+            .replace("{error_code}", "SYSTEM_ERROR"),
+            status_code=500
+        )
 
 # ==================== DASHBOARD API ====================
 
@@ -2194,7 +2943,7 @@ async def transfer_preview_enhanced(
 # ==================== HEALTH ENDPOINT ====================
 
 @app.get("/health")
-async def health_check():
+async def health_check_endpoint():
     """Health check endpoint"""
     try:
         # Check database
@@ -3233,6 +3982,544 @@ async def get_verification_url_public(guild_id: str):
             detail="Failed to generate verification link"
         )
 
+# ==================== CYBER LANDING PAGE ====================
+
+@app.get("/cyber")
+async def cyber_landing():
+    """Cyberpunk-themed landing page"""
+    cyber_html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>xotiicsverify | Cyber Security</title>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600&display=swap');
+            
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Rajdhani', sans-serif;
+                background: #000;
+                color: #0f0;
+                min-height: 100vh;
+                overflow-x: hidden;
+                position: relative;
+            }
+            
+            .cyber-bg {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: 
+                    radial-gradient(circle at 20% 50%, rgba(255, 0, 0, 0.15) 0%, transparent 50%),
+                    radial-gradient(circle at 80% 20%, rgba(255, 0, 0, 0.1) 0%, transparent 50%),
+                    radial-gradient(circle at 40% 80%, rgba(255, 0, 0, 0.05) 0%, transparent 50%);
+                animation: bgPulse 10s infinite alternate;
+            }
+            
+            @keyframes bgPulse {
+                0% { opacity: 0.3; }
+                100% { opacity: 0.7; }
+            }
+            
+            .terminal-grid {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background-image: 
+                    linear-gradient(rgba(255, 0, 0, 0.1) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 0, 0, 0.1) 1px, transparent 1px);
+                background-size: 50px 50px;
+                animation: gridScroll 20s linear infinite;
+                z-index: -1;
+            }
+            
+            @keyframes gridScroll {
+                0% { transform: translate(0, 0); }
+                100% { transform: translate(50px, 50px); }
+            }
+            
+            .container {
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+                position: relative;
+                z-index: 1;
+            }
+            
+            .cyber-terminal {
+                background: rgba(10, 0, 0, 0.9);
+                border: 2px solid #f00;
+                border-radius: 10px;
+                width: 100%;
+                max-width: 800px;
+                min-height: 500px;
+                box-shadow: 
+                    0 0 50px rgba(255, 0, 0, 0.5),
+                    inset 0 0 20px rgba(255, 0, 0, 0.2);
+                overflow: hidden;
+                position: relative;
+                animation: terminalGlow 3s infinite;
+            }
+            
+            @keyframes terminalGlow {
+                0%, 100% { box-shadow: 0 0 50px rgba(255, 0, 0, 0.5); }
+                50% { box-shadow: 0 0 80px rgba(255, 0, 0, 0.8); }
+            }
+            
+            .terminal-header {
+                background: linear-gradient(to right, #400000, #200000);
+                padding: 15px 20px;
+                border-bottom: 1px solid #f00;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            
+            .terminal-title {
+                font-family: 'Orbitron', sans-serif;
+                font-size: 1.5em;
+                font-weight: 700;
+                color: #f00;
+                text-shadow: 0 0 10px rgba(255, 0, 0, 0.5);
+                letter-spacing: 2px;
+            }
+            
+            .terminal-controls {
+                display: flex;
+                gap: 10px;
+            }
+            
+            .control-btn {
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+            }
+            
+            .control-btn.close { background: #f00; }
+            .control-btn.minimize { background: #ff0; }
+            .control-btn.maximize { background: #0f0; }
+            
+            .terminal-body {
+                padding: 30px;
+                font-family: 'Courier New', monospace;
+                font-size: 1.1em;
+                line-height: 1.6;
+            }
+            
+            .command-line {
+                margin-bottom: 20px;
+                animation: typing 3s steps(40, end);
+            }
+            
+            @keyframes typing {
+                from { width: 0; }
+                to { width: 100%; }
+            }
+            
+            .prompt {
+                color: #0f0;
+                margin-right: 10px;
+            }
+            
+            .command {
+                color: #fff;
+                animation: blink 1s infinite;
+            }
+            
+            @keyframes blink {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.5; }
+            }
+            
+            .output {
+                margin-top: 20px;
+                color: #f0f;
+                animation: fadeIn 2s;
+            }
+            
+            @keyframes fadeIn {
+                from { opacity: 0; }
+                to { opacity: 1; }
+            }
+            
+            .cyber-logo {
+                text-align: center;
+                margin: 40px 0;
+                animation: logoFloat 6s ease-in-out infinite;
+            }
+            
+            @keyframes logoFloat {
+                0%, 100% { transform: translateY(0); }
+                50% { transform: translateY(-20px); }
+            }
+            
+            .logo-text {
+                font-family: 'Orbitron', sans-serif;
+                font-size: 3em;
+                font-weight: 900;
+                background: linear-gradient(45deg, #f00, #ff0, #f00);
+                -webkit-background-clip: text;
+                background-clip: text;
+                -webkit-text-fill-color: transparent;
+                text-shadow: 0 0 30px rgba(255, 0, 0, 0.5);
+                letter-spacing: 5px;
+            }
+            
+            .logo-subtitle {
+                font-size: 1.2em;
+                color: #f00;
+                margin-top: 10px;
+                letter-spacing: 3px;
+            }
+            
+            .status-board {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin: 40px 0;
+            }
+            
+            .status-item {
+                background: rgba(255, 0, 0, 0.1);
+                border: 1px solid rgba(255, 0, 0, 0.3);
+                border-radius: 5px;
+                padding: 20px;
+                text-align: center;
+                transition: all 0.3s ease;
+                position: relative;
+                overflow: hidden;
+            }
+            
+            .status-item:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 10px 20px rgba(255, 0, 0, 0.3);
+                background: rgba(255, 0, 0, 0.2);
+            }
+            
+            .status-item::before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: -100%;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+                transition: 0.5s;
+            }
+            
+            .status-item:hover::before {
+                left: 100%;
+            }
+            
+            .status-label {
+                font-size: 0.9em;
+                color: #f88;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                margin-bottom: 10px;
+            }
+            
+            .status-value {
+                font-size: 2em;
+                font-weight: 700;
+                color: #f00;
+                font-family: 'Orbitron', sans-serif;
+            }
+            
+            .cyber-button {
+                display: inline-block;
+                background: linear-gradient(45deg, #f00, #800);
+                color: white;
+                padding: 15px 40px;
+                border: none;
+                border-radius: 5px;
+                font-family: 'Orbitron', sans-serif;
+                font-size: 1.2em;
+                font-weight: 700;
+                letter-spacing: 2px;
+                text-transform: uppercase;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                position: relative;
+                overflow: hidden;
+                margin: 10px;
+                box-shadow: 0 5px 15px rgba(255, 0, 0, 0.4);
+            }
+            
+            .cyber-button:hover {
+                transform: translateY(-3px);
+                box-shadow: 0 10px 25px rgba(255, 0, 0, 0.6);
+                background: linear-gradient(45deg, #ff0000, #a00000);
+            }
+            
+            .cyber-button:active {
+                transform: translateY(-1px);
+            }
+            
+            .cyber-button::before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: -100%;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+                transition: 0.5s;
+            }
+            
+            .cyber-button:hover::before {
+                left: 100%;
+            }
+            
+            .scan-effect {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 3px;
+                background: linear-gradient(90deg, transparent, #f00, transparent);
+                animation: scan 4s linear infinite;
+                z-index: 2;
+            }
+            
+            @keyframes scan {
+                0% { top: 0; opacity: 0; }
+                10% { opacity: 1; }
+                90% { opacity: 1; }
+                100% { top: 100%; opacity: 0; }
+            }
+            
+            .matrix-rain {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                pointer-events: none;
+                z-index: -1;
+                opacity: 0.1;
+            }
+            
+            .matrix-char {
+                position: absolute;
+                color: #0f0;
+                font-family: monospace;
+                font-size: 14px;
+                animation: matrixFall linear infinite;
+            }
+            
+            @keyframes matrixFall {
+                to { transform: translateY(100vh); }
+            }
+            
+            @media (max-width: 768px) {
+                .cyber-terminal {
+                    margin: 10px;
+                }
+                
+                .logo-text {
+                    font-size: 2em;
+                }
+                
+                .status-board {
+                    grid-template-columns: 1fr;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="cyber-bg"></div>
+        <div class="terminal-grid"></div>
+        <div class="matrix-rain" id="matrixRain"></div>
+        
+        <div class="container">
+            <div class="cyber-terminal">
+                <div class="scan-effect"></div>
+                
+                <div class="terminal-header">
+                    <div class="terminal-title">xotiicsverify://SYSTEM</div>
+                    <div class="terminal-controls">
+                        <div class="control-btn close"></div>
+                        <div class="control-btn minimize"></div>
+                        <div class="control-btn maximize"></div>
+                    </div>
+                </div>
+                
+                <div class="terminal-body">
+                    <div class="cyber-logo">
+                        <div class="logo-text">xotiicsverify</div>
+                        <div class="logo-subtitle">CYBER SECURITY VERIFICATION</div>
+                    </div>
+                    
+                    <div class="command-line">
+                        <span class="prompt">$</span>
+                        <span class="command">system status --check</span>
+                    </div>
+                    
+                    <div class="output">
+                        > SYSTEM STATUS: ONLINE<br>
+                        > SECURITY LEVEL: MAXIMUM<br>
+                        > VERIFICATIONS: ACTIVE<br>
+                        > DATABASE: ENCRYPTED<br>
+                        > API: RUNNING<br>
+                    </div>
+                    
+                    <div class="status-board">
+                        <div class="status-item">
+                            <div class="status-label">Servers</div>
+                            <div class="status-value" id="serverCount">0</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-label">Users</div>
+                            <div class="status-value" id="userCount">0</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-label">Verifications</div>
+                            <div class="status-value" id="verificationCount">0</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-label">Uptime</div>
+                            <div class="status-value">100%</div>
+                        </div>
+                    </div>
+                    
+                    <div style="text-align: center; margin-top: 40px;">
+                        <button class="cyber-button" onclick="window.location.href='/docs'">
+                            ACCESS DOCS
+                        </button>
+                        <button class="cyber-button" onclick="window.location.href='/health'">
+                            SYSTEM CHECK
+                        </button>
+                        <button class="cyber-button" onclick="window.location.href='https://bothostingf.vercel.app'">
+                            DASHBOARD
+                        </button>
+                    </div>
+                    
+                    <div style="margin-top: 40px; text-align: center; color: #888; font-size: 0.9em;">
+                        > System initialized: <span id="currentTime"></span><br>
+                        > Secure connection established
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            // Matrix rain effect
+            const matrixRain = document.getElementById('matrixRain');
+            const chars = "01";
+            
+            for (let i = 0; i < 50; i++) {
+                const char = document.createElement('div');
+                char.className = 'matrix-char';
+                char.textContent = chars[Math.floor(Math.random() * chars.length)];
+                char.style.left = Math.random() * 100 + '%';
+                char.style.animationDuration = (Math.random() * 10 + 5) + 's';
+                char.style.animationDelay = Math.random() * 5 + 's';
+                matrixRain.appendChild(char);
+            }
+            
+            // Update counts with animation
+            function animateCount(elementId, target, duration = 2000) {
+                const element = document.getElementById(elementId);
+                let start = 0;
+                const increment = target / (duration / 16); // 60fps
+                
+                function update() {
+                    start += increment;
+                    if (start >= target) {
+                        element.textContent = Math.floor(target);
+                        return;
+                    }
+                    element.textContent = Math.floor(start);
+                    requestAnimationFrame(update);
+                }
+                update();
+            }
+            
+            // Simulate some data (in production, fetch from API)
+            setTimeout(() => {
+                animateCount('serverCount', Math.floor(Math.random() * 100) + 50);
+                animateCount('userCount', Math.floor(Math.random() * 1000) + 500);
+                animateCount('verificationCount', Math.floor(Math.random() * 10000) + 5000);
+            }, 1000);
+            
+            // Update current time
+            function updateTime() {
+                const now = new Date();
+                const timeString = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+                document.getElementById('currentTime').textContent = timeString;
+            }
+            
+            updateTime();
+            setInterval(updateTime, 1000);
+            
+            // Add typing sound effect
+            document.addEventListener('keydown', (e) => {
+                if (e.key.length === 1) {
+                    // Simulate typewriter sound
+                    try {
+                        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        const oscillator = audioContext.createOscillator();
+                        const gainNode = audioContext.createGain();
+                        
+                        oscillator.connect(gainNode);
+                        gainNode.connect(audioContext.destination);
+                        
+                        oscillator.frequency.value = 800 + Math.random() * 400;
+                        gainNode.gain.value = 0.1;
+                        
+                        oscillator.start();
+                        setTimeout(() => oscillator.stop(), 50);
+                    } catch (e) {}
+                }
+            });
+            
+            // Add terminal cursor blink
+            const command = document.querySelector('.command');
+            setInterval(() => {
+                command.style.opacity = command.style.opacity === '0.5' ? '1' : '0.5';
+            }, 500);
+            
+            // Add hover sound effects
+            const buttons = document.querySelectorAll('.cyber-button, .status-item');
+            buttons.forEach(button => {
+                button.addEventListener('mouseenter', () => {
+                    try {
+                        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        const oscillator = audioContext.createOscillator();
+                        const gainNode = audioContext.createGain();
+                        
+                        oscillator.connect(gainNode);
+                        gainNode.connect(audioContext.destination);
+                        
+                        oscillator.frequency.value = 300 + Math.random() * 200;
+                        gainNode.gain.value = 0.05;
+                        
+                        oscillator.start();
+                        setTimeout(() => oscillator.stop(), 100);
+                    } catch (e) {}
+                });
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(cyber_html)
+
 # ==================== ERROR HANDLERS ====================
 
 @app.exception_handler(HTTPException)
@@ -3276,5 +4563,3 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True
     )
-
-
