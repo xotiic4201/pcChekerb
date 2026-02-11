@@ -992,68 +992,443 @@ HTML_TEMPLATES = {
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Verification Successful</title>
+        <title>ACCESS GRANTED</title>
         <style>
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;500;700&display=swap');
+            
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
             body {
-                font-family: Arial, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                font-family: 'Rajdhani', sans-serif;
+                background: #0a0a0a;
                 height: 100vh;
                 margin: 0;
                 display: flex;
                 justify-content: center;
                 align-items: center;
+                overflow: hidden;
+                position: relative;
+                color: #ff0033;
             }
+            
+            .cyber-grid {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                background-image: 
+                    linear-gradient(rgba(255, 0, 51, 0.1) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 0, 51, 0.1) 1px, transparent 1px);
+                background-size: 50px 50px;
+                animation: gridMove 20s linear infinite;
+                opacity: 0.3;
+            }
+            
+            .data-stream {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                opacity: 0.1;
+                overflow: hidden;
+            }
+            
+            .binary {
+                position: absolute;
+                color: #ff0033;
+                font-family: 'Courier New', monospace;
+                font-size: 14px;
+                animation: binaryFall linear infinite;
+            }
+            
+            .scan-line {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 2px;
+                background: linear-gradient(90deg, transparent, #ff0033, transparent);
+                animation: scan 4s linear infinite;
+                z-index: 100;
+                box-shadow: 0 0 20px #ff0033;
+            }
+            
             .container {
-                background: white;
-                padding: 40px;
-                border-radius: 10px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                background: rgba(10, 10, 10, 0.85);
+                padding: 50px;
+                border-radius: 0;
+                border: 2px solid #ff0033;
+                box-shadow: 
+                    0 0 60px rgba(255, 0, 51, 0.5),
+                    0 0 0 1px rgba(255, 0, 51, 0.2) inset,
+                    0 0 30px rgba(255, 0, 51, 0.1) inset;
                 text-align: center;
-                max-width: 500px;
+                max-width: 600px;
                 width: 90%;
+                z-index: 2;
+                position: relative;
+                animation: hologramAppear 1.2s cubic-bezier(0.68, -0.55, 0.265, 1.55) forwards;
+                transform: perspective(1000px) rotateX(90deg) translateY(100px);
+                opacity: 0;
+                clip-path: polygon(
+                    0 10px, 10px 0, calc(100% - 10px) 0, 100% 10px,
+                    100% calc(100% - 10px), calc(100% - 10px) 100%,
+                    10px 100%, 0 calc(100% - 10px)
+                );
             }
+            
+            .container:before {
+                content: '';
+                position: absolute;
+                top: -2px;
+                left: -2px;
+                right: -2px;
+                bottom: -2px;
+                background: linear-gradient(45deg, #ff0033, #ff3366, #ff0033);
+                z-index: -1;
+                animation: borderGlow 3s linear infinite;
+                border-radius: 2px;
+            }
+            
+            .success-symbol {
+                width: 120px;
+                height: 120px;
+                margin: 0 auto 40px;
+                position: relative;
+                animation: symbolPulse 2s infinite;
+            }
+            
+            .success-ring {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                border: 3px solid #ff0033;
+                border-radius: 50%;
+                animation: ringRotate 10s linear infinite;
+                box-shadow: 0 0 30px rgba(255, 0, 51, 0.5);
+            }
+            
+            .success-ring:nth-child(2) {
+                width: 80%;
+                height: 80%;
+                top: 10%;
+                left: 10%;
+                animation-direction: reverse;
+                animation-duration: 8s;
+            }
+            
+            .success-check {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 60px;
+                color: #ff0033;
+                text-shadow: 0 0 20px rgba(255, 0, 51, 0.8);
+                animation: checkFlicker 3s infinite;
+            }
+            
             h1 {
-                color: #4CAF50;
-                margin-bottom: 20px;
+                font-family: 'Orbitron', monospace;
+                font-weight: 900;
+                font-size: 3em;
+                margin-bottom: 30px;
+                text-transform: uppercase;
+                letter-spacing: 3px;
+                background: linear-gradient(90deg, #ff0033, #ff6666, #ff0033);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                animation: titleGlitch 5s infinite;
+                position: relative;
             }
-            .checkmark {
-                font-size: 80px;
-                color: #4CAF50;
-                margin-bottom: 20px;
+            
+            h1:after {
+                content: 'ACCESS GRANTED';
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                background: linear-gradient(90deg, #ff3366, #ff6699, #ff3366);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                clip-path: inset(0 50% 0 0);
+                animation: glitchSlide 0.3s infinite alternate;
             }
+            
             .username {
-                font-weight: bold;
-                color: #333;
-                font-size: 1.2em;
-            }
-            .message {
-                color: #666;
+                font-family: 'Orbitron', monospace;
+                font-weight: 700;
+                color: #ff0033;
+                font-size: 1.8em;
                 margin: 20px 0;
-                line-height: 1.6;
+                padding: 15px;
+                border: 1px solid rgba(255, 0, 51, 0.3);
+                background: rgba(255, 0, 51, 0.05);
+                display: inline-block;
+                animation: usernameGlow 2s infinite alternate;
+                text-shadow: 0 0 10px rgba(255, 0, 51, 0.5);
+                position: relative;
+                overflow: hidden;
             }
+            
+            .username:before {
+                content: '';
+                position: absolute;
+                top: -50%;
+                left: -60%;
+                width: 20%;
+                height: 200%;
+                background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+                transform: rotate(30deg);
+                animation: usernameShine 3s infinite;
+            }
+            
+            .message {
+                color: #ff6666;
+                margin: 30px 0;
+                line-height: 1.6;
+                font-size: 1.2em;
+                font-weight: 300;
+                opacity: 0;
+                animation: messageReveal 1s 1s forwards;
+                text-shadow: 0 0 5px rgba(255, 0, 51, 0.3);
+            }
+            
             .button {
                 display: inline-block;
-                background: #4CAF50;
-                color: white;
-                padding: 12px 30px;
+                background: transparent;
+                color: #ff0033;
+                padding: 18px 45px;
                 text-decoration: none;
-                border-radius: 5px;
-                margin-top: 20px;
-                font-weight: bold;
+                border: 2px solid #ff0033;
+                border-radius: 0;
+                margin-top: 30px;
+                font-family: 'Orbitron', monospace;
+                font-weight: 700;
+                font-size: 1.1em;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                cursor: pointer;
+                position: relative;
+                overflow: hidden;
+                transition: all 0.3s;
+                opacity: 0;
+                animation: buttonAppear 1s 1.5s forwards;
+                box-shadow: 0 0 20px rgba(255, 0, 51, 0.2);
+            }
+            
+            .button:hover {
+                background: rgba(255, 0, 51, 0.1);
+                box-shadow: 
+                    0 0 40px rgba(255, 0, 51, 0.4),
+                    0 0 0 1px rgba(255, 0, 51, 0.3) inset;
+                text-shadow: 0 0 10px rgba(255, 0, 51, 0.8);
+                transform: scale(1.05);
+                letter-spacing: 3px;
+            }
+            
+            .button:before {
+                content: 'TERMINATE CONNECTION';
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(255, 0, 51, 0.9);
+                color: #000;
+                transform: translateY(100%);
+                transition: transform 0.3s;
+            }
+            
+            .button:hover:before {
+                transform: translateY(0);
+            }
+            
+            .hologram-effect {
+                position: absolute;
+                top: 0;
+                left: -10%;
+                width: 120%;
+                height: 100%;
+                background: linear-gradient(90deg, 
+                    transparent 0%, 
+                    rgba(255, 0, 51, 0.05) 50%, 
+                    transparent 100%);
+                transform: skewX(-20deg);
+                animation: hologramScan 3s infinite linear;
+                pointer-events: none;
+            }
+            
+            @keyframes gridMove {
+                0% { background-position: 0 0; }
+                100% { background-position: 50px 50px; }
+            }
+            
+            @keyframes binaryFall {
+                0% { transform: translateY(-100px) translateX(0); opacity: 0; }
+                10% { opacity: 1; }
+                90% { opacity: 1; }
+                100% { transform: translateY(100vh) translateX(100px); opacity: 0; }
+            }
+            
+            @keyframes scan {
+                0% { top: 0; }
+                100% { top: 100%; }
+            }
+            
+            @keyframes hologramAppear {
+                0% { 
+                    transform: perspective(1000px) rotateX(90deg) translateY(100px);
+                    opacity: 0;
+                }
+                100% { 
+                    transform: perspective(1000px) rotateX(0deg) translateY(0);
+                    opacity: 1;
+                }
+            }
+            
+            @keyframes borderGlow {
+                0%, 100% { opacity: 0.5; }
+                50% { opacity: 1; }
+            }
+            
+            @keyframes symbolPulse {
+                0%, 100% { 
+                    transform: scale(1);
+                    filter: drop-shadow(0 0 10px rgba(255, 0, 51, 0.7));
+                }
+                50% { 
+                    transform: scale(1.1);
+                    filter: drop-shadow(0 0 30px rgba(255, 0, 51, 1));
+                }
+            }
+            
+            @keyframes ringRotate {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+            
+            @keyframes checkFlicker {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.8; }
+                75% { opacity: 0.9; }
+            }
+            
+            @keyframes titleGlitch {
+                0%, 100% { transform: translateX(0); }
+                97% { transform: translateX(0); }
+                98% { transform: translateX(-3px); }
+                99% { transform: translateX(3px); }
+            }
+            
+            @keyframes glitchSlide {
+                0% { clip-path: inset(0 50% 0 0); }
+                100% { clip-path: inset(0 0 0 50%); }
+            }
+            
+            @keyframes usernameGlow {
+                from { 
+                    box-shadow: 0 0 10px rgba(255, 0, 51, 0.3);
+                    border-color: rgba(255, 0, 51, 0.3);
+                }
+                to { 
+                    box-shadow: 0 0 30px rgba(255, 0, 51, 0.7);
+                    border-color: rgba(255, 0, 51, 0.7);
+                }
+            }
+            
+            @keyframes usernameShine {
+                0% { left: -60%; }
+                100% { left: 140%; }
+            }
+            
+            @keyframes messageReveal {
+                to { opacity: 1; }
+            }
+            
+            @keyframes buttonAppear {
+                to { opacity: 1; }
+            }
+            
+            @keyframes hologramScan {
+                0% { left: -10%; }
+                100% { left: 110%; }
             }
         </style>
     </head>
     <body>
+        <div class="cyber-grid"></div>
+        <div class="data-stream" id="dataStream"></div>
+        <div class="scan-line"></div>
+        <div class="hologram-effect"></div>
+        
         <div class="container">
-            <div class="checkmark">✅</div>
-            <h1>Verification Successful!</h1>
+            <div class="success-symbol">
+                <div class="success-ring"></div>
+                <div class="success-ring"></div>
+                <div class="success-check">✓</div>
+            </div>
+            <h1>ACCESS GRANTED</h1>
+            <div class="username">{username}</div>
             <div class="message">
-                Welcome, <span class="username">{username}</span>!
+                USER VERIFIED • SYSTEM INTEGRITY CONFIRMED<br>
                 {additional_message}
             </div>
-            <p>You can now close this window.</p>
-            <a href="javascript:window.close()" class="button">Close Window</a>
+            <a href="javascript:window.close()" class="button">TERMINATE CONNECTION</a>
         </div>
+        
+        <script>
+            // Create binary data stream
+            const dataStream = document.getElementById('dataStream');
+            const binaryChars = ['0', '1', '█', '░', '▓', '▒'];
+            
+            for (let i = 0; i < 100; i++) {
+                const binary = document.createElement('div');
+                binary.classList.add('binary');
+                binary.textContent = Array(20).fill(0).map(() => 
+                    binaryChars[Math.floor(Math.random() * binaryChars.length)]
+                ).join('');
+                binary.style.left = `${Math.random() * 100}%`;
+                binary.style.animationDuration = `${Math.random() * 10 + 5}s`;
+                binary.style.animationDelay = `${Math.random() * 5}s`;
+                binary.style.fontSize = `${Math.random() * 10 + 10}px`;
+                binary.style.opacity = Math.random() * 0.5 + 0.1;
+                dataStream.appendChild(binary);
+            }
+            
+            // Terminal typing effect for username
+            const usernameElement = document.querySelector('.username');
+            const originalText = usernameElement.textContent;
+            usernameElement.textContent = '';
+            let charIndex = 0;
+            
+            function typeUsername() {
+                if (charIndex < originalText.length) {
+                    usernameElement.textContent += originalText.charAt(charIndex);
+                    charIndex++;
+                    setTimeout(typeUsername, 50);
+                }
+            }
+            
+            setTimeout(typeUsername, 1000);
+            
+            // Add glitch effect to container
+            setInterval(() => {
+                if (Math.random() > 0.7) {
+                    const container = document.querySelector('.container');
+                    container.style.transform = 'translateX(' + (Math.random() * 4 - 2) + 'px)';
+                    setTimeout(() => {
+                        container.style.transform = 'translateX(0)';
+                    }, 100);
+                }
+            }, 3000);
+        </script>
     </body>
     </html>
     """,
@@ -1062,61 +1437,431 @@ HTML_TEMPLATES = {
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Verification Error</title>
+        <title>ACCESS DENIED</title>
         <style>
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;500;700&display=swap');
+            
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
             body {
-                font-family: Arial, sans-serif;
-                background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+                font-family: 'Rajdhani', sans-serif;
+                background: #0a0a0a;
                 height: 100vh;
                 margin: 0;
                 display: flex;
                 justify-content: center;
                 align-items: center;
+                overflow: hidden;
+                position: relative;
+                color: #ff0033;
             }
+            
+            .error-grid {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                background-image: 
+                    linear-gradient(rgba(255, 0, 51, 0.2) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 0, 51, 0.2) 1px, transparent 1px);
+                background-size: 40px 40px;
+                animation: errorGridMove 0.5s linear infinite;
+                opacity: 0.4;
+            }
+            
+            .warning-lines {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                opacity: 0.3;
+            }
+            
+            .warning-line {
+                position: absolute;
+                width: 100%;
+                height: 2px;
+                background: #ff0033;
+                animation: warningPulse 1s infinite;
+                box-shadow: 0 0 30px #ff0033;
+            }
+            
             .container {
-                background: white;
-                padding: 40px;
-                border-radius: 10px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                background: rgba(10, 10, 10, 0.9);
+                padding: 50px;
+                border-radius: 0;
+                border: 2px solid #ff0033;
+                box-shadow: 
+                    0 0 80px rgba(255, 0, 51, 0.7),
+                    0 0 0 1px rgba(255, 0, 51, 0.3) inset,
+                    0 0 40px rgba(255, 0, 51, 0.2) inset;
                 text-align: center;
-                max-width: 500px;
+                max-width: 600px;
                 width: 90%;
+                z-index: 2;
+                position: relative;
+                animation: errorAppear 1s cubic-bezier(0.68, -0.55, 0.265, 1.55),
+                         criticalShake 0.5s infinite alternate;
+                clip-path: polygon(
+                    0 15px, 15px 0, calc(100% - 15px) 0, 100% 15px,
+                    100% calc(100% - 15px), calc(100% - 15px) 100%,
+                    15px 100%, 0 calc(100% - 15px)
+                );
             }
+            
+            .container:before {
+                content: '';
+                position: absolute;
+                top: -4px;
+                left: -4px;
+                right: -4px;
+                bottom: -4px;
+                background: linear-gradient(45deg, 
+                    #ff0033, #000, #ff0033, #000, #ff0033);
+                z-index: -1;
+                animation: errorBorder 2s linear infinite;
+                border-radius: 4px;
+            }
+            
+            .error-symbol {
+                width: 140px;
+                height: 140px;
+                margin: 0 auto 40px;
+                position: relative;
+                animation: errorPulse 1s infinite;
+            }
+            
+            .error-triangle {
+                position: absolute;
+                width: 0;
+                height: 0;
+                border-left: 70px solid transparent;
+                border-right: 70px solid transparent;
+                border-bottom: 121px solid #ff0033;
+                top: 0;
+                left: 0;
+                filter: drop-shadow(0 0 20px rgba(255, 0, 51, 0.8));
+            }
+            
+            .error-triangle:before {
+                content: '';
+                position: absolute;
+                width: 0;
+                height: 0;
+                border-left: 50px solid transparent;
+                border-right: 50px solid transparent;
+                border-bottom: 87px solid #000;
+                top: 17px;
+                left: -50px;
+            }
+            
+            .error-exclamation {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-family: 'Orbitron', monospace;
+                font-weight: 900;
+                font-size: 70px;
+                color: #ff0033;
+                text-shadow: 0 0 30px rgba(255, 0, 51, 1);
+                animation: exclamationBlink 0.5s infinite;
+                z-index: 2;
+            }
+            
             h1 {
-                color: #f44336;
-                margin-bottom: 20px;
+                font-family: 'Orbitron', monospace;
+                font-weight: 900;
+                font-size: 3.5em;
+                margin-bottom: 30px;
+                text-transform: uppercase;
+                letter-spacing: 4px;
+                background: linear-gradient(90deg, #ff0033, #ff6666, #ff0033);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                animation: errorTitleGlitch 0.1s infinite;
+                position: relative;
             }
-            .error {
-                font-size: 80px;
-                color: #f44336;
-                margin-bottom: 20px;
+            
+            h1:after {
+                content: 'ACCESS DENIED';
+                position: absolute;
+                left: 2px;
+                top: 2px;
+                width: 100%;
+                color: rgba(255, 0, 51, 0.5);
+                z-index: -1;
             }
-            .message {
-                color: #666;
-                margin: 20px 0;
+            
+            .error-code {
+                font-family: 'Orbitron', monospace;
+                color: #ff0033;
+                font-size: 1.8em;
+                margin: 25px 0;
+                padding: 15px;
+                border: 1px solid rgba(255, 0, 51, 0.5);
+                background: rgba(255, 0, 51, 0.05);
+                display: inline-block;
+                animation: codeFlash 1s infinite;
+                text-shadow: 0 0 15px rgba(255, 0, 51, 0.7);
+            }
+            
+            .error-message {
+                color: #ff6666;
+                margin: 30px 0;
                 line-height: 1.6;
+                font-size: 1.2em;
+                font-weight: 300;
+                padding: 20px;
+                background: rgba(255, 0, 51, 0.05);
+                border: 1px solid rgba(255, 0, 51, 0.2);
+                position: relative;
+                overflow: hidden;
             }
+            
+            .error-message:before {
+                content: '';
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(90deg, 
+                    transparent, 
+                    rgba(255, 0, 51, 0.1), 
+                    transparent);
+                animation: errorScan 2s infinite linear;
+            }
+            
             .button {
                 display: inline-block;
-                background: #f44336;
-                color: white;
-                padding: 12px 30px;
+                background: rgba(255, 0, 51, 0.1);
+                color: #ff0033;
+                padding: 18px 45px;
                 text-decoration: none;
-                border-radius: 5px;
+                border: 2px solid #ff0033;
+                border-radius: 0;
+                margin-top: 30px;
+                font-family: 'Orbitron', monospace;
+                font-weight: 700;
+                font-size: 1.1em;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                cursor: pointer;
+                position: relative;
+                overflow: hidden;
+                transition: all 0.3s;
+                box-shadow: 0 0 30px rgba(255, 0, 51, 0.3);
+                animation: buttonPulse 2s infinite;
+            }
+            
+            .button:hover {
+                background: rgba(255, 0, 51, 0.3);
+                box-shadow: 
+                    0 0 60px rgba(255, 0, 51, 0.6),
+                    0 0 0 1px rgba(255, 0, 51, 0.4) inset;
+                text-shadow: 0 0 15px rgba(255, 0, 51, 1);
+                transform: scale(1.05);
+                letter-spacing: 3px;
+            }
+            
+            .button:before {
+                content: 'REINITIALIZE';
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(255, 0, 51, 0.9);
+                color: #000;
+                transform: scale(0);
+                transition: transform 0.3s;
+            }
+            
+            .button:hover:before {
+                transform: scale(1);
+            }
+            
+            .countdown {
+                font-family: 'Orbitron', monospace;
+                font-size: 2em;
                 margin-top: 20px;
-                font-weight: bold;
+                color: #ff0033;
+                text-shadow: 0 0 20px rgba(255, 0, 51, 0.8);
+                animation: countdownPulse 1s infinite;
+            }
+            
+            @keyframes errorGridMove {
+                0% { background-position: 0 0; }
+                100% { background-position: 40px 40px; }
+            }
+            
+            @keyframes warningPulse {
+                0%, 100% { opacity: 0.3; }
+                50% { opacity: 1; }
+            }
+            
+            @keyframes errorAppear {
+                0% { 
+                    transform: scale(0) rotate(0deg);
+                    opacity: 0;
+                }
+                70% { 
+                    transform: scale(1.1) rotate(5deg);
+                    opacity: 1;
+                }
+                100% { 
+                    transform: scale(1) rotate(0deg);
+                }
+            }
+            
+            @keyframes criticalShake {
+                0% { transform: translateX(0); }
+                25% { transform: translateX(-5px); }
+                75% { transform: translateX(5px); }
+                100% { transform: translateX(0); }
+            }
+            
+            @keyframes errorBorder {
+                0% { filter: hue-rotate(0deg) brightness(1); }
+                50% { filter: hue-rotate(30deg) brightness(1.5); }
+                100% { filter: hue-rotate(0deg) brightness(1); }
+            }
+            
+            @keyframes errorPulse {
+                0%, 100% { 
+                    transform: scale(1);
+                    filter: drop-shadow(0 0 20px rgba(255, 0, 51, 0.8));
+                }
+                50% { 
+                    transform: scale(1.15);
+                    filter: drop-shadow(0 0 40px rgba(255, 0, 51, 1));
+                }
+            }
+            
+            @keyframes exclamationBlink {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.3; }
+            }
+            
+            @keyframes errorTitleGlitch {
+                0% { transform: translateX(0); }
+                50% { transform: translateX(-2px); }
+                100% { transform: translateX(2px); }
+            }
+            
+            @keyframes codeFlash {
+                0%, 100% { 
+                    background: rgba(255, 0, 51, 0.05);
+                    box-shadow: 0 0 20px rgba(255, 0, 51, 0.3);
+                }
+                50% { 
+                    background: rgba(255, 0, 51, 0.15);
+                    box-shadow: 0 0 40px rgba(255, 0, 51, 0.7);
+                }
+            }
+            
+            @keyframes errorScan {
+                0% { transform: translateX(-100%); }
+                100% { transform: translateX(100%); }
+            }
+            
+            @keyframes buttonPulse {
+                0%, 100% { 
+                    box-shadow: 0 0 30px rgba(255, 0, 51, 0.3);
+                }
+                50% { 
+                    box-shadow: 0 0 50px rgba(255, 0, 51, 0.7);
+                }
+            }
+            
+            @keyframes countdownPulse {
+                0%, 100% { 
+                    opacity: 1;
+                    transform: scale(1);
+                }
+                50% { 
+                    opacity: 0.7;
+                    transform: scale(1.1);
+                }
             }
         </style>
     </head>
     <body>
+        <div class="error-grid"></div>
+        <div class="warning-lines">
+            <div class="warning-line" style="top: 20%;"></div>
+            <div class="warning-line" style="top: 40%;"></div>
+            <div class="warning-line" style="top: 60%;"></div>
+            <div class="warning-line" style="top: 80%;"></div>
+        </div>
+        
         <div class="container">
-            <div class="error">❌</div>
-            <h1>Verification Failed</h1>
-            <div class="message">
+            <div class="error-symbol">
+                <div class="error-triangle"></div>
+                <div class="error-exclamation">!</div>
+            </div>
+            <h1>ACCESS DENIED</h1>
+            <div class="error-code">ERROR: 0xFF0033</div>
+            <div class="error-message">
+                SYSTEM INTEGRITY COMPROMISED<br>
                 {error_message}
             </div>
-            <a href="/" class="button">Go Home</a>
+            <a href="/" class="button">INITIATE RECOVERY</a>
+            <div class="countdown" id="countdown">10</div>
         </div>
+        
+        <script>
+            // Create warning lines animation
+            const lines = document.querySelectorAll('.warning-line');
+            lines.forEach((line, i) => {
+                line.style.animationDelay = `${i * 0.2}s`;
+            });
+            
+            // Countdown timer
+            let countdown = 10;
+            const countdownElement = document.getElementById('countdown');
+            const countdownInterval = setInterval(() => {
+                countdown--;
+                countdownElement.textContent = countdown;
+                
+                if (countdown <= 3) {
+                    countdownElement.style.animationDuration = '0.3s';
+                    countdownElement.style.color = '#ff0000';
+                }
+                
+                if (countdown <= 0) {
+                    clearInterval(countdownInterval);
+                    countdownElement.textContent = 'SYSTEM LOCKDOWN';
+                    document.body.style.animation = 'criticalShake 0.1s infinite';
+                }
+            }, 1000);
+            
+            // Random glitch effect
+            setInterval(() => {
+                if (Math.random() > 0.8) {
+                    document.body.style.filter = 'hue-rotate(' + (Math.random() * 60 - 30) + 'deg)';
+                    setTimeout(() => {
+                        document.body.style.filter = 'none';
+                    }, 100);
+                }
+            }, 500);
+            
+            // Warning sound simulation (visual feedback)
+            setInterval(() => {
+                const container = document.querySelector('.container');
+                container.style.boxShadow = '0 0 100px rgba(255, 0, 51, 1)';
+                setTimeout(() => {
+                    container.style.boxShadow = '';
+                }, 200);
+            }, 2000);
+        </script>
     </body>
     </html>
     """
@@ -2179,3 +2924,4 @@ if __name__ == "__main__":
         access_log=True,
         timeout_keep_alive=30
     )
+
