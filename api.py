@@ -1209,12 +1209,347 @@ async def challenge_pvp(target_character_id: int, user=Depends(get_current_user)
 
 @app.post("/api/pvp/match/{match_id}/accept")
 async def accept_pvp(match_id: int, user=Depends(get_current_user)):
-    # Simplified PvP - randomly determine winner
-    winner = random.choice([1, 2])
+    """Accept and resolve a PvP match with full combat calculation"""
+    
+    # Get the match from database
+    match_result = supabase.table('pvp_matches')\
+        .select('*')\
+        .eq('id', match_id)\
+        .eq('status', 'pending')\
+        .execute()
+    
+    if not match_result.data:
+        raise HTTPException(status_code=404, detail="Match not found or already completed")
+    
+    match = match_result.data[0]
+    
+    # Get current user's character
+    char_result = supabase.table('characters')\
+        .select('*')\
+        .eq('user_id', user['id'])\
+        .execute()
+    
+    if not char_result.data:
+        raise HTTPException(status_code=404, detail="Character not found")
+    
+    current_char = char_result.data[0]
+    
+    # Verify this user is part of the match
+    if current_char['id'] not in [match['player1_id'], match['player2_id']]:
+        raise HTTPException(status_code=403, detail="You are not part of this match")
+    
+    # Get both players' full character data
+    player1_result = supabase.table('characters')\
+        .select('*')\
+        .eq('id', match['player1_id'])\
+        .execute()
+    
+    player2_result = supabase.table('characters')\
+        .select('*')\
+        .eq('id', match['player2_id'])\
+        .execute()
+    
+    if not player1_result.data or not player2_result.data:
+        raise HTTPException(status_code=404, detail="Player data not found")
+    
+    player1_data = player1_result.data[0]
+    player2_data = player2_result.data[0]
+    
+    # Create Player objects for combat
+    player1 = Player(
+        id=player1_data['id'],
+        user_id=player1_data['user_id'],
+        name=player1_data['name'],
+        class_name=GameClass(player1_data['class_name']),
+        level=player1_data['level'],
+        exp=player1_data['exp'],
+        gold=player1_data['gold'],
+        hp=player1_data['hp'],
+        max_hp=player1_data['max_hp'],
+        mana=player1_data['mana'],
+        max_mana=player1_data['max_mana'],
+        strength=player1_data['strength'],
+        agility=player1_data['agility'],
+        intelligence=player1_data['intelligence'],
+        vitality=player1_data['vitality'],
+        role=player1_data.get('role', 'player')
+    )
+    
+    player2 = Player(
+        id=player2_data['id'],
+        user_id=player2_data['user_id'],
+        name=player2_data['name'],
+        class_name=GameClass(player2_data['class_name']),
+        level=player2_data['level'],
+        exp=player2_data['exp'],
+        gold=player2_data['gold'],
+        hp=player2_data['hp'],
+        max_hp=player2_data['max_hp'],
+        mana=player2_data['mana'],
+        max_mana=player2_data['max_mana'],
+        strength=player2_data['strength'],
+        agility=player2_data['agility'],
+        intelligence=player2_data['intelligence'],
+        vitality=player2_data['vitality'],
+        role=player2_data.get('role', 'player')
+    )
+    
+    # Initialize combat
+    combat_log = []
+    turn = 1
+    max_turns = 50  # Prevent infinite loops
+    
+    # Determine who goes first based on agility
+    first_attacker = player1 if player1.agility >= player2.agility else player2
+    second_attacker = player2 if first_attacker == player1 else player1
+    
+    combat_log.append({
+        "turn": 0,
+        "message": f"Match started: {player1.name} ({player1.class_name.value}) vs {player2.name} ({player2.class_name.value})",
+        "first_attacker": first_attacker.name
+    })
+    
+    # Combat loop
+    while player1.hp > 0 and player2.hp > 0 and turn <= max_turns:
+        # First attacker's turn
+        if player1.hp > 0 and player2.hp > 0:
+            # Calculate damage with some randomness and critical hits
+            base_damage = first_attacker.attack_power
+            crit_chance = first_attacker.agility / 200  # 0.5% per agility point
+            is_critical = random.random() < crit_chance
+            
+            if is_critical:
+                base_damage = int(base_damage * 1.8)  # Critical hit does 80% more damage
+            
+            # Defense reduces damage
+            defense = second_attacker.defense
+            damage = max(1, base_damage - int(defense / 3))
+            
+            # Apply damage
+            second_attacker.hp -= damage
+            
+            combat_log.append({
+                "turn": turn,
+                "attacker": first_attacker.name,
+                "defender": second_attacker.name,
+                "damage": damage,
+                "critical": is_critical,
+                "defender_hp": max(0, second_attacker.hp),
+                "message": f"{first_attacker.name} hits {second_attacker.name} for {damage} damage{' (CRITICAL!)' if is_critical else ''}"
+            })
+        
+        # Check if defender died
+        if second_attacker.hp <= 0:
+            break
+        
+        turn += 1
+        
+        # Second attacker's turn
+        if player1.hp > 0 and player2.hp > 0:
+            # Swap roles
+            base_damage = second_attacker.attack_power
+            crit_chance = second_attacker.agility / 200
+            is_critical = random.random() < crit_chance
+            
+            if is_critical:
+                base_damage = int(base_damage * 1.8)
+            
+            defense = first_attacker.defense
+            damage = max(1, base_damage - int(defense / 3))
+            
+            first_attacker.hp -= damage
+            
+            combat_log.append({
+                "turn": turn,
+                "attacker": second_attacker.name,
+                "defender": first_attacker.name,
+                "damage": damage,
+                "critical": is_critical,
+                "defender_hp": max(0, first_attacker.hp),
+                "message": f"{second_attacker.name} hits {first_attacker.name} for {damage} damage{' (CRITICAL!)' if is_critical else ''}"
+            })
+        
+        turn += 1
+    
+    # Determine winner
+    winner_id = None
+    loser_id = None
+    winner_data = None
+    loser_data = None
+    
+    if player1.hp <= 0:
+        winner_id = player2.id
+        loser_id = player1.id
+        winner_data = player2
+        loser_data = player1
+    elif player2.hp <= 0:
+        winner_id = player1.id
+        loser_id = player2.id
+        winner_data = player1
+        loser_data = player2
+    else:
+        # Match ended by turn limit - winner is the one with more HP
+        if player1.hp > player2.hp:
+            winner_id = player1.id
+            loser_id = player2.id
+            winner_data = player1
+            loser_data = player2
+        elif player2.hp > player1.hp:
+            winner_id = player2.id
+            loser_id = player1.id
+            winner_data = player2
+            loser_data = player1
+        else:
+            # Tie - both get partial rewards
+            winner_id = None
+            loser_id = None
+    
+    # Calculate rewards
+    pvp_rewards = {}
+    if winner_id:
+        # Winner gets gold and XP based on loser's level
+        gold_reward = 50 + (loser_data.level * 10)
+        exp_reward = 100 + (loser_data.level * 20)
+        
+        # Update winner in database
+        supabase.table('characters')\
+            .update({
+                'gold': winner_data.gold + gold_reward,
+                'exp': winner_data.exp + exp_reward,
+                'hp': winner_data.hp  # Keep remaining HP
+            })\
+            .eq('id', winner_id)\
+            .execute()
+        
+        # Update loser in database (they keep their HP too)
+        supabase.table('characters')\
+            .update({
+                'hp': loser_data.hp
+            })\
+            .eq('id', loser_id)\
+            .execute()
+        
+        pvp_rewards = {
+            "winner": {
+                "id": winner_id,
+                "name": winner_data.name,
+                "gold_earned": gold_reward,
+                "exp_earned": exp_reward
+            },
+            "loser": {
+                "id": loser_id,
+                "name": loser_data.name
+            }
+        }
+        
+        # Record win/loss for leaderboard
+        supabase.table('pvp_stats').upsert({
+            'character_id': winner_id,
+            'wins': supabase.table('pvp_stats').select('wins').eq('character_id', winner_id).execute().data[0].get('wins', 0) + 1 if supabase.table('pvp_stats').select('wins').eq('character_id', winner_id).execute().data else 1
+        }).execute()
+        
+        supabase.table('pvp_stats').upsert({
+            'character_id': loser_id,
+            'losses': supabase.table('pvp_stats').select('losses').eq('character_id', loser_id).execute().data[0].get('losses', 0) + 1 if supabase.table('pvp_stats').select('losses').eq('character_id', loser_id).execute().data else 1
+        }).execute()
+        
+    else:
+        # Tie game - both get reduced rewards
+        tie_gold = 30
+        tie_exp = 50
+        
+        supabase.table('characters')\
+            .update({
+                'gold': player1.gold + tie_gold,
+                'exp': player1.exp + tie_exp,
+                'hp': player1.hp
+            })\
+            .eq('id', player1.id)\
+            .execute()
+        
+        supabase.table('characters')\
+            .update({
+                'gold': player2.gold + tie_gold,
+                'exp': player2.exp + tie_exp,
+                'hp': player2.hp
+            })\
+            .eq('id', player2.id)\
+            .execute()
+        
+        pvp_rewards = {
+            "tie": True,
+            "gold_earned": tie_gold,
+            "exp_earned": tie_exp
+        }
+    
+    # Update match record
+    end_time = datetime.datetime.now().isoformat()
+    supabase.table('pvp_matches')\
+        .update({
+            'status': 'completed',
+            'winner_id': winner_id,
+            'ended_at': end_time,
+            'match_data': {
+                'combat_log': combat_log,
+                'turns': turn,
+                'player1_final_hp': player1.hp,
+                'player2_final_hp': player2.hp
+            }
+        })\
+        .eq('id', match_id)\
+        .execute()
+    
+    # Notify both players via WebSocket if they're online
+    await manager.send_personal_message(player1.user_id, {
+        "type": "pvp_result",
+        "match_id": match_id,
+        "winner_id": winner_id,
+        "rewards": pvp_rewards,
+        "combat_log": combat_log[-10:]  # Last 10 actions
+    })
+    
+    await manager.send_personal_message(player2.user_id, {
+        "type": "pvp_result",
+        "match_id": match_id,
+        "winner_id": winner_id,
+        "rewards": pvp_rewards,
+        "combat_log": combat_log[-10:]  # Last 10 actions
+    })
+    
+    # Calculate stats
+    player1_damage_dealt = sum(log['damage'] for log in combat_log if log.get('attacker') == player1.name)
+    player2_damage_dealt = sum(log['damage'] for log in combat_log if log.get('attacker') == player2.name)
+    
     return {
-        "winner": winner,
-        "player1": 1,
-        "player2": 2
+        "success": True,
+        "match_id": match_id,
+        "winner_id": winner_id,
+        "player1": {
+            "id": player1.id,
+            "name": player1.name,
+            "class": player1.class_name.value,
+            "level": player1.level,
+            "final_hp": player1.hp,
+            "max_hp": player1.max_hp,
+            "damage_dealt": player1_damage_dealt
+        },
+        "player2": {
+            "id": player2.id,
+            "name": player2.name,
+            "class": player2.class_name.value,
+            "level": player2.level,
+            "final_hp": player2.hp,
+            "max_hp": player2.max_hp,
+            "damage_dealt": player2_damage_dealt
+        },
+        "rewards": pvp_rewards,
+        "combat_summary": {
+            "total_turns": turn - 1,
+            "decisive_victory": winner_id is not None,
+            "first_attacker": first_attacker.name,
+            "combat_log": combat_log  # Full log for detailed viewing
+        },
+        "ended_at": end_time
     }
 
 # ==================== Guild Routes ====================
@@ -1962,3 +2297,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
