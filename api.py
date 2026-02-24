@@ -1616,7 +1616,8 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
     
     # Check if user already has max characters (3)
     cursor.execute("SELECT COUNT(*) as count FROM characters WHERE user_id = ?", (user["id"],))
-    count = cursor.fetchone()["count"]
+    count_row = cursor.fetchone()
+    count = count_row["count"] if count_row else 0
     if count >= 3:
         conn.close()
         raise HTTPException(status_code=400, detail="Maximum characters reached (3)")
@@ -1659,24 +1660,61 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
     char_data = cursor.fetchone()
     conn.close()
     
+    # Convert to dictionary for safe access
+    char_dict = dict(char_data)
+    
     return CharacterResponse(
-        id=char_data["id"],
-        name=char_data["name"],
+        id=char_dict["id"],
+        name=char_dict["name"],
         class_name=character.class_name,
-        level=char_data["level"],
-        exp=char_data["exp"],
-        gold=char_data["gold"],
-        hp=char_data["hp"],
-        max_hp=char_data["max_hp"],
-        mana=char_data["mana"],
-        max_mana=char_data["max_mana"],
-        strength=char_data["strength"],
-        agility=char_data["agility"],
-        intelligence=char_data["intelligence"],
-        vitality=char_data["vitality"],
-        role=role,
-        skill_points=char_data["skill_points"]
+        level=char_dict["level"],
+        exp=char_dict["exp"],
+        gold=char_dict["gold"],
+        hp=char_dict["hp"],
+        max_hp=char_dict["max_hp"],
+        mana=char_dict["mana"],
+        max_mana=char_dict["max_mana"],
+        strength=char_dict["strength"],
+        agility=char_dict["agility"],
+        intelligence=char_dict["intelligence"],
+        vitality=char_dict["vitality"],
+        role=char_dict.get('role', 'player'),
+        skill_points=char_dict["skill_points"]
     )
+
+@app.get("/api/characters", response_model=List[CharacterResponse])
+async def get_characters(user=Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM characters WHERE user_id = ?", (user["id"],))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    characters = []
+    for row in rows:
+        # Convert to dictionary first for safe access
+        row_dict = dict(row)
+        characters.append(CharacterResponse(
+            id=row_dict["id"],
+            name=row_dict["name"],
+            class_name=GameClass(row_dict["class_name"]),
+            level=row_dict["level"],
+            exp=row_dict["exp"],
+            gold=row_dict["gold"],
+            hp=row_dict["hp"],
+            max_hp=row_dict["max_hp"],
+            mana=row_dict["mana"],
+            max_mana=row_dict["max_mana"],
+            strength=row_dict["strength"],
+            agility=row_dict["agility"],
+            intelligence=row_dict["intelligence"],
+            vitality=row_dict["vitality"],
+            role=row_dict.get('role', 'player'),  # Safe get using dict
+            skill_points=row_dict["skill_points"]
+        ))
+    
+    return characters
 
 @app.get("/api/characters", response_model=List[CharacterResponse])
 async def get_characters(user=Depends(get_current_user)):
@@ -3547,3 +3585,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
