@@ -19,7 +19,7 @@ import urllib.request
 from supabase import create_client, Client
 from cryptography.fernet import Fernet
 import base64
-import jwt
+from jose import jwt
 from pydantic import BaseModel, Field, validator
 import time
 import uuid
@@ -2924,4 +2924,5 @@ if __name__ == "__main__":
         access_log=True,
         timeout_keep_alive=30
     )
+
 
