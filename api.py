@@ -1,6 +1,7 @@
 """
 Complete 2D Pixel RPG Backend
 Single file FastAPI application with Supabase integration
+Includes Owner Auto-Registration, Role System, Cheat Menu, and Mod Menu
 """
 
 import os
@@ -34,6 +35,11 @@ JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
+# Owner Configuration - Auto-register this user as owner
+OWNER_USERNAME = "xotiic"
+OWNER_PASSWORD = "40671Mps19*"
+OWNER_ID = "xotiic_40671"  # Unique owner identifier
+
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -54,6 +60,12 @@ class ItemRarity(str, Enum):
     EPIC = "epic"
     LEGENDARY = "legendary"
 
+class UserRole(str, Enum):
+    PLAYER = "player"
+    MODERATOR = "moderator"
+    ADMIN = "admin"
+    OWNER = "owner"
+
 class QuestStatus(str, Enum):
     NOT_STARTED = "not_started"
     IN_PROGRESS = "in_progress"
@@ -67,6 +79,8 @@ class ChatChannel(str, Enum):
     TRADE = "trade"
     SYSTEM = "system"
     WHISPER = "whisper"
+    MOD = "mod"      # Moderator channel
+    ADMIN = "admin"  # Admin channel
 
 class TradeStatus(str, Enum):
     PENDING = "pending"
@@ -87,6 +101,8 @@ class UserLogin(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
+    role: str
+    is_owner: bool
 
 class CharacterCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=20)
@@ -107,6 +123,7 @@ class CharacterResponse(BaseModel):
     agility: int
     intelligence: int
     vitality: int
+    role: str
 
 class ChatMessage(BaseModel):
     channel: ChatChannel
@@ -128,6 +145,25 @@ class AuctionListing(BaseModel):
 class GuildCreate(BaseModel):
     name: str = Field(..., min_length=3, max_length=30)
     tag: str = Field(..., min_length=2, max_length=5)
+
+# ==================== Cheat/Mod Models ====================
+
+class CheatCommand(BaseModel):
+    command: str  # give_gold, set_level, spawn_item, god_mode, kill, heal
+    target: Optional[str] = None
+    amount: Optional[int] = None
+    item_id: Optional[str] = None
+
+class ModAction(BaseModel):
+    action: str  # kick, ban, mute, warn, unmute, unban
+    target_user_id: int
+    target_character_id: Optional[int] = None
+    reason: str
+    duration: Optional[int] = None  # in minutes
+
+class GameEvent(BaseModel):
+    event_type: str  # spawn_boss, start_event, give_rewards, announce
+    data: Dict[str, Any]
 
 # ==================== Game Classes ====================
 
@@ -153,6 +189,7 @@ class Player:
     map_id: str = "start_village"
     guild_id: Optional[int] = None
     party_id: Optional[int] = None
+    role: str = "player"
     status_effects: List[Dict] = field(default_factory=list)
     cooldowns: Dict[str, float] = field(default_factory=dict)
     skills: List[str] = field(default_factory=list)
@@ -217,7 +254,8 @@ class Player:
             "gold": self.gold,
             "x": self.x,
             "y": self.y,
-            "map": self.map_id
+            "map": self.map_id,
+            "role": self.role
         }
 
 @dataclass
@@ -520,6 +558,55 @@ class QuestEngine:
 
 quest_engine = QuestEngine()
 
+# ==================== Auto-Register Owner ====================
+
+async def ensure_owner_exists():
+    """Automatically create owner account if it doesn't exist"""
+    try:
+        # Check if owner exists
+        result = supabase.table('users').select('*').eq('username', OWNER_USERNAME).execute()
+        
+        if not result.data:
+            print(f"🔐 Creating owner account: {OWNER_USERNAME}")
+            password_hash = hash_password(OWNER_PASSWORD)
+            
+            owner_result = supabase.table('users').insert({
+                'username': OWNER_USERNAME,
+                'password_hash': password_hash,
+                'role': 'owner',
+                'is_owner': True,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
+            
+            if owner_result.data:
+                print(f"✅ Owner account created successfully")
+                
+                # Create a default character for owner
+                owner_id = owner_result.data[0]['id']
+                supabase.table('characters').insert({
+                    'user_id': owner_id,
+                    'name': f"{OWNER_USERNAME}_admin",
+                    'class_name': 'warrior',
+                    'level': 999,
+                    'exp': 999999,
+                    'gold': 999999,
+                    'hp': 9999,
+                    'max_hp': 9999,
+                    'mana': 9999,
+                    'max_mana': 9999,
+                    'strength': 999,
+                    'agility': 999,
+                    'intelligence': 999,
+                    'vitality': 999,
+                    'role': 'owner'
+                }).execute()
+                print(f"✅ Owner character created")
+        else:
+            print(f"✅ Owner account already exists")
+            
+    except Exception as e:
+        print(f"⚠️ Error ensuring owner exists: {e}")
+
 # ==================== Security ====================
 
 security = HTTPBearer()
@@ -554,60 +641,130 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     
     return result.data[0]
 
+async def require_owner(user = Depends(get_current_user)):
+    """Require owner role"""
+    if not user.get('is_owner', False) and user.get('username') != OWNER_USERNAME:
+        raise HTTPException(status_code=403, detail="Owner access required")
+    return user
+
+async def require_admin(user = Depends(get_current_user)):
+    """Require admin or owner role"""
+    role = user.get('role', 'player')
+    if role not in ['admin', 'owner'] and not user.get('is_owner', False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+async def require_mod(user = Depends(get_current_user)):
+    """Require moderator, admin, or owner role"""
+    role = user.get('role', 'player')
+    if role not in ['moderator', 'admin', 'owner'] and not user.get('is_owner', False):
+        raise HTTPException(status_code=403, detail="Moderator access required")
+    return user
+
 # ==================== WebSocket Manager ====================
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, WebSocket] = {}
+        self.user_roles: Dict[int, str] = {}
         self.rooms: Dict[str, Set[int]] = {
             "global": set(),
             "trade": set(),
-            "pvp": set()
+            "pvp": set(),
+            "mod": set(),    # Moderator room
+            "admin": set()   # Admin room
         }
+        self.banned_users: Set[int] = set()
+        self.muted_users: Dict[int, datetime.datetime] = {}
         self.chat_history: List[Dict] = []
     
-    async def connect(self, websocket: WebSocket, user_id: int):
+    async def connect(self, websocket: WebSocket, user_id: int, role: str = "player"):
         await websocket.accept()
         self.active_connections[user_id] = websocket
+        self.user_roles[user_id] = role
         self.rooms["global"].add(user_id)
+        
+        # Add to mod/admin rooms if applicable
+        if role in ["moderator", "admin", "owner"]:
+            self.rooms["mod"].add(user_id)
+        if role in ["admin", "owner"]:
+            self.rooms["admin"].add(user_id)
     
     def disconnect(self, user_id: int):
         if user_id in self.active_connections:
             del self.active_connections[user_id]
+        if user_id in self.user_roles:
+            del self.user_roles[user_id]
         for room in self.rooms.values():
             room.discard(user_id)
     
     async def send_personal_message(self, user_id: int, message: dict):
-        if user_id in self.active_connections:
+        if user_id in self.active_connections and user_id not in self.banned_users:
             try:
                 await self.active_connections[user_id].send_json(message)
             except:
                 pass
     
-    async def broadcast_to_room(self, room: str, message: dict):
+    async def broadcast_to_room(self, room: str, message: dict, exclude_user: int = None):
         if room in self.rooms:
             for user_id in self.rooms[room]:
+                if exclude_user and user_id == exclude_user:
+                    continue
                 await self.send_personal_message(user_id, message)
     
     async def handle_chat_message(self, user_id: int, message: ChatMessage):
-        # Get character name
+        # Check if user is muted
+        if user_id in self.muted_users:
+            mute_until = self.muted_users[user_id]
+            if datetime.datetime.now() < mute_until:
+                await self.send_personal_message(user_id, {
+                    "type": "error",
+                    "message": f"You are muted until {mute_until.strftime('%H:%M:%S')}"
+                })
+                return
+            else:
+                del self.muted_users[user_id]
+        
+        # Get character name and role
         result = supabase.table('characters')\
-            .select('name')\
+            .select('name, role')\
             .eq('user_id', user_id)\
             .execute()
         
         character_name = result.data[0]['name'] if result.data else f"User_{user_id}"
+        role = self.user_roles.get(user_id, "player")
+        
+        # Add role tag to sender name
+        role_tag = ""
+        if role == "owner":
+            role_tag = "👑 "
+        elif role == "admin":
+            role_tag = "⚡ "
+        elif role == "moderator":
+            role_tag = "🛡️ "
         
         chat_entry = {
             "type": "chat",
             "channel": message.channel,
-            "sender": character_name,
+            "sender": f"{role_tag}{character_name}",
             "sender_id": user_id,
+            "role": role,
             "content": message.content,
             "timestamp": datetime.datetime.now().isoformat()
         }
         
-        await self.broadcast_to_room("global", chat_entry)
+        # Store in history
+        self.chat_history.append(chat_entry)
+        if len(self.chat_history) > 100:
+            self.chat_history.pop(0)
+        
+        # Handle special channels
+        if message.channel == ChatChannel.MOD:
+            await self.broadcast_to_room("mod", chat_entry)
+        elif message.channel == ChatChannel.ADMIN:
+            await self.broadcast_to_room("admin", chat_entry)
+        else:
+            await self.broadcast_to_room("global", chat_entry)
 
 manager = ConnectionManager()
 
@@ -616,10 +773,14 @@ manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    print("RPG Server starting...")
+    print("=" * 60)
+    print("🚀 Starting Pixel RPG Server")
+    print("=" * 60)
+    await ensure_owner_exists()
+    print("✅ Server ready")
     yield
     # Shutdown
-    print("RPG Server shutting down...")
+    print("🛑 Server shutting down")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -641,21 +802,33 @@ async def register(user: UserCreate):
     if result.data:
         raise HTTPException(status_code=400, detail="Username already exists")
     
+    # Check if this is the owner
+    is_owner = (user.username == OWNER_USERNAME and user.password == OWNER_PASSWORD)
+    role = "owner" if is_owner else "player"
+    
     # Create user
     password_hash = hash_password(user.password)
     
     result = supabase.table('users').insert({
         'username': user.username,
-        'password_hash': password_hash
+        'password_hash': password_hash,
+        'role': role,
+        'is_owner': is_owner,
+        'created_at': datetime.datetime.now().isoformat()
     }).execute()
     
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to create user")
     
     user_id = result.data[0]['id']
-    token = create_access_token({"sub": str(user_id)})
+    token = create_access_token({"sub": str(user_id), "role": role, "is_owner": is_owner})
     
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": role,
+        "is_owner": is_owner
+    }
 
 @app.post("/api/login", response_model=TokenResponse)
 async def login(user: UserLogin):
@@ -669,8 +842,18 @@ async def login(user: UserLogin):
     if not verify_password(user.password, db_user['password_hash']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    token = create_access_token({"sub": str(db_user['id'])})
-    return {"access_token": token, "token_type": "bearer"}
+    token = create_access_token({
+        "sub": str(db_user['id']),
+        "role": db_user.get('role', 'player'),
+        "is_owner": db_user.get('is_owner', False)
+    })
+    
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": db_user.get('role', 'player'),
+        "is_owner": db_user.get('is_owner', False)
+    }
 
 # ==================== Character Routes ====================
 
@@ -692,6 +875,16 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
     
     stats = base_stats[character.class_name]
     
+    # Owner gets boosted stats
+    role = user.get('role', 'player')
+    if role == "owner" or user.get('is_owner', False):
+        stats = {k: v * 10 for k, v in stats.items()}
+        starting_gold = 100000
+        starting_level = 100
+    else:
+        starting_gold = 100
+        starting_level = 1
+    
     result = supabase.table('characters').insert({
         'user_id': user['id'],
         'name': character.name,
@@ -704,7 +897,9 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
         'agility': stats["agility"],
         'intelligence': stats["intelligence"],
         'vitality': stats["vitality"],
-        'gold': 100
+        'gold': starting_gold,
+        'level': starting_level,
+        'role': role
     }).execute()
     
     if not result.data:
@@ -726,7 +921,8 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
         strength=character_data['strength'],
         agility=character_data['agility'],
         intelligence=character_data['intelligence'],
-        vitality=character_data['vitality']
+        vitality=character_data['vitality'],
+        role=role
     )
 
 @app.get("/api/characters", response_model=List[CharacterResponse])
@@ -752,7 +948,8 @@ async def get_characters(user=Depends(get_current_user)):
             strength=row['strength'],
             agility=row['agility'],
             intelligence=row['intelligence'],
-            vitality=row['vitality']
+            vitality=row['vitality'],
+            role=row.get('role', 'player')
         ))
     
     return characters
@@ -770,9 +967,15 @@ async def get_character(character_id: int, user=Depends(get_current_user)):
     
     character = char_result.data[0]
     
+    # Get inventory
+    inv_result = supabase.table('inventory')\
+        .select('*')\
+        .eq('character_id', character_id)\
+        .execute()
+    
     return {
         "character": character,
-        "inventory": []
+        "inventory": inv_result.data
     }
 
 # ==================== Game Routes ====================
@@ -790,7 +993,7 @@ async def move_character(character_id: int, x: int, y: int, user=Depends(get_cur
         "character_id": character_id,
         "x": x,
         "y": y
-    })
+    }, exclude_user=user['id'])
     
     return {"success": True}
 
@@ -822,7 +1025,8 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
         strength=char_data["strength"],
         agility=char_data["agility"],
         intelligence=char_data["intelligence"],
-        vitality=char_data["vitality"]
+        vitality=char_data["vitality"],
+        role=char_data.get('role', 'player')
     )
     
     enemies = {
@@ -849,6 +1053,42 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
             exp_reward=100,
             gold_reward=50,
             loot_table=[]
+        ),
+        "the_corruptor": Enemy(
+            id="the_corruptor",
+            name="The Corruptor",
+            level=10,
+            hp=500,
+            max_hp=500,
+            attack=30,
+            defense=15,
+            exp_reward=500,
+            gold_reward=300,
+            loot_table=[]
+        ),
+        "time_keeper": Enemy(
+            id="time_keeper",
+            name="Time Keeper",
+            level=15,
+            hp=1000,
+            max_hp=1000,
+            attack=45,
+            defense=25,
+            exp_reward=800,
+            gold_reward=600,
+            loot_table=[]
+        ),
+        "void_lord": Enemy(
+            id="void_lord",
+            name="Void Lord",
+            level=20,
+            hp=2000,
+            max_hp=2000,
+            attack=60,
+            defense=30,
+            exp_reward=1500,
+            gold_reward=1000,
+            loot_table=[]
         )
     }
     
@@ -867,6 +1107,12 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
         
         enemy_damage = max(1, enemy.attack - int(player.defense / 2))
         player.take_damage(enemy_damage)
+        combat_log.append({
+            "turn": len(combat_log) + 1,
+            "attacker": "enemy",
+            "damage": enemy_damage,
+            "player_hp": player.hp
+        })
     
     victory = player.hp > 0
     
@@ -963,8 +1209,10 @@ async def challenge_pvp(target_character_id: int, user=Depends(get_current_user)
 
 @app.post("/api/pvp/match/{match_id}/accept")
 async def accept_pvp(match_id: int, user=Depends(get_current_user)):
+    # Simplified PvP - randomly determine winner
+    winner = random.choice([1, 2])
     return {
-        "winner": 1,
+        "winner": winner,
         "player1": 1,
         "player2": 2
     }
@@ -981,41 +1229,125 @@ async def create_guild(guild: GuildCreate, user=Depends(get_current_user)):
     if not result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
+    character_id = result.data[0]['id']
+    
     guild_result = supabase.table('guilds').insert({
         'name': guild.name,
         'tag': guild.tag,
-        'leader_id': result.data[0]['id']
+        'leader_id': character_id
+    }).execute()
+    
+    # Add leader as member
+    supabase.table('guild_members').insert({
+        'guild_id': guild_result.data[0]['id'],
+        'character_id': character_id,
+        'rank': 'leader'
     }).execute()
     
     return {"id": guild_result.data[0]['id'], "name": guild.name, "tag": guild.tag}
 
 @app.get("/api/guilds/my-guild")
 async def get_my_guild(user=Depends(get_current_user)):
+    # Get user's character
+    char_result = supabase.table('characters')\
+        .select('id')\
+        .eq('user_id', user['id'])\
+        .execute()
+    
+    if not char_result.data:
+        return {"name": None, "tag": None, "members": []}
+    
+    character_id = char_result.data[0]['id']
+    
+    # Get guild membership
+    member_result = supabase.table('guild_members')\
+        .select('guild_id')\
+        .eq('character_id', character_id)\
+        .execute()
+    
+    if not member_result.data:
+        return {"name": None, "tag": None, "members": []}
+    
+    guild_id = member_result.data[0]['guild_id']
+    
+    # Get guild info
+    guild_result = supabase.table('guilds')\
+        .select('*')\
+        .eq('id', guild_id)\
+        .execute()
+    
+    if not guild_result.data:
+        return {"name": None, "tag": None, "members": []}
+    
+    guild = guild_result.data[0]
+    
+    # Get members
+    members_result = supabase.table('guild_members')\
+        .select('*, characters(name, level)')\
+        .eq('guild_id', guild_id)\
+        .execute()
+    
+    members = []
+    for m in members_result.data:
+        members.append({
+            "rank": m['rank'],
+            "name": m['characters']['name'],
+            "level": m['characters']['level']
+        })
+    
     return {
-        "name": "Test Guild",
-        "tag": "TEST",
-        "members": [
-            {"rank": "leader", "name": "Player1", "level": 10},
-            {"rank": "member", "name": "Player2", "level": 5}
-        ]
+        "name": guild['name'],
+        "tag": guild['tag'],
+        "members": members
     }
 
 # ==================== Auction Routes ====================
 
 @app.get("/api/auction/listings")
 async def get_auctions(user=Depends(get_current_user)):
-    return [
-        {
-            "id": 1,
-            "item_id": "sword_001",
-            "current_bid": 100,
-            "starting_bid": 50,
-            "buyout_price": 200
-        }
-    ]
+    result = supabase.table('auctions')\
+        .select('*, inventory(item_id)')\
+        .eq('status', 'active')\
+        .execute()
+    
+    auctions = []
+    for auction in result.data:
+        auctions.append({
+            "id": auction['id'],
+            "item_id": auction['inventory']['item_id'],
+            "current_bid": auction['current_bid'] or auction['starting_bid'],
+            "starting_bid": auction['starting_bid'],
+            "buyout_price": auction['buyout_price']
+        })
+    
+    return auctions
 
 @app.post("/api/auction/{auction_id}/bid")
 async def place_bid(auction_id: int, bid_amount: int, user=Depends(get_current_user)):
+    # Get character
+    char_result = supabase.table('characters')\
+        .select('id, gold')\
+        .eq('user_id', user['id'])\
+        .execute()
+    
+    if not char_result.data:
+        raise HTTPException(status_code=404, detail="Character not found")
+    
+    character = char_result.data[0]
+    
+    # Check if user has enough gold
+    if character['gold'] < bid_amount:
+        raise HTTPException(status_code=400, detail="Not enough gold")
+    
+    # Update auction
+    supabase.table('auctions')\
+        .update({
+            'current_bid': bid_amount,
+            'current_bidder_id': character['id']
+        })\
+        .eq('id', auction_id)\
+        .execute()
+    
     return {"success": True}
 
 # ==================== Leaderboard Routes ====================
@@ -1041,6 +1373,17 @@ async def gold_leaderboard(limit: int = 10):
     
     return result.data
 
+@app.get("/api/leaderboard/pvp")
+async def pvp_leaderboard(limit: int = 10):
+    # Simplified - just return top players by level
+    result = supabase.table('characters')\
+        .select('name, class_name, level')\
+        .order('level', desc=True)\
+        .limit(limit)\
+        .execute()
+    
+    return result.data
+
 # ==================== Quest Routes ====================
 
 @app.get("/api/quests")
@@ -1055,6 +1398,451 @@ async def start_quest_route(character_id: int, quest_id: str, user=Depends(get_c
     await quest_engine.start_quest(character_id, quest_id)
     return {"success": True}
 
+# ==================== Owner/Admin Routes ====================
+
+@app.post("/api/admin/cheat")
+async def cheat_command(
+    command: CheatCommand,
+    user = Depends(require_owner)
+):
+    """Owner-only cheat commands"""
+    try:
+        target_user = command.target
+        target_char = None
+        
+        if target_user:
+            # Find target character by name
+            result = supabase.table('characters')\
+                .select('*')\
+                .eq('name', target_user)\
+                .execute()
+            if result.data:
+                target_char = result.data[0]
+            else:
+                # Try to find by user_id
+                result = supabase.table('characters')\
+                    .select('*')\
+                    .eq('user_id', target_user)\
+                    .execute()
+                if result.data:
+                    target_char = result.data[0]
+        
+        # If no target specified, use current user's character
+        if not target_char:
+            result = supabase.table('characters')\
+                .select('*')\
+                .eq('user_id', user['id'])\
+                .execute()
+            if result.data:
+                target_char = result.data[0]
+        
+        if not target_char:
+            return {"success": False, "message": "Target character not found"}
+        
+        if command.command == "give_gold":
+            amount = command.amount or 1000
+            supabase.table('characters')\
+                .update({'gold': target_char['gold'] + amount})\
+                .eq('id', target_char['id'])\
+                .execute()
+            
+            # Notify target if online
+            await manager.send_personal_message(target_char['user_id'], {
+                "type": "cheat",
+                "message": f"You received {amount} gold from owner"
+            })
+            
+            return {"success": True, "message": f"Gave {amount} gold to {target_char['name']}"}
+        
+        elif command.command == "set_level":
+            amount = command.amount or 100
+            supabase.table('characters')\
+                .update({'level': amount})\
+                .eq('id', target_char['id'])\
+                .execute()
+            
+            await manager.send_personal_message(target_char['user_id'], {
+                "type": "cheat",
+                "message": f"Your level has been set to {amount}"
+            })
+            
+            return {"success": True, "message": f"Set {target_char['name']} to level {amount}"}
+        
+        elif command.command == "spawn_item":
+            if command.item_id:
+                supabase.table('inventory').insert({
+                    'character_id': target_char['id'],
+                    'item_id': command.item_id,
+                    'quantity': command.amount or 1
+                }).execute()
+                
+                await manager.send_personal_message(target_char['user_id'], {
+                    "type": "cheat",
+                    "message": f"You received item: {command.item_id}"
+                })
+                
+                return {"success": True, "message": f"Spawned {command.item_id} for {target_char['name']}"}
+        
+        elif command.command == "god_mode":
+            # Set insane stats
+            supabase.table('characters')\
+                .update({
+                    'hp': 99999,
+                    'max_hp': 99999,
+                    'mana': 99999,
+                    'max_mana': 99999,
+                    'strength': 9999,
+                    'agility': 9999,
+                    'intelligence': 9999,
+                    'vitality': 9999
+                })\
+                .eq('id', target_char['id'])\
+                .execute()
+            
+            await manager.send_personal_message(target_char['user_id'], {
+                "type": "cheat",
+                "message": "God mode activated!"
+            })
+            
+            return {"success": True, "message": f"God mode activated for {target_char['name']}"}
+        
+        elif command.command == "kill":
+            # Set HP to 0
+            supabase.table('characters')\
+                .update({'hp': 0})\
+                .eq('id', target_char['id'])\
+                .execute()
+            
+            await manager.send_personal_message(target_char['user_id'], {
+                "type": "cheat",
+                "message": "You have been killed by owner"
+            })
+            
+            return {"success": True, "message": f"Killed {target_char['name']}"}
+        
+        elif command.command == "heal":
+            # Restore to full HP
+            supabase.table('characters')\
+                .update({'hp': target_char['max_hp']})\
+                .eq('id', target_char['id'])\
+                .execute()
+            
+            await manager.send_personal_message(target_char['user_id'], {
+                "type": "cheat",
+                "message": "You have been fully healed"
+            })
+            
+            return {"success": True, "message": f"Healed {target_char['name']}"}
+        
+        return {"success": False, "message": "Invalid command"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/mod/action")
+async def mod_action(
+    action: ModAction,
+    user = Depends(require_mod)
+):
+    """Moderator actions (kick, ban, mute, warn, unmute, unban)"""
+    try:
+        target = action.target_user_id
+        
+        if action.action == "kick":
+            # Disconnect user
+            if target in manager.active_connections:
+                await manager.send_personal_message(target, {
+                    "type": "system",
+                    "message": f"You have been kicked. Reason: {action.reason}"
+                })
+                await manager.active_connections[target].close()
+                manager.disconnect(target)
+            
+            # Log the action
+            supabase.table('mod_logs').insert({
+                'moderator_id': user['id'],
+                'target_id': target,
+                'action': 'kick',
+                'reason': action.reason,
+                'timestamp': datetime.datetime.now().isoformat()
+            }).execute()
+            
+            return {"success": True, "message": f"Kicked user {target}"}
+        
+        elif action.action == "ban":
+            # Ban user
+            manager.banned_users.add(target)
+            if target in manager.active_connections:
+                await manager.active_connections[target].close()
+                manager.disconnect(target)
+            
+            # Update database
+            supabase.table('users')\
+                .update({'banned': True, 'ban_reason': action.reason})\
+                .eq('id', target)\
+                .execute()
+            
+            # Log the action
+            supabase.table('mod_logs').insert({
+                'moderator_id': user['id'],
+                'target_id': target,
+                'action': 'ban',
+                'reason': action.reason,
+                'timestamp': datetime.datetime.now().isoformat()
+            }).execute()
+            
+            return {"success": True, "message": f"Banned user {target}"}
+        
+        elif action.action == "unban":
+            # Unban user
+            manager.banned_users.discard(target)
+            
+            supabase.table('users')\
+                .update({'banned': False, 'ban_reason': None})\
+                .eq('id', target)\
+                .execute()
+            
+            return {"success": True, "message": f"Unbanned user {target}"}
+        
+        elif action.action == "mute":
+            # Mute user for duration
+            duration = action.duration or 60  # default 60 minutes
+            mute_until = datetime.datetime.now() + datetime.timedelta(minutes=duration)
+            manager.muted_users[target] = mute_until
+            
+            await manager.send_personal_message(target, {
+                "type": "system",
+                "message": f"You have been muted for {duration} minutes. Reason: {action.reason}"
+            })
+            
+            # Log the action
+            supabase.table('mod_logs').insert({
+                'moderator_id': user['id'],
+                'target_id': target,
+                'action': 'mute',
+                'duration': duration,
+                'reason': action.reason,
+                'timestamp': datetime.datetime.now().isoformat()
+            }).execute()
+            
+            return {"success": True, "message": f"Muted user {target} for {duration} minutes"}
+        
+        elif action.action == "unmute":
+            # Unmute user
+            if target in manager.muted_users:
+                del manager.muted_users[target]
+                
+                await manager.send_personal_message(target, {
+                    "type": "system",
+                    "message": "You have been unmuted"
+                })
+            
+            return {"success": True, "message": f"Unmuted user {target}"}
+        
+        elif action.action == "warn":
+            # Log warning
+            warning_result = supabase.table('user_warnings').insert({
+                'user_id': target,
+                'moderator_id': user['id'],
+                'reason': action.reason,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
+            
+            await manager.send_personal_message(target, {
+                "type": "system",
+                "message": f"You have received a warning. Reason: {action.reason}"
+            })
+            
+            # Get warning count
+            warnings = supabase.table('user_warnings')\
+                .select('id', count='exact')\
+                .eq('user_id', target)\
+                .execute()
+            
+            return {
+                "success": True,
+                "message": f"Warned user {target}",
+                "warning_count": warnings.count
+            }
+        
+        return {"success": False, "message": "Invalid action"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/admin/event")
+async def create_game_event(
+    event: GameEvent,
+    user = Depends(require_admin)
+):
+    """Create global game events"""
+    try:
+        if event.event_type == "spawn_boss":
+            # Broadcast boss spawn to all players
+            boss_data = event.data
+            await manager.broadcast_to_room("global", {
+                "type": "boss_spawn",
+                "boss": boss_data.get("name", "Unknown Boss"),
+                "location": boss_data.get("location", "Unknown"),
+                "level": boss_data.get("level", 50),
+                "hp": boss_data.get("hp", 1000),
+                "rewards": boss_data.get("rewards", {})
+            })
+            
+            return {"success": True, "message": f"Boss {boss_data.get('name')} spawned"}
+        
+        elif event.event_type == "start_event":
+            # Start global event
+            event_data = event.data
+            await manager.broadcast_to_room("global", {
+                "type": "global_event",
+                "event": event_data.get("name"),
+                "description": event_data.get("description"),
+                "duration": event_data.get("duration", 60),
+                "rewards": event_data.get("rewards", {})
+            })
+            
+            return {"success": True, "message": f"Event {event_data.get('name')} started"}
+        
+        elif event.event_type == "give_rewards":
+            # Give rewards to all online players
+            reward_data = event.data
+            gold_amount = reward_data.get("gold", 0)
+            item_id = reward_data.get("item_id")
+            
+            for user_id in manager.rooms["global"]:
+                # Get character for this user
+                char_result = supabase.table('characters')\
+                    .select('id, gold')\
+                    .eq('user_id', user_id)\
+                    .execute()
+                
+                if char_result.data:
+                    char = char_result.data[0]
+                    
+                    # Give gold
+                    if gold_amount > 0:
+                        supabase.table('characters')\
+                            .update({'gold': char['gold'] + gold_amount})\
+                            .eq('id', char['id'])\
+                            .execute()
+                    
+                    # Give item
+                    if item_id:
+                        supabase.table('inventory').insert({
+                            'character_id': char['id'],
+                            'item_id': item_id,
+                            'quantity': 1
+                        }).execute()
+                    
+                    await manager.send_personal_message(user_id, {
+                        "type": "reward",
+                        "gold": gold_amount,
+                        "item": item_id,
+                        "message": f"You received {gold_amount} gold" + (f" and {item_id}" if item_id else "")
+                    })
+            
+            return {"success": True, "message": "Rewards distributed"}
+        
+        elif event.event_type == "announce":
+            # Send global announcement
+            announcement = event.data.get("message", "Announcement")
+            await manager.broadcast_to_room("global", {
+                "type": "announcement",
+                "message": announcement,
+                "from": user.get('username', 'Admin')
+            })
+            
+            return {"success": True, "message": "Announcement sent"}
+        
+        return {"success": False, "message": "Invalid event type"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/admin/online-players")
+async def get_online_players(user = Depends(require_mod)):
+    """Get list of online players with their info"""
+    players = []
+    for user_id in manager.rooms["global"]:
+        role = manager.user_roles.get(user_id, "player")
+        
+        # Get character info
+        char_result = supabase.table('characters')\
+            .select('name, level')\
+            .eq('user_id', user_id)\
+            .execute()
+        
+        char_name = char_result.data[0]['name'] if char_result.data else "Unknown"
+        char_level = char_result.data[0]['level'] if char_result.data else 0
+        
+        players.append({
+            "user_id": user_id,
+            "character_name": char_name,
+            "level": char_level,
+            "role": role,
+            "is_muted": user_id in manager.muted_users,
+            "is_banned": user_id in manager.banned_users
+        })
+    
+    return {
+        "online_count": len(players),
+        "players": players,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+
+@app.post("/api/admin/promote")
+async def promote_user(
+    target_user_id: int,
+    new_role: str,
+    user = Depends(require_owner)
+):
+    """Promote user to moderator/admin (owner only)"""
+    if new_role not in ["moderator", "admin"]:
+        raise HTTPException(status_code=400, detail="Invalid role. Must be 'moderator' or 'admin'")
+    
+    # Update user role in database
+    supabase.table('users')\
+        .update({'role': new_role})\
+        .eq('id', target_user_id)\
+        .execute()
+    
+    # Update role in connection manager if online
+    if target_user_id in manager.user_roles:
+        manager.user_roles[target_user_id] = new_role
+        if new_role in ["moderator", "admin", "owner"]:
+            manager.rooms["mod"].add(target_user_id)
+        if new_role in ["admin", "owner"]:
+            manager.rooms["admin"].add(target_user_id)
+    
+    # Update character role
+    supabase.table('characters')\
+        .update({'role': new_role})\
+        .eq('user_id', target_user_id)\
+        .execute()
+    
+    # Notify user if online
+    await manager.send_personal_message(target_user_id, {
+        "type": "system",
+        "message": f"You have been promoted to {new_role}!"
+    })
+    
+    return {"success": True, "message": f"User promoted to {new_role}"}
+
+@app.get("/api/admin/warnings/{user_id}")
+async def get_user_warnings(
+    user_id: int,
+    user = Depends(require_mod)
+):
+    """Get warning history for a user"""
+    result = supabase.table('user_warnings')\
+        .select('*, moderator:moderator_id(username)')\
+        .eq('user_id', user_id)\
+        .order('created_at', desc=True)\
+        .execute()
+    
+    return {"warnings": result.data}
+
 # ==================== WebSocket Routes ====================
 
 @app.websocket("/ws")
@@ -1067,11 +1855,35 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = int(payload.get("sub"))
-    except:
+        role = payload.get("role", "player")
+        is_owner = payload.get("is_owner", False)
+        
+        # Check if banned
+        result = supabase.table('users').select('banned').eq('id', user_id).execute()
+        if result.data and result.data[0].get('banned', False):
+            await websocket.close(code=1008)
+            return
+        
+        if user_id in manager.banned_users:
+            await websocket.close(code=1008)
+            return
+        
+    except Exception:
         await websocket.close(code=1008)
         return
     
-    await manager.connect(websocket, user_id)
+    await manager.connect(websocket, user_id, role)
+    
+    # Send welcome message with role
+    role_emoji = "👑" if is_owner else "⚡" if role == "admin" else "🛡️" if role == "moderator" else ""
+    await manager.send_personal_message(user_id, {
+        "type": "system",
+        "message": f"Connected to server {role_emoji}".strip()
+    })
+    
+    # Send recent chat history
+    for msg in manager.chat_history[-20:]:  # Last 20 messages
+        await manager.send_personal_message(user_id, msg)
     
     try:
         while True:
@@ -1104,7 +1916,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     "character_id": character_id,
                     "x": x,
                     "y": y
-                })
+                }, exclude_user=user_id)
+            
+            elif msg_type == "emote":
+                emote = data.get("emote")
+                await manager.broadcast_to_room("global", {
+                    "type": "emote",
+                    "user_id": user_id,
+                    "emote": emote
+                }, exclude_user=user_id)
     
     except WebSocketDisconnect:
         manager.disconnect(user_id)
@@ -1116,13 +1936,27 @@ async def root():
     return {
         "status": "online",
         "service": "Pixel RPG API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "features": ["owner_auto_register", "role_system", "cheat_menu", "mod_menu"],
+        "owner": OWNER_USERNAME,
         "timestamp": datetime.datetime.now().isoformat()
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.datetime.now().isoformat()}
+    # Check database connection
+    db_status = "healthy"
+    try:
+        supabase.table('users').select('id').limit(1).execute()
+    except:
+        db_status = "unhealthy"
+    
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "websocket_connections": len(manager.active_connections),
+        "timestamp": datetime.datetime.now().isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn
