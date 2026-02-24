@@ -1,35 +1,17 @@
-# Core framework - use versions without Rust dependencies
 fastapi==0.104.1
-uvicorn[standard]==0.24.0.post1
-python-dotenv==1.0.0
-
-# Database - pure Python
-supabase==1.2.0
-gotrue==1.3.0
-postgrest==0.10.11
-realtime==1.0.2
-storage3==0.5.3
-
-# HTTP client
-aiohttp==3.9.3
-aiohttp-retry==2.8.3
-
-# JWT - pure Python
-pyjwt==2.8.0
-cryptography==41.0.7
-
-# Pydantic - use pre-built wheels, no Rust
-pydantic==2.5.3
-pydantic-settings==2.1.0
-pydantic-extra-types==2.1.0
-annotated-types==0.6.0
-
-# QR Code - pure Python
-qrcode==7.4.2
-pillow==10.1.0
-
-# Utils
+uvicorn[standard]==0.24.0
+websockets==12.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
+supabase==2.0.3
+postgrest==0.10.0
+gotrue==1.0.4
+realtime==1.0.0
+storage3==0.5.0
+bcrypt==4.0.1
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+httpx==0.25.1
 python-dateutil==2.8.2
-
-
