@@ -10,7 +10,3 @@ pydantic==1.10.13
 python-dotenv==1.0.0
 httpx==0.25.1
 python-dateutil==2.8.2
-postgrest==0.16.10
-gotrue==2.5.0
-realtime==2.2.0
-storage3==0.7.6
