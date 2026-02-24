@@ -36,8 +36,8 @@ JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
 # Owner Configuration - Auto-register this user as owner
-OWNER_USERNAME = "xotiic"
-OWNER_PASSWORD = "40671Mps19*"
+OWNER_USERNAME = os.getenv("OWNER_USERNAME")
+OWNER_PASSWORD = os.getenv("OWNER_PASSWORD")
 OWNER_ID = "xotiic_40671"  # Unique owner identifier
 
 # Initialize Supabase client
@@ -2297,4 +2297,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
 
