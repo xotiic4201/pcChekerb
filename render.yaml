@@ -2,7 +2,7 @@ services:
   - type: web
     name: pixel-rpg-backend
     runtime: python
-    repo: https://github.com/yourusername/pixel-rpg-backend
+    repo: https://github.com/xotiic4201/bot-hosting-b
     plan: free
     region: oregon
     buildCommand: pip install -r requirements.txt
@@ -10,24 +10,20 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: DATABASE_URL
-        fromDatabase:
-          name: pixel-rpg-db
-          property: connectionString
-      - key: JWT_SECRET
-        generateValue: true
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: JWT_SECRET
+        sync: false
       - key: ADMIN_SECRET
-        generateValue: true
+        sync: false
       - key: CORS_ORIGINS
         value: https://bothostingf.vercel.app/
       - key: ENVIRONMENT
         value: production
     healthCheckPath: /health
-    autoDeploy: true
+  
 
 databases:
   - name: pixel-rpg-db
@@ -36,3 +32,4 @@ databases:
     databaseName: pixel_rpg
     user: pixel_rpg_user
     ipAllowList: [] # allow only from internal services
+
