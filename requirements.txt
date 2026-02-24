@@ -4,9 +4,13 @@ websockets==12.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
-supabase==1.2.0
+supabase==2.0.3
 bcrypt==4.0.1
 pydantic==1.10.13
 python-dotenv==1.0.0
 httpx==0.25.1
 python-dateutil==2.8.2
+postgrest==0.16.10
+gotrue==2.5.0
+realtime==2.2.0
+storage3==0.7.6
