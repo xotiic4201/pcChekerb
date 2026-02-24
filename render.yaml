@@ -1,27 +1,38 @@
 services:
   - type: web
-    name: xotiicsverify-api
-    env: python
+    name: pixel-rpg-backend
+    runtime: python
+    repo: https://github.com/yourusername/pixel-rpg-backend
+    plan: free
+    region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pixel-rpg-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: SUPABASE_KEY
         sync: false
-      - key: DISCORD_BOT_TOKEN
-        sync: false
-      - key: DISCORD_CLIENT_ID
-        sync: false
-      - key: DISCORD_CLIENT_SECRET
-        sync: false
-      - key: REDIRECT_URI
-        value: https://bot-hosting-b.onrender.com/oauth/callback
-      - key: API_URL
-        value: https://bot-hosting-b.onrender.com
-      - key: FRONTEND_URL
-        value: https://bothostingf.vercel.app
-      - key: ENCRYPTION_KEY
+      - key: ADMIN_SECRET
         generateValue: true
-      - key: API_SECRET_KEY
-        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://bothostingf.vercel.app/
+      - key: ENVIRONMENT
+        value: production
+    healthCheckPath: /health
+    autoDeploy: true
+
+databases:
+  - name: pixel-rpg-db
+    plan: free
+    region: oregon
+    databaseName: pixel_rpg
+    user: pixel_rpg_user
+    ipAllowList: [] # allow only from internal services
