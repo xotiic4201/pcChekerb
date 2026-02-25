@@ -328,8 +328,8 @@ def create_default_owner():
     
     if not owner:
         # Create default owner
-        username = "Admin"
-        password = "admin123"
+        username = os.getenv"OWNER_USERNAME"
+        password = os.getenv"OWNER_PASSWORD"
         password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         
         cursor.execute('''
@@ -3585,4 +3585,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
 
