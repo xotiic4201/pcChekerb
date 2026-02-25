@@ -1,6 +1,6 @@
 """
 Complete 2D Pixel RPG Backend
-Single file FastAPI application with SQLite database
+Single file FastAPI application with Supabase PostgreSQL database
 Includes Full Game Systems, Multiplayer, Trading, PvP, Guilds, and 5-Act Story
 """
 
@@ -13,7 +13,6 @@ import asyncio
 import datetime
 import math
 import random
-import sqlite3
 from typing import Dict, List, Optional, Any, Set
 from enum import Enum
 from dataclasses import dataclass, field
@@ -28,332 +27,108 @@ import jwt
 from pydantic import BaseModel, Field, validator
 import bcrypt
 
+# Supabase imports
+from supabase import create_client, Client
+from postgrest import APIError
+
 # ==================== Configuration ====================
 
-DATABASE_PATH = "rpg_game.db"
+# Supabase configuration - REPLACE WITH YOUR ACTUAL SUPABASE URL AND KEY
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project-url.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-supabase-anon-key")
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_urlsafe(32))
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
-# ==================== Database Setup ====================
+# Owner credentials
+OWNER_USERNAME = os.getenv("username")
+OWNER_PASSWORD = os.getenv("password")
 
-def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ==================== Supabase Client ====================
 
-def init_database():
-    """Initialize all database tables"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            email TEXT,
-            role TEXT DEFAULT 'player',
-            is_owner BOOLEAN DEFAULT 0,
-            banned BOOLEAN DEFAULT 0,
-            ban_reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login TIMESTAMP
-        )
-    ''')
-    
-    # Characters table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT UNIQUE NOT NULL,
-            class_name TEXT NOT NULL,
-            level INTEGER DEFAULT 1,
-            exp INTEGER DEFAULT 0,
-            gold INTEGER DEFAULT 100,
-            hp INTEGER DEFAULT 100,
-            max_hp INTEGER DEFAULT 100,
-            mana INTEGER DEFAULT 50,
-            max_mana INTEGER DEFAULT 50,
-            strength INTEGER DEFAULT 10,
-            agility INTEGER DEFAULT 10,
-            intelligence INTEGER DEFAULT 10,
-            vitality INTEGER DEFAULT 10,
-            x_position INTEGER DEFAULT 50,
-            y_position INTEGER DEFAULT 50,
-            map_id TEXT DEFAULT 'start_village',
-            guild_id INTEGER,
-            party_id INTEGER,
-            role TEXT DEFAULT 'player',
-            skill_points INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Inventory table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            character_id INTEGER NOT NULL,
-            item_id TEXT NOT NULL,
-            quantity INTEGER DEFAULT 1,
-            equipped BOOLEAN DEFAULT 0,
-            slot INTEGER,
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Skills table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS skills (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            character_id INTEGER NOT NULL,
-            skill_id TEXT NOT NULL,
-            level INTEGER DEFAULT 1,
-            unlocked BOOLEAN DEFAULT 1,
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Quests table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS quests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            character_id INTEGER NOT NULL,
-            quest_id TEXT NOT NULL,
-            status TEXT DEFAULT 'not_started',
-            progress INTEGER DEFAULT 0,
-            objectives TEXT,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP,
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Guilds table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS guilds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            tag TEXT UNIQUE NOT NULL,
-            leader_id INTEGER NOT NULL,
-            level INTEGER DEFAULT 1,
-            exp INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (leader_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Guild members table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS guild_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            character_id INTEGER NOT NULL,
-            rank TEXT DEFAULT 'member',
-            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (guild_id) REFERENCES guilds (id),
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Parties table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS parties (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            leader_id INTEGER NOT NULL,
-            name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Party members table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS party_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            party_id INTEGER NOT NULL,
-            character_id INTEGER NOT NULL,
-            FOREIGN KEY (party_id) REFERENCES parties (id),
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Auctions table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS auctions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller_id INTEGER NOT NULL,
-            item_instance_id INTEGER NOT NULL,
-            starting_bid INTEGER NOT NULL,
-            current_bid INTEGER,
-            current_bidder_id INTEGER,
-            buyout_price INTEGER,
-            status TEXT DEFAULT 'active',
-            ends_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (seller_id) REFERENCES characters (id),
-            FOREIGN KEY (current_bidder_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Trades table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            initiator_id INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            initiator_items TEXT,
-            target_items TEXT,
-            initiator_gold INTEGER DEFAULT 0,
-            target_gold INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP,
-            FOREIGN KEY (initiator_id) REFERENCES characters (id),
-            FOREIGN KEY (target_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # PvP matches table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS pvp_matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player1_id INTEGER NOT NULL,
-            player2_id INTEGER NOT NULL,
-            winner_id INTEGER,
-            status TEXT DEFAULT 'pending',
-            match_data TEXT,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ended_at TIMESTAMP,
-            FOREIGN KEY (player1_id) REFERENCES characters (id),
-            FOREIGN KEY (player2_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # PvP stats table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS pvp_stats (
-            character_id INTEGER PRIMARY KEY,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0,
-            rating INTEGER DEFAULT 1000,
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Messages/Chat history
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender_id INTEGER NOT NULL,
-            channel TEXT NOT NULL,
-            content TEXT NOT NULL,
-            target_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (sender_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Moderation logs
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS mod_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            moderator_id INTEGER NOT NULL,
-            target_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            reason TEXT,
-            duration INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (moderator_id) REFERENCES users (id),
-            FOREIGN KEY (target_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # User warnings
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_warnings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            moderator_id INTEGER NOT NULL,
-            reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (moderator_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Story progression
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS story_progression (
-            character_id INTEGER PRIMARY KEY,
-            current_act INTEGER DEFAULT 1,
-            current_chapter INTEGER DEFAULT 1,
-            completed_acts TEXT DEFAULT '[]',
-            choices_made TEXT DEFAULT '[]',
-            reputation JSON,
-            companions TEXT DEFAULT '[]',
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    # Codex entries
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS codex (
-            character_id INTEGER NOT NULL,
-            entry_id TEXT NOT NULL,
-            discovered BOOLEAN DEFAULT 1,
-            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (character_id, entry_id),
-            FOREIGN KEY (character_id) REFERENCES characters (id)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    
-    # Create default owner if not exists
-    create_default_owner()
+supabase: Optional[Client] = None
 
-def create_default_owner():
-    """Create default admin/owner account"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Check if any owner exists
-    cursor.execute("SELECT * FROM users WHERE role = 'owner' OR is_owner = 1")
-    owner = cursor.fetchone()
-    
-    if not owner:
-        # Create default owner
-        username = "xotiic"
-        password = "40671Mps19*"
-        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-        
-        cursor.execute('''
-            INSERT INTO users (username, password_hash, role, is_owner)
-            VALUES (?, ?, ?, ?)
-        ''', (username, password_hash, 'owner', 1))
-        
-        user_id = cursor.lastrowid
-        
-        # Create owner character
-        cursor.execute('''
-            INSERT INTO characters (user_id, name, class_name, level, gold, hp, max_hp, mana, max_mana,
-                                   strength, agility, intelligence, vitality, role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, "Admin", "warrior", 999, 999999, 99999, 99999, 99999, 99999,
-              999, 999, 999, 999, 'owner'))
-        
-        conn.commit()
-        print("✅ Default owner account created (Admin/admin123)")
-    
-    conn.close()
+def get_supabase_client() -> Client:
+    """Get or create Supabase client"""
+    global supabase
+    if supabase is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise Exception("SUPABASE_URL and SUPABASE_KEY must be set")
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return supabase
 
-# Initialize database
-init_database()
+async def execute_query(query_func):
+    """Execute a Supabase query with error handling"""
+    try:
+        return await query_func()
+    except APIError as e:
+        print(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+async def init_database():
+    """Initialize database connection and create owner account"""
+    try:
+        client = get_supabase_client()
+        # Test connection
+        result = client.table('users').select('count', count='exact').limit(1).execute()
+        print("✅ Supabase connection successful")
+        
+        # Create owner account
+        await create_owner_account()
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        print("Please ensure your Supabase database is properly set up with the schema")
+
+async def create_owner_account():
+    """Create owner account with specified credentials"""
+    client = get_supabase_client()
+    
+    try:
+        # Check if owner already exists
+        result = client.table('users').select('*').eq('username', OWNER_USERNAME).execute()
+        
+        if not result.data:
+            # Create owner
+            password_hash = bcrypt.hashpw(OWNER_PASSWORD.encode(), bcrypt.gensalt()).decode()
+            
+            user_data = {
+                'username': OWNER_USERNAME,
+                'password_hash': password_hash,
+                'role': 'owner',
+                'is_owner': True,
+                'created_at': datetime.datetime.now().isoformat()
+            }
+            
+            user_result = client.table('users').insert(user_data).execute()
+            
+            if user_result.data:
+                user_id = user_result.data[0]['id']
+                
+                # Create owner character
+                character_data = {
+                    'user_id': user_id,
+                    'name': 'Admin',
+                    'class_name': 'warrior',
+                    'level': 999,
+                    'gold': 999999,
+                    'hp': 99999,
+                    'max_hp': 99999,
+                    'mana': 99999,
+                    'max_mana': 99999,
+                    'strength': 999,
+                    'agility': 999,
+                    'intelligence': 999,
+                    'vitality': 999,
+                    'role': 'owner'
+                }
+                
+                client.table('characters').insert(character_data).execute()
+                print(f"✅ Owner account created ({OWNER_USERNAME})")
+    except Exception as e:
+        print(f"⚠️ Could not create default owner: {e}")
 
 # ==================== Enums ====================
 
@@ -1196,49 +971,40 @@ class QuestEngine:
         self.quests = QUESTS
     
     async def start_quest(self, character_id: int, quest_id: str) -> Dict:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        client = get_supabase_client()
         
         # Check if already started
-        cursor.execute(
-            "SELECT * FROM quests WHERE character_id = ? AND quest_id = ?",
-            (character_id, quest_id)
-        )
-        existing = cursor.fetchone()
+        result = client.table('quests').select('*').eq('character_id', character_id).eq('quest_id', quest_id).execute()
         
-        if existing:
-            conn.close()
+        if result.data:
             return {"success": False, "message": "Quest already started"}
         
         quest = self.quests.get(quest_id)
         if not quest:
-            conn.close()
             return {"success": False, "message": "Quest not found"}
         
         # Initialize objectives as JSON
         objectives = json.dumps(quest.get("objectives", []))
         
-        cursor.execute('''
-            INSERT INTO quests (character_id, quest_id, status, objectives, started_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (character_id, quest_id, "in_progress", objectives, datetime.datetime.now().isoformat()))
+        quest_data = {
+            'character_id': character_id,
+            'quest_id': quest_id,
+            'status': 'in_progress',
+            'objectives': objectives,
+            'started_at': datetime.datetime.now().isoformat()
+        }
         
-        conn.commit()
-        conn.close()
+        client.table('quests').insert(quest_data).execute()
         
         return {"success": True, "message": f"Quest '{quest['title']}' started"}
     
     async def update_quest_progress(self, character_id: int, event_type: str, event_data: Dict) -> Dict:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        client = get_supabase_client()
         
         # Get active quests
-        cursor.execute(
-            "SELECT * FROM quests WHERE character_id = ? AND status = 'in_progress'",
-            (character_id,)
-        )
-        active_quests = cursor.fetchall()
+        result = client.table('quests').select('*').eq('character_id', character_id).eq('status', 'in_progress').execute()
         
+        active_quests = result.data
         updates = []
         
         for q in active_quests:
@@ -1260,38 +1026,39 @@ class QuestEngine:
             
             if completed:
                 # Quest completed
-                cursor.execute('''
-                    UPDATE quests
-                    SET status = ?, completed_at = ?
-                    WHERE character_id = ? AND quest_id = ?
-                ''', ("completed", datetime.datetime.now().isoformat(), character_id, quest_id))
+                client.table('quests').update({
+                    'status': 'completed',
+                    'completed_at': datetime.datetime.now().isoformat()
+                }).eq('character_id', character_id).eq('quest_id', quest_id).execute()
                 
                 # Grant rewards
                 rewards = quest.get("rewards", {})
                 if rewards:
-                    cursor.execute(
-                        "UPDATE characters SET exp = exp + ?, gold = gold + ? WHERE id = ?",
-                        (rewards.get("exp", 0), rewards.get("gold", 0), character_id)
-                    )
+                    # Update character exp and gold
+                    if rewards.get("exp", 0) > 0:
+                        client.table('characters').update({
+                            'exp': client.rpc('increment', {'x': rewards["exp"]})
+                        }).eq('id', character_id).execute()
+                    
+                    if rewards.get("gold", 0) > 0:
+                        client.table('characters').update({
+                            'gold': client.rpc('increment', {'x': rewards["gold"]})
+                        }).eq('id', character_id).execute()
                     
                     # Add items
                     for item in rewards.get("items", []):
-                        cursor.execute('''
-                            INSERT INTO inventory (character_id, item_id, quantity)
-                            VALUES (?, ?, 1)
-                        ''', (character_id, item))
+                        client.table('inventory').insert({
+                            'character_id': character_id,
+                            'item_id': item,
+                            'quantity': 1
+                        }).execute()
                 
                 updates.append({"quest_id": quest_id, "completed": True})
             else:
                 # Update progress
-                cursor.execute('''
-                    UPDATE quests SET progress = ? WHERE character_id = ? AND quest_id = ?
-                ''', (progress, character_id, quest_id))
+                client.table('quests').update({'progress': progress}).eq('character_id', character_id).eq('quest_id', quest_id).execute()
                 
                 updates.append({"quest_id": quest_id, "progress": progress})
-        
-        conn.commit()
-        conn.close()
         
         return {"success": True, "updates": updates}
 
@@ -1324,16 +1091,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    user = cursor.fetchone()
-    conn.close()
+    client = get_supabase_client()
+    result = client.table('users').select('*').eq('id', user_id).execute()
     
-    if not user:
+    if not result.data:
         raise HTTPException(status_code=401, detail="User not found")
     
-    if user["banned"]:
+    user = result.data[0]
+    
+    if user.get("banned", False):
         raise HTTPException(status_code=403, detail="User is banned")
     
     return dict(user)
@@ -1383,13 +1149,10 @@ class ConnectionManager:
         self.rooms["global"].add(user_id)
         
         # Get character ID for this user
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user_id,))
-        char = cursor.fetchone()
-        if char:
-            self.character_ids[user_id] = char["id"]
-        conn.close()
+        client = get_supabase_client()
+        result = client.table('characters').select('id').eq('user_id', user_id).execute()
+        if result.data:
+            self.character_ids[user_id] = result.data[0]["id"]
         
         # Add to mod/admin rooms if applicable
         if role in ["moderator", "admin", "owner"]:
@@ -1435,11 +1198,9 @@ class ConnectionManager:
                 del self.muted_users[user_id]
         
         # Get character name
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, class_name FROM characters WHERE user_id = ?", (user_id,))
-        char = cursor.fetchone()
-        conn.close()
+        client = get_supabase_client()
+        result = client.table('characters').select('name, class_name').eq('user_id', user_id).execute()
+        char = result.data[0] if result.data else None
         
         character_name = char["name"] if char else f"User_{user_id}"
         role = self.user_roles.get(user_id, "player")
@@ -1471,16 +1232,10 @@ class ConnectionManager:
         # Handle whisper
         if message.channel == ChatChannel.WHISPER and message.target:
             # Find target user by character name
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT user_id FROM characters WHERE name = ?
-            ''', (message.target,))
-            target = cursor.fetchone()
-            conn.close()
+            result = client.table('characters').select('user_id').eq('name', message.target).execute()
             
-            if target:
-                await self.send_personal_message(target["user_id"], chat_entry)
+            if result.data:
+                await self.send_personal_message(result.data[0]["user_id"], chat_entry)
                 await self.send_personal_message(user_id, chat_entry)
             else:
                 await self.send_personal_message(user_id, {
@@ -1502,9 +1257,9 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     # Startup
     print("=" * 60)
-    print("🚀 Starting Pixel RPG Server")
+    print("🚀 Starting Pixel RPG Server with Supabase")
     print("=" * 60)
-    print("✅ Database initialized")
+    await init_database()
     print("✅ Server ready")
     yield
     # Shutdown
@@ -1525,33 +1280,37 @@ app.add_middleware(
 
 @app.post("/api/register", response_model=TokenResponse)
 async def register(user: UserCreate):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Check if user exists
-    cursor.execute("SELECT * FROM users WHERE username = ?", (user.username,))
-    if cursor.fetchone():
-        conn.close()
+    result = client.table('users').select('*').eq('username', user.username).execute()
+    if result.data:
         raise HTTPException(status_code=400, detail="Username already exists")
     
     # Check if email exists
     if user.email:
-        cursor.execute("SELECT * FROM users WHERE email = ?", (user.email,))
-        if cursor.fetchone():
-            conn.close()
+        result = client.table('users').select('*').eq('email', user.email).execute()
+        if result.data:
             raise HTTPException(status_code=400, detail="Email already registered")
     
     # Create user
     password_hash = hash_password(user.password)
     
-    cursor.execute('''
-        INSERT INTO users (username, password_hash, email, role, is_owner, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user.username, password_hash, user.email, 'player', 0, datetime.datetime.now().isoformat()))
+    user_data = {
+        'username': user.username,
+        'password_hash': password_hash,
+        'email': user.email,
+        'role': 'player',
+        'is_owner': False,
+        'created_at': datetime.datetime.now().isoformat()
+    }
     
-    user_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    result = client.table('users').insert(user_data).execute()
+    
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+    
+    user_id = result.data[0]['id']
     
     token = create_access_token({"sub": str(user_id), "role": "player", "is_owner": False})
     
@@ -1564,29 +1323,23 @@ async def register(user: UserCreate):
 
 @app.post("/api/login", response_model=TokenResponse)
 async def login(user: UserLogin):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute("SELECT * FROM users WHERE username = ?", (user.username,))
-    db_user = cursor.fetchone()
-    conn.close()
+    result = client.table('users').select('*').eq('username', user.username).execute()
     
-    if not db_user:
+    if not result.data:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    db_user = result.data[0]
     
     if not verify_password(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    if db_user["banned"]:
+    if db_user.get("banned", False):
         raise HTTPException(status_code=403, detail="Account is banned")
     
     # Update last login
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET last_login = ? WHERE id = ?", 
-                   (datetime.datetime.now().isoformat(), db_user["id"]))
-    conn.commit()
-    conn.close()
+    client.table('users').update({'last_login': datetime.datetime.now().isoformat()}).eq('id', db_user["id"]).execute()
     
     token = create_access_token({
         "sub": str(db_user["id"]),
@@ -1605,21 +1358,17 @@ async def login(user: UserLogin):
 
 @app.post("/api/characters", response_model=CharacterResponse)
 async def create_character(character: CharacterCreate, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Check if character name exists
-    cursor.execute("SELECT * FROM characters WHERE name = ?", (character.name,))
-    if cursor.fetchone():
-        conn.close()
+    result = client.table('characters').select('*').eq('name', character.name).execute()
+    if result.data:
         raise HTTPException(status_code=400, detail="Character name already exists")
     
     # Check if user already has max characters (3)
-    cursor.execute("SELECT COUNT(*) as count FROM characters WHERE user_id = ?", (user["id"],))
-    count_row = cursor.fetchone()
-    count = count_row["count"] if count_row else 0
+    result = client.table('characters').select('id', count='exact').eq('user_id', user["id"]).execute()
+    count = result.count if hasattr(result, 'count') else len(result.data)
     if count >= 3:
-        conn.close()
         raise HTTPException(status_code=400, detail="Maximum characters reached (3)")
     
     # Base stats per class
@@ -1640,93 +1389,63 @@ async def create_character(character: CharacterCreate, user=Depends(get_current_
     if role == "owner" or user.get('is_owner', False):
         starting_gold = 100000
     
-    cursor.execute('''
-        INSERT INTO characters (
-            user_id, name, class_name, hp, max_hp, mana, max_mana,
-            strength, agility, intelligence, vitality, gold, role
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        user["id"], character.name, character.class_name.value,
-        stats["hp"], stats["hp"], stats["mana"], stats["mana"],
-        stats["strength"], stats["agility"], stats["intelligence"], stats["vitality"],
-        starting_gold, role
-    ))
+    character_data = {
+        'user_id': user["id"],
+        'name': character.name,
+        'class_name': character.class_name.value,
+        'hp': stats["hp"],
+        'max_hp': stats["hp"],
+        'mana': stats["mana"],
+        'max_mana': stats["mana"],
+        'strength': stats["strength"],
+        'agility': stats["agility"],
+        'intelligence': stats["intelligence"],
+        'vitality': stats["vitality"],
+        'gold': starting_gold,
+        'role': role
+    }
     
-    character_id = cursor.lastrowid
-    conn.commit()
+    result = client.table('characters').insert(character_data).execute()
     
-    # Get created character
-    cursor.execute("SELECT * FROM characters WHERE id = ?", (character_id,))
-    char_data = cursor.fetchone()
-    conn.close()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create character")
     
-    # Convert to dictionary for safe access
-    char_dict = dict(char_data)
+    char_data = result.data[0]
+    
+    # Add starting items
+    client.table('inventory').insert({
+        'character_id': char_data["id"],
+        'item_id': 'health_potion',
+        'quantity': 3
+    }).execute()
     
     return CharacterResponse(
-        id=char_dict["id"],
-        name=char_dict["name"],
-        class_name=character.class_name,
-        level=char_dict["level"],
-        exp=char_dict["exp"],
-        gold=char_dict["gold"],
-        hp=char_dict["hp"],
-        max_hp=char_dict["max_hp"],
-        mana=char_dict["mana"],
-        max_mana=char_dict["max_mana"],
-        strength=char_dict["strength"],
-        agility=char_dict["agility"],
-        intelligence=char_dict["intelligence"],
-        vitality=char_dict["vitality"],
-        role=char_dict.get('role', 'player'),
-        skill_points=char_dict["skill_points"]
+        id=char_data["id"],
+        name=char_data["name"],
+        class_name=GameClass(char_data["class_name"]),
+        level=char_data["level"],
+        exp=char_data["exp"],
+        gold=char_data["gold"],
+        hp=char_data["hp"],
+        max_hp=char_data["max_hp"],
+        mana=char_data["mana"],
+        max_mana=char_data["max_mana"],
+        strength=char_data["strength"],
+        agility=char_data["agility"],
+        intelligence=char_data["intelligence"],
+        vitality=char_data["vitality"],
+        role=char_data.get('role', 'player'),
+        skill_points=char_data["skill_points"]
     )
 
 @app.get("/api/characters", response_model=List[CharacterResponse])
 async def get_characters(user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute("SELECT * FROM characters WHERE user_id = ?", (user["id"],))
-    rows = cursor.fetchall()
-    conn.close()
+    result = client.table('characters').select('*').eq('user_id', user["id"]).execute()
     
     characters = []
-    for row in rows:
-        # Convert to dictionary first for safe access
-        row_dict = dict(row)
-        characters.append(CharacterResponse(
-            id=row_dict["id"],
-            name=row_dict["name"],
-            class_name=GameClass(row_dict["class_name"]),
-            level=row_dict["level"],
-            exp=row_dict["exp"],
-            gold=row_dict["gold"],
-            hp=row_dict["hp"],
-            max_hp=row_dict["max_hp"],
-            mana=row_dict["mana"],
-            max_mana=row_dict["max_mana"],
-            strength=row_dict["strength"],
-            agility=row_dict["agility"],
-            intelligence=row_dict["intelligence"],
-            vitality=row_dict["vitality"],
-            role=row_dict.get('role', 'player'),  # Safe get using dict
-            skill_points=row_dict["skill_points"]
-        ))
-    
-    return characters
-
-@app.get("/api/characters", response_model=List[CharacterResponse])
-async def get_characters(user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM characters WHERE user_id = ?", (user["id"],))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    characters = []
-    for row in rows:
+    for row in result.data:
         characters.append(CharacterResponse(
             id=row["id"],
             name=row["name"],
@@ -1750,73 +1469,49 @@ async def get_characters(user=Depends(get_current_user)):
 
 @app.get("/api/characters/{character_id}")
 async def get_character(character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute('''
-        SELECT * FROM characters
-        WHERE id = ? AND user_id = ?
-    ''', (character_id, user["id"]))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('*').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
+    character = char_result.data[0]
+    
     # Get inventory
-    cursor.execute('''
-        SELECT * FROM inventory
-        WHERE character_id = ?
-    ''', (character_id,))
-    inventory = cursor.fetchall()
+    inv_result = client.table('inventory').select('*').eq('character_id', character_id).execute()
     
     # Get skills
-    cursor.execute('''
-        SELECT * FROM skills
-        WHERE character_id = ?
-    ''', (character_id,))
-    skills = cursor.fetchall()
+    skills_result = client.table('skills').select('*').eq('character_id', character_id).execute()
     
-    # Get active quests
-    cursor.execute('''
-        SELECT * FROM quests
-        WHERE character_id = ? AND status = 'in_progress'
-    ''', (character_id,))
-    quests = cursor.fetchall()
+    # Get quests
+    quests_result = client.table('quests').select('*').eq('character_id', character_id).execute()
     
     # Get story progression
-    cursor.execute('''
-        SELECT * FROM story_progression
-        WHERE character_id = ?
-    ''', (character_id,))
-    story = cursor.fetchone()
+    story_result = client.table('story_progression').select('*').eq('character_id', character_id).execute()
     
-    conn.close()
+    # Get codex
+    codex_result = client.table('codex').select('*').eq('character_id', character_id).execute()
     
     return {
-        "character": dict(character),
-        "inventory": [dict(i) for i in inventory],
-        "skills": [dict(s) for s in skills],
-        "quests": [dict(q) for q in quests],
-        "story": dict(story) if story else None
+        "character": character,
+        "inventory": inv_result.data,
+        "skills": skills_result.data,
+        "quests": quests_result.data,
+        "story": story_result.data[0] if story_result.data else None,
+        "codex": codex_result.data
     }
 
 # ==================== Game Routes ====================
 
 @app.post("/api/characters/{character_id}/move")
 async def move_character(character_id: int, x: int, y: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        UPDATE characters
-        SET x_position = ?, y_position = ?
-        WHERE id = ? AND user_id = ?
-    ''', (x, y, character_id, user["id"]))
-    
-    conn.commit()
-    conn.close()
+    client.table('characters').update({
+        'x_position': x,
+        'y_position': y
+    }).eq('id', character_id).eq('user_id', user["id"]).execute()
     
     # Broadcast movement
     await manager.broadcast_to_room("global", {
@@ -1830,16 +1525,15 @@ async def move_character(character_id: int, x: int, y: int, user=Depends(get_cur
 
 @app.post("/api/characters/{character_id}/combat/{enemy_id}")
 async def start_combat(character_id: int, enemy_id: str, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT * FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    char_data = cursor.fetchone()
+    char_result = client.table('characters').select('*').eq('id', character_id).eq('user_id', user["id"]).execute()
     
-    if not char_data:
-        conn.close()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
+    
+    char_data = char_result.data[0]
     
     # Create player object
     player = Player(
@@ -1865,7 +1559,6 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
     # Get enemy
     enemy_data = ENEMIES.get(enemy_id)
     if not enemy_data:
-        conn.close()
         raise HTTPException(status_code=404, detail="Enemy not found")
     
     enemy = Enemy(
@@ -1919,23 +1612,23 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
         for loot in enemy.loot_table:
             if random.random() < loot["chance"]:
                 loot_items.append(loot["item_id"])
-                cursor.execute('''
-                    INSERT INTO inventory (character_id, item_id, quantity)
-                    VALUES (?, ?, 1)
-                ''', (character_id, loot["item_id"]))
+                client.table('inventory').insert({
+                    'character_id': character_id,
+                    'item_id': loot["item_id"],
+                    'quantity': 1
+                }).execute()
         
         # Update character in database
-        cursor.execute('''
-            UPDATE characters
-            SET hp = ?, mana = ?, exp = ?, gold = ?, level = ?
-            WHERE id = ?
-        ''', (player.hp, player.mana, player.exp, player.gold, player.level, character_id))
+        client.table('characters').update({
+            'hp': player.hp,
+            'mana': player.mana,
+            'exp': player.exp,
+            'gold': player.gold,
+            'level': player.level
+        }).eq('id', character_id).execute()
         
         # Update quest progress
         await quest_engine.update_quest_progress(character_id, "kill", {"target": enemy_id, "amount": 1})
-    
-    conn.commit()
-    conn.close()
     
     return {
         "victory": victory,
@@ -1946,41 +1639,39 @@ async def start_combat(character_id: int, enemy_id: str, user=Depends(get_curren
         "exp_gained": enemy.exp_reward if victory else 0,
         "gold_gained": enemy.gold_reward if victory else 0,
         "loot": loot_items if victory else [],
-        "combat_log": combat_log[-10:]  # Last 10 actions
+        "combat_log": combat_log[-10:]
     }
 
 # ==================== Trading Routes ====================
 
 @app.post("/api/trade/initiate/{target_character_id}")
 async def initiate_trade(target_character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get initiator character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    initiator = cursor.fetchone()
-    
-    if not initiator:
-        conn.close()
+    initiator_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not initiator_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Check if target exists
-    cursor.execute("SELECT user_id FROM characters WHERE id = ?", (target_character_id,))
-    target = cursor.fetchone()
+    initiator = initiator_result.data[0]
     
-    if not target:
-        conn.close()
+    # Check if target exists
+    target_result = client.table('characters').select('user_id').eq('id', target_character_id).execute()
+    if not target_result.data:
         raise HTTPException(status_code=404, detail="Target character not found")
     
-    # Create trade
-    cursor.execute('''
-        INSERT INTO trades (initiator_id, target_id, status, created_at)
-        VALUES (?, ?, ?, ?)
-    ''', (initiator["id"], target_character_id, "pending", datetime.datetime.now().isoformat()))
+    target = target_result.data[0]
     
-    trade_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    # Create trade
+    trade_data = {
+        'initiator_id': initiator["id"],
+        'target_id': target_character_id,
+        'status': 'pending',
+        'created_at': datetime.datetime.now().isoformat()
+    }
+    
+    trade_result = client.table('trades').insert(trade_data).execute()
+    trade_id = trade_result.data[0]["id"]
     
     # Notify target
     await manager.send_personal_message(target["user_id"], {
@@ -1993,160 +1684,154 @@ async def initiate_trade(target_character_id: int, user=Depends(get_current_user
 
 @app.post("/api/trade/{trade_id}/accept")
 async def accept_trade(trade_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Get trade
-    cursor.execute('''
-        SELECT * FROM trades WHERE id = ? AND (initiator_id = ? OR target_id = ?)
-    ''', (trade_id, character["id"], character["id"]))
-    trade = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not trade:
-        conn.close()
+    # Get trade
+    trade_result = client.table('trades').select('*').eq('id', trade_id).execute()
+    if not trade_result.data:
         raise HTTPException(status_code=404, detail="Trade not found")
+    
+    trade = trade_result.data[0]
     
     # Update trade status
     if trade["status"] == "pending":
-        cursor.execute('''
-            UPDATE trades SET status = ? WHERE id = ?
-        ''', ("accepted", trade_id))
+        client.table('trades').update({'status': 'accepted'}).eq('id', trade_id).execute()
     elif trade["status"] == "accepted":
         # Both accepted, complete trade
-        # Validate and transfer items/gold
         initiator_items = json.loads(trade["initiator_items"] or "[]")
         target_items = json.loads(trade["target_items"] or "[]")
         initiator_gold = trade["initiator_gold"]
         target_gold = trade["target_gold"]
         
         # Get character inventories
-        cursor.execute("SELECT * FROM inventory WHERE character_id = ?", (trade["initiator_id"],))
-        initiator_inv = {i["item_id"]: i for i in cursor.fetchall()}
+        initiator_inv_result = client.table('inventory').select('*').eq('character_id', trade["initiator_id"]).execute()
+        target_inv_result = client.table('inventory').select('*').eq('character_id', trade["target_id"]).execute()
         
-        cursor.execute("SELECT * FROM inventory WHERE character_id = ?", (trade["target_id"],))
-        target_inv = {i["item_id"]: i for i in cursor.fetchall()}
+        initiator_inv = {i["item_id"]: i for i in initiator_inv_result.data}
+        target_inv = {i["item_id"]: i for i in target_inv_result.data}
         
         # Verify initiator has items
         for item in initiator_items:
             if item["item_id"] not in initiator_inv or initiator_inv[item["item_id"]]["quantity"] < item["quantity"]:
-                conn.close()
                 raise HTTPException(status_code=400, detail="Initiator missing items")
         
         # Verify target has items
         for item in target_items:
             if item["item_id"] not in target_inv or target_inv[item["item_id"]]["quantity"] < item["quantity"]:
-                conn.close()
                 raise HTTPException(status_code=400, detail="Target missing items")
         
         # Verify gold amounts
-        cursor.execute("SELECT gold FROM characters WHERE id = ?", (trade["initiator_id"],))
-        initiator_gold_current = cursor.fetchone()["gold"]
+        initiator_gold_result = client.table('characters').select('gold').eq('id', trade["initiator_id"]).execute()
+        target_gold_result = client.table('characters').select('gold').eq('id', trade["target_id"]).execute()
         
-        cursor.execute("SELECT gold FROM characters WHERE id = ?", (trade["target_id"],))
-        target_gold_current = cursor.fetchone()["gold"]
+        initiator_gold_current = initiator_gold_result.data[0]["gold"]
+        target_gold_current = target_gold_result.data[0]["gold"]
         
         if initiator_gold_current < initiator_gold or target_gold_current < target_gold:
-            conn.close()
             raise HTTPException(status_code=400, detail="Insufficient gold")
         
         # Transfer items
         for item in initiator_items:
             # Remove from initiator
-            cursor.execute('''
-                UPDATE inventory SET quantity = quantity - ?
-                WHERE character_id = ? AND item_id = ?
-            ''', (item["quantity"], trade["initiator_id"], item["item_id"]))
+            client.table('inventory').update({
+                'quantity': initiator_inv[item["item_id"]]["quantity"] - item["quantity"]
+            }).eq('character_id', trade["initiator_id"]).eq('item_id', item["item_id"]).execute()
             
             # Add to target
-            cursor.execute('''
-                INSERT INTO inventory (character_id, item_id, quantity)
-                VALUES (?, ?, ?)
-                ON CONFLICT(character_id, item_id) DO UPDATE SET quantity = quantity + ?
-            ''', (trade["target_id"], item["item_id"], item["quantity"], item["quantity"]))
+            target_item = target_inv.get(item["item_id"])
+            if target_item:
+                client.table('inventory').update({
+                    'quantity': target_item["quantity"] + item["quantity"]
+                }).eq('character_id', trade["target_id"]).eq('item_id', item["item_id"]).execute()
+            else:
+                client.table('inventory').insert({
+                    'character_id': trade["target_id"],
+                    'item_id': item["item_id"],
+                    'quantity': item["quantity"]
+                }).execute()
         
         for item in target_items:
             # Remove from target
-            cursor.execute('''
-                UPDATE inventory SET quantity = quantity - ?
-                WHERE character_id = ? AND item_id = ?
-            ''', (item["quantity"], trade["target_id"], item["item_id"]))
+            client.table('inventory').update({
+                'quantity': target_inv[item["item_id"]]["quantity"] - item["quantity"]
+            }).eq('character_id', trade["target_id"]).eq('item_id', item["item_id"]).execute()
             
             # Add to initiator
-            cursor.execute('''
-                INSERT INTO inventory (character_id, item_id, quantity)
-                VALUES (?, ?, ?)
-                ON CONFLICT(character_id, item_id) DO UPDATE SET quantity = quantity + ?
-            ''', (trade["initiator_id"], item["item_id"], item["quantity"], item["quantity"]))
+            initiator_item = initiator_inv.get(item["item_id"])
+            if initiator_item:
+                client.table('inventory').update({
+                    'quantity': initiator_item["quantity"] + item["quantity"]
+                }).eq('character_id', trade["initiator_id"]).eq('item_id', item["item_id"]).execute()
+            else:
+                client.table('inventory').insert({
+                    'character_id': trade["initiator_id"],
+                    'item_id': item["item_id"],
+                    'quantity': item["quantity"]
+                }).execute()
         
         # Transfer gold
-        cursor.execute('''
-            UPDATE characters SET gold = gold - ? WHERE id = ?
-        ''', (initiator_gold, trade["initiator_id"]))
-        cursor.execute('''
-            UPDATE characters SET gold = gold + ? WHERE id = ?
-        ''', (initiator_gold, trade["target_id"]))
+        client.table('characters').update({
+            'gold': initiator_gold_current - initiator_gold
+        }).eq('id', trade["initiator_id"]).execute()
         
-        cursor.execute('''
-            UPDATE characters SET gold = gold - ? WHERE id = ?
-        ''', (target_gold, trade["target_id"]))
-        cursor.execute('''
-            UPDATE characters SET gold = gold + ? WHERE id = ?
-        ''', (target_gold, trade["initiator_id"]))
+        client.table('characters').update({
+            'gold': target_gold_current + initiator_gold
+        }).eq('id', trade["target_id"]).execute()
+        
+        client.table('characters').update({
+            'gold': target_gold_current - target_gold
+        }).eq('id', trade["target_id"]).execute()
+        
+        client.table('characters').update({
+            'gold': initiator_gold_current + target_gold
+        }).eq('id', trade["initiator_id"]).execute()
         
         # Complete trade
-        cursor.execute('''
-            UPDATE trades SET status = ?, completed_at = ? WHERE id = ?
-        ''', ("completed", datetime.datetime.now().isoformat(), trade_id))
-    
-    conn.commit()
-    conn.close()
+        client.table('trades').update({
+            'status': 'completed',
+            'completed_at': datetime.datetime.now().isoformat()
+        }).eq('id', trade_id).execute()
     
     return {"success": True}
 
 @app.post("/api/trade/{trade_id}/update")
 async def update_trade(trade_id: int, items: List[Dict], gold: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Get trade
-    cursor.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
-    trade = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not trade:
-        conn.close()
+    # Get trade
+    trade_result = client.table('trades').select('*').eq('id', trade_id).execute()
+    if not trade_result.data:
         raise HTTPException(status_code=404, detail="Trade not found")
+    
+    trade = trade_result.data[0]
     
     # Determine which side is updating
     if trade["initiator_id"] == character["id"]:
-        cursor.execute('''
-            UPDATE trades SET initiator_items = ?, initiator_gold = ? WHERE id = ?
-        ''', (json.dumps(items), gold, trade_id))
+        client.table('trades').update({
+            'initiator_items': json.dumps(items),
+            'initiator_gold': gold
+        }).eq('id', trade_id).execute()
     elif trade["target_id"] == character["id"]:
-        cursor.execute('''
-            UPDATE trades SET target_items = ?, target_gold = ? WHERE id = ?
-        ''', (json.dumps(items), gold, trade_id))
+        client.table('trades').update({
+            'target_items': json.dumps(items),
+            'target_gold': gold
+        }).eq('id', trade_id).execute()
     else:
-        conn.close()
         raise HTTPException(status_code=403, detail="Not part of this trade")
-    
-    conn.commit()
-    conn.close()
     
     return {"success": True}
 
@@ -2154,34 +1839,32 @@ async def update_trade(trade_id: int, items: List[Dict], gold: int, user=Depends
 
 @app.post("/api/pvp/challenge/{target_character_id}")
 async def challenge_pvp(target_character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get challenger character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    challenger = cursor.fetchone()
-    
-    if not challenger:
-        conn.close()
+    challenger_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not challenger_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Check if target exists
-    cursor.execute("SELECT user_id FROM characters WHERE id = ?", (target_character_id,))
-    target = cursor.fetchone()
+    challenger = challenger_result.data[0]
     
-    if not target:
-        conn.close()
+    # Check if target exists
+    target_result = client.table('characters').select('user_id').eq('id', target_character_id).execute()
+    if not target_result.data:
         raise HTTPException(status_code=404, detail="Target character not found")
     
-    # Create PvP match
-    cursor.execute('''
-        INSERT INTO pvp_matches (player1_id, player2_id, status, started_at)
-        VALUES (?, ?, ?, ?)
-    ''', (challenger["id"], target_character_id, "pending", datetime.datetime.now().isoformat()))
+    target = target_result.data[0]
     
-    match_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    # Create PvP match
+    match_data = {
+        'player1_id': challenger["id"],
+        'player2_id': target_character_id,
+        'status': 'pending',
+        'started_at': datetime.datetime.now().isoformat()
+    }
+    
+    match_result = client.table('pvp_matches').insert(match_data).execute()
+    match_id = match_result.data[0]["id"]
     
     # Notify target
     await manager.send_personal_message(target["user_id"], {
@@ -2194,39 +1877,31 @@ async def challenge_pvp(target_character_id: int, user=Depends(get_current_user)
 
 @app.post("/api/pvp/match/{match_id}/accept")
 async def accept_pvp(match_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT * FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('*').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Get match
-    cursor.execute("SELECT * FROM pvp_matches WHERE id = ?", (match_id,))
-    match = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not match:
-        conn.close()
+    # Get match
+    match_result = client.table('pvp_matches').select('*').eq('id', match_id).execute()
+    if not match_result.data:
         raise HTTPException(status_code=404, detail="Match not found")
     
+    match = match_result.data[0]
+    
     if match["status"] != "pending":
-        conn.close()
         raise HTTPException(status_code=400, detail="Match already processed")
     
     # Get both players
-    cursor.execute("SELECT * FROM characters WHERE id = ?", (match["player1_id"],))
-    player1_data = cursor.fetchone()
+    player1_result = client.table('characters').select('*').eq('id', match["player1_id"]).execute()
+    player2_result = client.table('characters').select('*').eq('id', match["player2_id"]).execute()
     
-    cursor.execute("SELECT * FROM characters WHERE id = ?", (match["player2_id"],))
-    player2_data = cursor.fetchone()
-    
-    if not player1_data or not player2_data:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Players not found")
+    player1_data = player1_result.data[0]
+    player2_data = player2_result.data[0]
     
     # Create player objects
     player1 = Player(
@@ -2279,46 +1954,51 @@ async def accept_pvp(match_id: int, user=Depends(get_current_user)):
     exp_reward = 100 + (loser.level * 20)
     
     # Update winner
-    cursor.execute('''
-        UPDATE characters
-        SET gold = gold + ?, exp = exp + ?, hp = ?
-        WHERE id = ?
-    ''', (gold_reward, exp_reward, winner.hp, winner.id))
+    client.table('characters').update({
+        'gold': client.rpc('increment', {'x': gold_reward}),
+        'exp': client.rpc('increment', {'x': exp_reward}),
+        'hp': winner.hp
+    }).eq('id', winner.id).execute()
     
     # Update loser
-    cursor.execute('''
-        UPDATE characters
-        SET hp = ?
-        WHERE id = ?
-    ''', (loser.hp, loser.id))
+    client.table('characters').update({
+        'hp': loser.hp
+    }).eq('id', loser.id).execute()
     
     # Update PvP stats
-    cursor.execute('''
-        INSERT INTO pvp_stats (character_id, wins, losses, rating)
-        VALUES (?, 1, 0, ?)
-        ON CONFLICT(character_id) DO UPDATE SET
-            wins = wins + 1,
-            rating = rating + 25
-    ''', (winner.id, 1025))
+    winner_stats = client.table('pvp_stats').select('*').eq('character_id', winner.id).execute()
+    if winner_stats.data:
+        client.table('pvp_stats').update({
+            'wins': winner_stats.data[0]["wins"] + 1,
+            'rating': winner_stats.data[0]["rating"] + 25
+        }).eq('character_id', winner.id).execute()
+    else:
+        client.table('pvp_stats').insert({
+            'character_id': winner.id,
+            'wins': 1,
+            'rating': 1025
+        }).execute()
     
-    cursor.execute('''
-        INSERT INTO pvp_stats (character_id, wins, losses, rating)
-        VALUES (?, 0, 1, ?)
-        ON CONFLICT(character_id) DO UPDATE SET
-            losses = losses + 1,
-            rating = rating - 15
-    ''', (loser.id, 985))
+    loser_stats = client.table('pvp_stats').select('*').eq('character_id', loser.id).execute()
+    if loser_stats.data:
+        client.table('pvp_stats').update({
+            'losses': loser_stats.data[0]["losses"] + 1,
+            'rating': max(0, loser_stats.data[0]["rating"] - 15)
+        }).eq('character_id', loser.id).execute()
+    else:
+        client.table('pvp_stats').insert({
+            'character_id': loser.id,
+            'losses': 1,
+            'rating': 985
+        }).execute()
     
     # Update match
-    cursor.execute('''
-        UPDATE pvp_matches
-        SET status = ?, winner_id = ?, ended_at = ?, match_data = ?
-        WHERE id = ?
-    ''', ("completed", winner.id, datetime.datetime.now().isoformat(), 
-          json.dumps({"combat_log": result["combat_log"]}), match_id))
-    
-    conn.commit()
-    conn.close()
+    client.table('pvp_matches').update({
+        'status': 'completed',
+        'winner_id': winner.id,
+        'ended_at': datetime.datetime.now().isoformat(),
+        'match_data': json.dumps({"combat_log": result["combat_log"]})
+    }).eq('id', match_id).execute()
     
     # Notify both players
     await manager.send_personal_message(player1.user_id, {
@@ -2357,91 +2037,74 @@ async def accept_pvp(match_id: int, user=Depends(get_current_user)):
 
 @app.post("/api/guilds")
 async def create_guild(guild: GuildCreate, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id, guild_id').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
+    character = char_result.data[0]
+    
     # Check if already in a guild
-    cursor.execute("SELECT guild_id FROM characters WHERE id = ?", (character["id"],))
-    char_guild = cursor.fetchone()
-    if char_guild and char_guild["guild_id"]:
-        conn.close()
+    if character.get("guild_id"):
         raise HTTPException(status_code=400, detail="Already in a guild")
     
     # Check if guild name exists
-    cursor.execute("SELECT * FROM guilds WHERE name = ?", (guild.name,))
-    if cursor.fetchone():
-        conn.close()
+    name_check = client.table('guilds').select('*').eq('name', guild.name).execute()
+    if name_check.data:
         raise HTTPException(status_code=400, detail="Guild name already exists")
     
     # Check if tag exists
-    cursor.execute("SELECT * FROM guilds WHERE tag = ?", (guild.tag,))
-    if cursor.fetchone():
-        conn.close()
+    tag_check = client.table('guilds').select('*').eq('tag', guild.tag).execute()
+    if tag_check.data:
         raise HTTPException(status_code=400, detail="Guild tag already exists")
     
     # Create guild
-    cursor.execute('''
-        INSERT INTO guilds (name, tag, leader_id, created_at)
-        VALUES (?, ?, ?, ?)
-    ''', (guild.name, guild.tag, character["id"], datetime.datetime.now().isoformat()))
+    guild_data = {
+        'name': guild.name,
+        'tag': guild.tag,
+        'leader_id': character["id"],
+        'created_at': datetime.datetime.now().isoformat()
+    }
     
-    guild_id = cursor.lastrowid
+    guild_result = client.table('guilds').insert(guild_data).execute()
+    guild_id = guild_result.data[0]["id"]
     
     # Add leader as member
-    cursor.execute('''
-        INSERT INTO guild_members (guild_id, character_id, rank, joined_at)
-        VALUES (?, ?, ?, ?)
-    ''', (guild_id, character["id"], "leader", datetime.datetime.now().isoformat()))
+    client.table('guild_members').insert({
+        'guild_id': guild_id,
+        'character_id': character["id"],
+        'rank': 'leader',
+        'joined_at': datetime.datetime.now().isoformat()
+    }).execute()
     
     # Update character guild
-    cursor.execute('''
-        UPDATE characters SET guild_id = ? WHERE id = ?
-    ''', (guild_id, character["id"]))
-    
-    conn.commit()
-    conn.close()
+    client.table('characters').update({'guild_id': guild_id}).eq('id', character["id"]).execute()
     
     return {"id": guild_id, "name": guild.name, "tag": guild.tag}
 
 @app.get("/api/guilds/my-guild")
 async def get_my_guild(user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id, guild_id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character or not character["guild_id"]:
-        conn.close()
+    char_result = client.table('characters').select('id, guild_id').eq('user_id', user["id"]).execute()
+    if not char_result.data or not char_result.data[0].get("guild_id"):
         return {"in_guild": False}
+    
+    character = char_result.data[0]
+    guild_id = character["guild_id"]
     
     # Get guild info
-    cursor.execute("SELECT * FROM guilds WHERE id = ?", (character["guild_id"],))
-    guild = cursor.fetchone()
-    
-    if not guild:
-        conn.close()
+    guild_result = client.table('guilds').select('*').eq('id', guild_id).execute()
+    if not guild_result.data:
         return {"in_guild": False}
     
-    # Get members
-    cursor.execute('''
-        SELECT gm.*, c.name, c.level
-        FROM guild_members gm
-        JOIN characters c ON gm.character_id = c.id
-        WHERE gm.guild_id = ?
-    ''', (character["guild_id"],))
-    members = cursor.fetchall()
+    guild = guild_result.data[0]
     
-    conn.close()
+    # Get members
+    members_result = client.table('guild_members').select('*, characters!inner(name, level)').eq('guild_id', guild_id).execute()
     
     return {
         "in_guild": True,
@@ -2453,48 +2116,40 @@ async def get_my_guild(user=Depends(get_current_user)):
         "leader_id": guild["leader_id"],
         "members": [{
             "character_id": m["character_id"],
-            "name": m["name"],
-            "level": m["level"],
+            "name": m["characters"]["name"],
+            "level": m["characters"]["level"],
             "rank": m["rank"],
             "joined_at": m["joined_at"]
-        } for m in members]
+        } for m in members_result.data]
     }
 
 @app.post("/api/guilds/{guild_id}/invite/{character_id}")
 async def invite_to_guild(guild_id: int, character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Check if in guild and has permission
-    cursor.execute("SELECT * FROM guild_members WHERE character_id = ? AND guild_id = ?", 
-                   (character["id"], guild_id))
-    membership = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not membership or membership["rank"] not in ["leader", "officer"]:
-        conn.close()
+    # Check if in guild and has permission
+    membership_result = client.table('guild_members').select('rank').eq('character_id', character["id"]).eq('guild_id', guild_id).execute()
+    
+    if not membership_result.data or membership_result.data[0]["rank"] not in ["leader", "officer"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     
     # Check if target exists
-    cursor.execute("SELECT user_id FROM characters WHERE id = ?", (character_id,))
-    target = cursor.fetchone()
-    
-    if not target:
-        conn.close()
+    target_result = client.table('characters').select('user_id').eq('id', character_id).execute()
+    if not target_result.data:
         raise HTTPException(status_code=404, detail="Target character not found")
     
+    target = target_result.data[0]
+    
     # Check if already in a guild
-    cursor.execute("SELECT guild_id FROM characters WHERE id = ?", (character_id,))
-    target_guild = cursor.fetchone()
-    if target_guild and target_guild["guild_id"]:
-        conn.close()
+    target_guild_result = client.table('characters').select('guild_id').eq('id', character_id).execute()
+    if target_guild_result.data and target_guild_result.data[0].get("guild_id"):
         raise HTTPException(status_code=400, detail="Target already in a guild")
     
     # Send invitation
@@ -2504,136 +2159,115 @@ async def invite_to_guild(guild_id: int, character_id: int, user=Depends(get_cur
         "inviter": character["id"]
     })
     
-    conn.close()
-    
     return {"success": True}
 
 # ==================== Auction Routes ====================
 
 @app.get("/api/auction/listings")
 async def get_auctions(user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        SELECT a.*, c.name as seller_name, i.item_id
-        FROM auctions a
-        JOIN characters c ON a.seller_id = c.id
-        JOIN inventory i ON a.item_instance_id = i.id
-        WHERE a.status = 'active'
-        ORDER BY a.created_at DESC
-    ''')
+    result = client.table('auctions').select('*, characters!seller_id(name), inventory!item_instance_id(item_id)').eq('status', 'active').order('created_at', desc=True).execute()
     
-    auctions = cursor.fetchall()
-    conn.close()
+    auctions = []
+    for a in result.data:
+        auctions.append({
+            "id": a["id"],
+            "seller_name": a["characters"]["name"],
+            "item_id": a["inventory"]["item_id"],
+            "starting_bid": a["starting_bid"],
+            "current_bid": a["current_bid"],
+            "buyout_price": a["buyout_price"],
+            "ends_at": a["ends_at"]
+        })
     
-    return [dict(a) for a in auctions]
+    return auctions
 
 @app.post("/api/auction/list")
 async def list_auction(inventory_id: int, starting_bid: int, buyout_price: Optional[int] = None, 
                        duration_hours: int = 24, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Get inventory item
-    cursor.execute('''
-        SELECT * FROM inventory
-        WHERE id = ? AND character_id = ?
-    ''', (inventory_id, character["id"]))
-    item = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not item:
-        conn.close()
+    # Get inventory item
+    item_result = client.table('inventory').select('*').eq('id', inventory_id).eq('character_id', character["id"]).execute()
+    if not item_result.data:
         raise HTTPException(status_code=404, detail="Item not found")
+    
+    item = item_result.data[0]
     
     # Calculate end time
     ends_at = (datetime.datetime.now() + datetime.timedelta(hours=duration_hours)).isoformat()
     
     # Create auction
-    cursor.execute('''
-        INSERT INTO auctions (seller_id, item_instance_id, starting_bid, buyout_price, ends_at)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (character["id"], inventory_id, starting_bid, buyout_price, ends_at))
+    auction_data = {
+        'seller_id': character["id"],
+        'item_instance_id': inventory_id,
+        'starting_bid': starting_bid,
+        'buyout_price': buyout_price,
+        'ends_at': ends_at
+    }
+    
+    client.table('auctions').insert(auction_data).execute()
     
     # Remove item from inventory
-    cursor.execute('''
-        DELETE FROM inventory WHERE id = ?
-    ''', (inventory_id,))
-    
-    conn.commit()
-    conn.close()
+    client.table('inventory').delete().eq('id', inventory_id).execute()
     
     return {"success": True}
 
 @app.post("/api/auction/{auction_id}/bid")
 async def place_bid(auction_id: int, bid_amount: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Get character
-    cursor.execute("SELECT id, gold FROM characters WHERE user_id = ?", (user["id"],))
-    character = cursor.fetchone()
-    
-    if not character:
-        conn.close()
+    char_result = client.table('characters').select('id, gold').eq('user_id', user["id"]).execute()
+    if not char_result.data:
         raise HTTPException(status_code=404, detail="Character not found")
     
-    # Get auction
-    cursor.execute("SELECT * FROM auctions WHERE id = ? AND status = 'active'", (auction_id,))
-    auction = cursor.fetchone()
+    character = char_result.data[0]
     
-    if not auction:
-        conn.close()
+    # Get auction
+    auction_result = client.table('auctions').select('*').eq('id', auction_id).eq('status', 'active').execute()
+    if not auction_result.data:
         raise HTTPException(status_code=404, detail="Auction not found")
+    
+    auction = auction_result.data[0]
     
     # Check if seller
     if auction["seller_id"] == character["id"]:
-        conn.close()
         raise HTTPException(status_code=400, detail="Cannot bid on your own auction")
     
     # Check bid amount
     min_bid = auction["current_bid"] or auction["starting_bid"]
     if bid_amount <= min_bid:
-        conn.close()
         raise HTTPException(status_code=400, detail=f"Bid must be greater than {min_bid}")
     
     # Check gold
     if character["gold"] < bid_amount:
-        conn.close()
         raise HTTPException(status_code=400, detail="Not enough gold")
     
     # If there was a previous bidder, refund them
     if auction["current_bidder_id"]:
-        cursor.execute('''
-            UPDATE characters
-            SET gold = gold + ?
-            WHERE id = ?
-        ''', (auction["current_bid"], auction["current_bidder_id"]))
+        client.table('characters').update({
+            'gold': client.rpc('increment', {'x': auction["current_bid"]})
+        }).eq('id', auction["current_bidder_id"]).execute()
     
     # Place bid
-    cursor.execute('''
-        UPDATE auctions
-        SET current_bid = ?, current_bidder_id = ?
-        WHERE id = ?
-    ''', (bid_amount, character["id"], auction_id))
+    client.table('auctions').update({
+        'current_bid': bid_amount,
+        'current_bidder_id': character["id"]
+    }).eq('id', auction_id).execute()
     
     # Deduct gold from bidder
-    cursor.execute('''
-        UPDATE characters
-        SET gold = gold - ?
-        WHERE id = ?
-    ''', (bid_amount, character["id"]))
-    
-    conn.commit()
-    conn.close()
+    client.table('characters').update({
+        'gold': character["gold"] - bid_amount
+    }).eq('id', character["id"]).execute()
     
     return {"success": True}
 
@@ -2641,55 +2275,33 @@ async def place_bid(auction_id: int, bid_amount: int, user=Depends(get_current_u
 
 @app.get("/api/leaderboard/level")
 async def level_leaderboard(limit: int = 10):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        SELECT name, class_name, level, exp
-        FROM characters
-        ORDER BY level DESC, exp DESC
-        LIMIT ?
-    ''', (limit,))
+    result = client.table('characters').select('name, class_name, level, exp').order('level', desc=True).order('exp', desc=True).limit(limit).execute()
     
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [dict(r) for r in rows]
+    return result.data
 
 @app.get("/api/leaderboard/gold")
 async def gold_leaderboard(limit: int = 10):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        SELECT name, class_name, gold
-        FROM characters
-        ORDER BY gold DESC
-        LIMIT ?
-    ''', (limit,))
+    result = client.table('characters').select('name, class_name, gold').order('gold', desc=True).limit(limit).execute()
     
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [dict(r) for r in rows]
+    return result.data
 
 @app.get("/api/leaderboard/pvp")
 async def pvp_leaderboard(limit: int = 10):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        SELECT c.name, c.class_name, ps.wins, ps.losses, ps.rating
-        FROM pvp_stats ps
-        JOIN characters c ON ps.character_id = c.id
-        ORDER BY ps.rating DESC
-        LIMIT ?
-    ''', (limit,))
+    result = client.table('pvp_stats').select('*, characters!inner(name, class_name)').order('rating', desc=True).limit(limit).execute()
     
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [dict(r) for r in rows]
+    return [{
+        "name": r["characters"]["name"],
+        "class_name": r["characters"]["class_name"],
+        "wins": r["wins"],
+        "losses": r["losses"],
+        "rating": r["rating"]
+    } for r in result.data]
 
 # ==================== Quest Routes ====================
 
@@ -2708,40 +2320,25 @@ async def start_quest_route(character_id: int, quest_id: str, user=Depends(get_c
 
 @app.get("/api/characters/{character_id}/quests")
 async def get_character_quests(character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor.execute('''
-        SELECT * FROM quests
-        WHERE character_id = ?
-        ORDER BY 
-            CASE status
-                WHEN 'in_progress' THEN 1
-                WHEN 'not_started' THEN 2
-                WHEN 'completed' THEN 3
-            END,
-            started_at DESC
-    ''', (character_id,))
+    client = get_supabase_client()
     
-    quests = cursor.fetchall()
-    conn.close()
+    result = client.table('quests').select('*').eq('character_id', character_id).order('started_at', desc=True).execute()
     
-    return [dict(q) for q in quests]
+    return result.data
 
 # ==================== Story Routes ====================
 
 @app.post("/api/characters/{character_id}/story/choice")
 async def make_story_choice(character_id: int, quest_id: str, choice_id: str, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Verify ownership
-    cursor.execute("SELECT id FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
+    char_check = client.table('characters').select('id').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_check.data:
         raise HTTPException(status_code=403, detail="Not your character")
     
     quest = QUESTS.get(quest_id)
     if not quest:
-        conn.close()
         raise HTTPException(status_code=404, detail="Quest not found")
     
     choice = None
@@ -2751,12 +2348,11 @@ async def make_story_choice(character_id: int, quest_id: str, choice_id: str, us
             break
     
     if not choice:
-        conn.close()
         raise HTTPException(status_code=404, detail="Choice not found")
     
     # Get or create story progression
-    cursor.execute("SELECT * FROM story_progression WHERE character_id = ?", (character_id,))
-    story = cursor.fetchone()
+    story_result = client.table('story_progression').select('*').eq('character_id', character_id).execute()
+    story = story_result.data[0] if story_result.data else None
     
     if story:
         choices_made = json.loads(story["choices_made"] or "[]")
@@ -2772,11 +2368,10 @@ async def make_story_choice(character_id: int, quest_id: str, choice_id: str, us
         for key, value in choice.get("reputation", {}).items():
             reputation[key] = reputation.get(key, 0) + value
         
-        cursor.execute('''
-            UPDATE story_progression
-            SET choices_made = ?, reputation = ?
-            WHERE character_id = ?
-        ''', (json.dumps(choices_made), json.dumps(reputation), character_id))
+        client.table('story_progression').update({
+            'choices_made': json.dumps(choices_made),
+            'reputation': json.dumps(reputation)
+        }).eq('character_id', character_id).execute()
     else:
         choices_made = [{
             "quest_id": quest_id,
@@ -2786,43 +2381,38 @@ async def make_story_choice(character_id: int, quest_id: str, choice_id: str, us
         }]
         reputation = choice.get("reputation", {})
         
-        cursor.execute('''
-            INSERT INTO story_progression (character_id, choices_made, reputation)
-            VALUES (?, ?, ?)
-        ''', (character_id, json.dumps(choices_made), json.dumps(reputation)))
+        client.table('story_progression').insert({
+            'character_id': character_id,
+            'choices_made': json.dumps(choices_made),
+            'reputation': json.dumps(reputation)
+        }).execute()
     
     # If this is the final quest, handle ending
     if quest.get("is_final"):
         ending = choice.get("ending", "The adventure continues...")
-        cursor.execute('''
-            UPDATE story_progression
-            SET current_act = 6, completed_acts = ?
-            WHERE character_id = ?
-        ''', (json.dumps(list(range(1, 6))), character_id))
+        client.table('story_progression').update({
+            'current_act': 6,
+            'completed_acts': json.dumps(list(range(1, 6)))
+        }).eq('character_id', character_id).execute()
         
         # Grant bonus rewards based on ending
         if choice_id == "ending_hero":
-            cursor.execute('''
-                UPDATE characters
-                SET gold = gold + 5000, exp = exp + 5000
-                WHERE id = ?
-            ''', (character_id,))
+            client.table('characters').update({
+                'gold': client.rpc('increment', {'x': 5000}),
+                'exp': client.rpc('increment', {'x': 5000})
+            }).eq('id', character_id).execute()
         elif choice_id == "ending_dark":
-            cursor.execute('''
-                UPDATE characters
-                SET gold = gold + 10000, strength = strength + 50
-                WHERE id = ?
-            ''', (character_id,))
+            client.table('characters').update({
+                'gold': client.rpc('increment', {'x': 10000}),
+                'strength': client.rpc('increment', {'x': 50})
+            }).eq('id', character_id).execute()
         elif choice_id == "ending_balance":
-            cursor.execute('''
-                UPDATE characters
-                SET gold = gold + 3000, exp = exp + 3000,
-                    intelligence = intelligence + 30, vitality = vitality + 30
-                WHERE id = ?
-            ''', (character_id,))
-    
-    conn.commit()
-    conn.close()
+            client.table('characters').update({
+                'gold': client.rpc('increment', {'x': 3000}),
+                'exp': client.rpc('increment', {'x': 3000}),
+                'intelligence': client.rpc('increment', {'x': 30}),
+                'vitality': client.rpc('increment', {'x': 30})
+            }).eq('id', character_id).execute()
     
     return {
         "success": True,
@@ -2832,40 +2422,22 @@ async def make_story_choice(character_id: int, quest_id: str, choice_id: str, us
 
 @app.get("/api/characters/{character_id}/story")
 async def get_story_progress(character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Verify ownership
-    cursor.execute("SELECT id FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
+    char_check = client.table('characters').select('id').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_check.data:
         raise HTTPException(status_code=403, detail="Not your character")
     
-    cursor.execute("SELECT * FROM story_progression WHERE character_id = ?", (character_id,))
-    story = cursor.fetchone()
+    story_result = client.table('story_progression').select('*').eq('character_id', character_id).execute()
     
-    # Get active quests
-    cursor.execute('''
-        SELECT q.*, qu.title, qu.act, qu.chapter
-        FROM quests q
-        JOIN json_each(?) as quest_data ON q.quest_id = quest_data.key
-        LEFT JOIN json_each(?) as quests ON 1=1
-    ''', (json.dumps(QUESTS), json.dumps([])))
-    
-    # Simplified - just get quests from DB
-    cursor.execute('''
-        SELECT q.*, ? as title, ? as act, ? as chapter
-        FROM quests q
-    ''', ("", 0, 0))
-    
-    active_quests = cursor.fetchall()
-    
-    conn.close()
+    # Get quests
+    quests_result = client.table('quests').select('*').eq('character_id', character_id).execute()
     
     return {
-        "story": dict(story) if story else None,
-        "active_quests": [dict(q) for q in active_quests if q["status"] == "in_progress"],
-        "completed_quests": [dict(q) for q in active_quests if q["status"] == "completed"]
+        "story": story_result.data[0] if story_result.data else None,
+        "active_quests": [q for q in quests_result.data if q["status"] == "in_progress"],
+        "completed_quests": [q for q in quests_result.data if q["status"] == "completed"]
     }
 
 # ==================== Codex Routes ====================
@@ -2876,45 +2448,36 @@ async def get_codex():
 
 @app.post("/api/characters/{character_id}/codex/{entry_id}")
 async def discover_codex(character_id: int, entry_id: str, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Verify ownership
-    cursor.execute("SELECT id FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
+    char_check = client.table('characters').select('id').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_check.data:
         raise HTTPException(status_code=403, detail="Not your character")
     
     if entry_id not in CODEX:
-        conn.close()
         raise HTTPException(status_code=404, detail="Codex entry not found")
     
-    cursor.execute('''
-        INSERT OR IGNORE INTO codex (character_id, entry_id, discovered_at)
-        VALUES (?, ?, ?)
-    ''', (character_id, entry_id, datetime.datetime.now().isoformat()))
-    
-    conn.commit()
-    conn.close()
+    client.table('codex').insert({
+        'character_id': character_id,
+        'entry_id': entry_id,
+        'discovered_at': datetime.datetime.now().isoformat()
+    }).execute()
     
     return {"success": True}
 
 @app.get("/api/characters/{character_id}/codex")
 async def get_character_codex(character_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Verify ownership
-    cursor.execute("SELECT id FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
+    char_check = client.table('characters').select('id').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_check.data:
         raise HTTPException(status_code=403, detail="Not your character")
     
-    cursor.execute("SELECT * FROM codex WHERE character_id = ?", (character_id,))
-    entries = cursor.fetchall()
-    conn.close()
+    entries_result = client.table('codex').select('*').eq('character_id', character_id).execute()
     
-    discovered = {e["entry_id"]: dict(e) for e in entries}
+    discovered = {e["entry_id"]: e for e in entries_result.data}
     
     return {
         "discovered": discovered,
@@ -2929,43 +2492,34 @@ async def get_companions():
 
 @app.post("/api/characters/{character_id}/companions/{companion_id}/recruit")
 async def recruit_companion(character_id: int, companion_id: str, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     # Verify ownership
-    cursor.execute("SELECT id FROM characters WHERE id = ? AND user_id = ?", (character_id, user["id"]))
-    if not cursor.fetchone():
-        conn.close()
+    char_check = client.table('characters').select('id').eq('id', character_id).eq('user_id', user["id"]).execute()
+    if not char_check.data:
         raise HTTPException(status_code=403, detail="Not your character")
     
     if companion_id not in COMPANIONS:
-        conn.close()
         raise HTTPException(status_code=404, detail="Companion not found")
     
     # Get story progression
-    cursor.execute("SELECT companions FROM story_progression WHERE character_id = ?", (character_id,))
-    story = cursor.fetchone()
+    story_result = client.table('story_progression').select('companions').eq('character_id', character_id).execute()
+    story = story_result.data[0] if story_result.data else None
     
     if story:
         companions = json.loads(story["companions"] or "[]")
         if companion_id in companions:
-            conn.close()
             raise HTTPException(status_code=400, detail="Companion already recruited")
         
         companions.append(companion_id)
-        cursor.execute('''
-            UPDATE story_progression
-            SET companions = ?
-            WHERE character_id = ?
-        ''', (json.dumps(companions), character_id))
+        client.table('story_progression').update({
+            'companions': json.dumps(companions)
+        }).eq('character_id', character_id).execute()
     else:
-        cursor.execute('''
-            INSERT INTO story_progression (character_id, companions)
-            VALUES (?, ?)
-        ''', (character_id, json.dumps([companion_id])))
-    
-    conn.commit()
-    conn.close()
+        client.table('story_progression').insert({
+            'character_id': character_id,
+            'companions': json.dumps([companion_id])
+        }).execute()
     
     return {"success": True, "companion": COMPANIONS[companion_id]}
 
@@ -2973,97 +2527,74 @@ async def recruit_companion(character_id: int, companion_id: str, user=Depends(g
 
 @app.post("/api/characters/{character_id}/inventory/use/{inventory_id}")
 async def use_item(character_id: int, inventory_id: int, user=Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    # Verify ownership
-    cursor.execute('''
-        SELECT i.*, c.hp, c.max_hp, c.mana, c.max_mana
-        FROM inventory i
-        JOIN characters c ON i.character_id = c.id
-        WHERE i.id = ? AND c.user_id = ?
-    ''', (inventory_id, user["id"]))
+    # Get item
+    item_result = client.table('inventory').select('*, characters!inner(hp, max_hp, mana, max_mana)').eq('id', inventory_id).eq('characters.user_id', user["id"]).execute()
     
-    item = cursor.fetchone()
-    
-    if not item:
-        conn.close()
+    if not item_result.data:
         raise HTTPException(status_code=404, detail="Item not found")
     
+    item = item_result.data[0]
     item_data = ITEMS.get(item["item_id"])
+    
     if not item_data:
-        conn.close()
         raise HTTPException(status_code=404, detail="Item data not found")
     
     effect = item_data.get("effect", {})
     
     # Apply effects
     if "heal" in effect:
-        new_hp = min(item["max_hp"], item["hp"] + effect["heal"])
-        cursor.execute('''
-            UPDATE characters SET hp = ? WHERE id = ?
-        ''', (new_hp, character_id))
+        new_hp = min(item["characters"]["max_hp"], item["characters"]["hp"] + effect["heal"])
+        client.table('characters').update({'hp': new_hp}).eq('id', character_id).execute()
     
     if "restore_mana" in effect:
-        new_mana = min(item["max_mana"], item["mana"] + effect["restore_mana"])
-        cursor.execute('''
-            UPDATE characters SET mana = ? WHERE id = ?
-        ''', (new_mana, character_id))
+        new_mana = min(item["characters"]["max_mana"], item["characters"]["mana"] + effect["restore_mana"])
+        client.table('characters').update({'mana': new_mana}).eq('id', character_id).execute()
     
     # Remove used item
     if item["quantity"] > 1:
-        cursor.execute('''
-            UPDATE inventory SET quantity = quantity - 1 WHERE id = ?
-        ''', (inventory_id,))
+        client.table('inventory').update({'quantity': item["quantity"] - 1}).eq('id', inventory_id).execute()
     else:
-        cursor.execute('''
-            DELETE FROM inventory WHERE id = ?
-        ''', (inventory_id,))
-    
-    conn.commit()
-    conn.close()
+        client.table('inventory').delete().eq('id', inventory_id).execute()
     
     return {"success": True, "effect": effect}
 
 # ==================== Owner/Admin Routes ====================
 
 @app.post("/api/admin/cheat")
-async def cheat_command(
-    command: CheatCommand,
-    user = Depends(require_owner)
-):
+async def cheat_command(command: CheatCommand, user = Depends(require_owner)):
     """Owner-only cheat commands"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     try:
         target_char = None
         
         if command.target:
             # Find target by name
-            cursor.execute("SELECT * FROM characters WHERE name = ?", (command.target,))
-            target_char = cursor.fetchone()
-            
-            if not target_char:
-                cursor.execute("SELECT * FROM users WHERE username = ?", (command.target,))
-                target_user = cursor.fetchone()
-                if target_user:
-                    cursor.execute("SELECT * FROM characters WHERE user_id = ?", (target_user["id"],))
-                    target_char = cursor.fetchone()
+            char_result = client.table('characters').select('*').eq('name', command.target).execute()
+            if char_result.data:
+                target_char = char_result.data[0]
+            else:
+                user_result = client.table('users').select('*').eq('username', command.target).execute()
+                if user_result.data:
+                    char_result = client.table('characters').select('*').eq('user_id', user_result.data[0]["id"]).execute()
+                    if char_result.data:
+                        target_char = char_result.data[0]
         else:
             # Use current user's character
-            cursor.execute("SELECT * FROM characters WHERE user_id = ?", (user["id"],))
-            target_char = cursor.fetchone()
+            char_result = client.table('characters').select('*').eq('user_id', user["id"]).execute()
+            if char_result.data:
+                target_char = char_result.data[0]
         
         if not target_char:
-            conn.close()
             return {"success": False, "message": "Target character not found"}
         
         if command.command == "give_gold":
             amount = command.amount or 1000
-            cursor.execute('''
-                UPDATE characters SET gold = gold + ? WHERE id = ?
-            ''', (amount, target_char["id"]))
+            client.table('characters').update({
+                'gold': client.rpc('increment', {'x': amount})
+            }).eq('id', target_char["id"]).execute()
             
             await manager.send_personal_message(target_char["user_id"], {
                 "type": "cheat",
@@ -3074,9 +2605,10 @@ async def cheat_command(
         
         elif command.command == "set_level":
             amount = command.amount or 100
-            cursor.execute('''
-                UPDATE characters SET level = ?, exp = 0 WHERE id = ?
-            ''', (amount, target_char["id"]))
+            client.table('characters').update({
+                'level': amount,
+                'exp': 0
+            }).eq('id', target_char["id"]).execute()
             
             await manager.send_personal_message(target_char["user_id"], {
                 "type": "cheat",
@@ -3087,10 +2619,11 @@ async def cheat_command(
         
         elif command.command == "spawn_item":
             if command.item_id and command.item_id in ITEMS:
-                cursor.execute('''
-                    INSERT INTO inventory (character_id, item_id, quantity)
-                    VALUES (?, ?, ?)
-                ''', (target_char["id"], command.item_id, command.amount or 1))
+                client.table('inventory').insert({
+                    'character_id': target_char["id"],
+                    'item_id': command.item_id,
+                    'quantity': command.amount or 1
+                }).execute()
                 
                 await manager.send_personal_message(target_char["user_id"], {
                     "type": "cheat",
@@ -3099,16 +2632,19 @@ async def cheat_command(
                 
                 message = f"Spawned {ITEMS[command.item_id]['name']} for {target_char['name']}"
             else:
-                conn.close()
                 return {"success": False, "message": "Invalid item ID"}
         
         elif command.command == "god_mode":
-            cursor.execute('''
-                UPDATE characters
-                SET hp = 99999, max_hp = 99999, mana = 99999, max_mana = 99999,
-                    strength = 9999, agility = 9999, intelligence = 9999, vitality = 9999
-                WHERE id = ?
-            ''', (target_char["id"],))
+            client.table('characters').update({
+                'hp': 99999,
+                'max_hp': 99999,
+                'mana': 99999,
+                'max_mana': 99999,
+                'strength': 9999,
+                'agility': 9999,
+                'intelligence': 9999,
+                'vitality': 9999
+            }).eq('id', target_char["id"]).execute()
             
             await manager.send_personal_message(target_char["user_id"], {
                 "type": "cheat",
@@ -3118,9 +2654,9 @@ async def cheat_command(
             message = f"God mode activated for {target_char['name']}"
         
         elif command.command == "kill":
-            cursor.execute('''
-                UPDATE characters SET hp = 0 WHERE id = ?
-            ''', (target_char["id"],))
+            client.table('characters').update({
+                'hp': 0
+            }).eq('id', target_char["id"]).execute()
             
             await manager.send_personal_message(target_char["user_id"], {
                 "type": "cheat",
@@ -3130,9 +2666,10 @@ async def cheat_command(
             message = f"Killed {target_char['name']}"
         
         elif command.command == "heal":
-            cursor.execute('''
-                UPDATE characters SET hp = max_hp, mana = max_mana WHERE id = ?
-            ''', (target_char["id"],))
+            client.table('characters').update({
+                'hp': client.column('max_hp'),
+                'mana': client.column('max_mana')
+            }).eq('id', target_char["id"]).execute()
             
             await manager.send_personal_message(target_char["user_id"], {
                 "type": "cheat",
@@ -3142,34 +2679,25 @@ async def cheat_command(
             message = f"Healed {target_char['name']}"
         
         elif command.command == "complete_quests":
-            cursor.execute('''
-                UPDATE quests SET status = 'completed', completed_at = ?
-                WHERE character_id = ? AND status = 'in_progress'
-            ''', (datetime.datetime.now().isoformat(), target_char["id"]))
+            client.table('quests').update({
+                'status': 'completed',
+                'completed_at': datetime.datetime.now().isoformat()
+            }).eq('character_id', target_char["id"]).eq('status', 'in_progress').execute()
             
             message = f"Completed all quests for {target_char['name']}"
         
         else:
-            conn.close()
             return {"success": False, "message": "Invalid command"}
-        
-        conn.commit()
-        conn.close()
         
         return {"success": True, "message": message}
         
     except Exception as e:
-        conn.close()
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/mod/action")
-async def mod_action(
-    action: ModAction,
-    user = Depends(require_mod)
-):
+async def mod_action(action: ModAction, user = Depends(require_mod)):
     """Moderator actions"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
     try:
         target = action.target_user_id
@@ -3185,10 +2713,13 @@ async def mod_action(
                 manager.disconnect(target)
             
             # Log action
-            cursor.execute('''
-                INSERT INTO mod_logs (moderator_id, target_id, action, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user["id"], target, "kick", action.reason, datetime.datetime.now().isoformat()))
+            client.table('mod_logs').insert({
+                'moderator_id': user["id"],
+                'target_id': target,
+                'action': 'kick',
+                'reason': action.reason,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
             
             message = f"Kicked user {target}"
         
@@ -3199,23 +2730,28 @@ async def mod_action(
                 await manager.active_connections[target].close()
                 manager.disconnect(target)
             
-            cursor.execute('''
-                UPDATE users SET banned = 1, ban_reason = ? WHERE id = ?
-            ''', (action.reason, target))
+            client.table('users').update({
+                'banned': True,
+                'ban_reason': action.reason
+            }).eq('id', target).execute()
             
-            cursor.execute('''
-                INSERT INTO mod_logs (moderator_id, target_id, action, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user["id"], target, "ban", action.reason, datetime.datetime.now().isoformat()))
+            client.table('mod_logs').insert({
+                'moderator_id': user["id"],
+                'target_id': target,
+                'action': 'ban',
+                'reason': action.reason,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
             
             message = f"Banned user {target}"
         
         elif action.action == "unban":
             manager.banned_users.discard(target)
             
-            cursor.execute('''
-                UPDATE users SET banned = 0, ban_reason = NULL WHERE id = ?
-            ''', (target,))
+            client.table('users').update({
+                'banned': False,
+                'ban_reason': None
+            }).eq('id', target).execute()
             
             message = f"Unbanned user {target}"
         
@@ -3229,10 +2765,14 @@ async def mod_action(
                 "message": f"You have been muted for {duration} minutes. Reason: {action.reason}"
             })
             
-            cursor.execute('''
-                INSERT INTO mod_logs (moderator_id, target_id, action, reason, duration, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user["id"], target, "mute", action.reason, duration, datetime.datetime.now().isoformat()))
+            client.table('mod_logs').insert({
+                'moderator_id': user["id"],
+                'target_id': target,
+                'action': 'mute',
+                'reason': action.reason,
+                'duration': duration,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
             
             message = f"Muted user {target} for {duration} minutes"
         
@@ -3248,10 +2788,12 @@ async def mod_action(
             message = f"Unmuted user {target}"
         
         elif action.action == "warn":
-            cursor.execute('''
-                INSERT INTO user_warnings (user_id, moderator_id, reason, created_at)
-                VALUES (?, ?, ?, ?)
-            ''', (target, user["id"], action.reason, datetime.datetime.now().isoformat()))
+            client.table('user_warnings').insert({
+                'user_id': target,
+                'moderator_id': user["id"],
+                'reason': action.reason,
+                'created_at': datetime.datetime.now().isoformat()
+            }).execute()
             
             await manager.send_personal_message(target, {
                 "type": "system",
@@ -3259,31 +2801,21 @@ async def mod_action(
             })
             
             # Get warning count
-            cursor.execute('''
-                SELECT COUNT(*) as count FROM user_warnings WHERE user_id = ?
-            ''', (target,))
-            count = cursor.fetchone()["count"]
+            warnings_result = client.table('user_warnings').select('count', count='exact').eq('user_id', target).execute()
+            count = warnings_result.count if hasattr(warnings_result, 'count') else len(warnings_result.data)
             
             message = f"Warned user {target} (Warning #{count})"
         
         else:
-            conn.close()
             return {"success": False, "message": "Invalid action"}
-        
-        conn.commit()
-        conn.close()
         
         return {"success": True, "message": message}
         
     except Exception as e:
-        conn.close()
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/admin/event")
-async def create_game_event(
-    event: GameEvent,
-    user = Depends(require_admin)
-):
+async def create_game_event(event: GameEvent, user = Depends(require_admin)):
     """Create global game events"""
     
     if event.event_type == "spawn_boss":
@@ -3316,24 +2848,23 @@ async def create_game_event(
         gold_amount = reward_data.get("gold", 0)
         item_id = reward_data.get("item_id")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
         for user_id in manager.rooms["global"]:
-            cursor.execute("SELECT id FROM characters WHERE user_id = ?", (user_id,))
-            char = cursor.fetchone()
+            char_result = client.table('characters').select('id').eq('user_id', user_id).execute()
             
-            if char:
+            if char_result.data:
+                char_id = char_result.data[0]["id"]
+                
                 if gold_amount > 0:
-                    cursor.execute('''
-                        UPDATE characters SET gold = gold + ? WHERE id = ?
-                    ''', (gold_amount, char["id"]))
+                    client.table('characters').update({
+                        'gold': client.rpc('increment', {'x': gold_amount})
+                    }).eq('id', char_id).execute()
                 
                 if item_id:
-                    cursor.execute('''
-                        INSERT INTO inventory (character_id, item_id, quantity)
-                        VALUES (?, ?, 1)
-                    ''', (char["id"], item_id))
+                    client.table('inventory').insert({
+                        'character_id': char_id,
+                        'item_id': item_id,
+                        'quantity': 1
+                    }).execute()
                 
                 await manager.send_personal_message(user_id, {
                     "type": "reward",
@@ -3341,9 +2872,6 @@ async def create_game_event(
                     "item": item_id,
                     "message": f"You received {gold_amount} gold" + (f" and {item_id}" if item_id else "")
                 })
-        
-        conn.commit()
-        conn.close()
         
         return {"success": True, "message": "Rewards distributed"}
     
@@ -3366,11 +2894,9 @@ async def get_online_players(user = Depends(require_mod)):
     for user_id in manager.rooms["global"]:
         role = manager.user_roles.get(user_id, "player")
         
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, level FROM characters WHERE user_id = ?", (user_id,))
-        char = cursor.fetchone()
-        conn.close()
+        client = get_supabase_client()
+        char_result = client.table('characters').select('name, level').eq('user_id', user_id).execute()
+        char = char_result.data[0] if char_result.data else None
         
         char_name = char["name"] if char else "Unknown"
         char_level = char["level"] if char else 0
@@ -3391,28 +2917,15 @@ async def get_online_players(user = Depends(require_mod)):
     }
 
 @app.post("/api/admin/promote")
-async def promote_user(
-    target_user_id: int,
-    new_role: str,
-    user = Depends(require_owner)
-):
+async def promote_user(target_user_id: int, new_role: str, user = Depends(require_owner)):
     """Promote user to moderator/admin"""
     if new_role not in ["moderator", "admin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    client = get_supabase_client()
     
-    cursor.execute('''
-        UPDATE users SET role = ? WHERE id = ?
-    ''', (new_role, target_user_id))
-    
-    cursor.execute('''
-        UPDATE characters SET role = ? WHERE user_id = ?
-    ''', (new_role, target_user_id))
-    
-    conn.commit()
-    conn.close()
+    client.table('users').update({'role': new_role}).eq('id', target_user_id).execute()
+    client.table('characters').update({'role': new_role}).eq('user_id', target_user_id).execute()
     
     # Update connection manager
     if target_user_id in manager.user_roles:
@@ -3445,13 +2958,10 @@ async def websocket_endpoint(websocket: WebSocket):
         is_owner = payload.get("is_owner", False)
         
         # Check if banned
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT banned FROM users WHERE id = ?", (user_id,))
-        user = cursor.fetchone()
-        conn.close()
+        client = get_supabase_client()
+        user_result = client.table('users').select('banned').eq('id', user_id).execute()
         
-        if user and user["banned"]:
+        if user_result.data and user_result.data[0].get("banned"):
             await websocket.close(code=1008)
             return
         
@@ -3495,14 +3005,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 x = data.get("x")
                 y = data.get("y")
                 
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE characters SET x_position = ?, y_position = ?
-                    WHERE id = ? AND user_id = ?
-                ''', (x, y, character_id, user_id))
-                conn.commit()
-                conn.close()
+                client = get_supabase_client()
+                client.table('characters').update({
+                    'x_position': x,
+                    'y_position': y
+                }).eq('id', character_id).eq('user_id', user_id).execute()
                 
                 await manager.broadcast_to_room("global", {
                     "type": "movement",
@@ -3519,34 +3026,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     "user_id": user_id,
                     "emote": emote
                 }, exclude_user=user_id)
-            
-            elif msg_type == "trade_update" and activeTrade:
-                # Handle trade update via WebSocket
-                trade_id = data.get("trade_id")
-                gold = data.get("gold", 0)
-                items = data.get("items", [])
-                
-                # Update in database
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                
-                cursor.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
-                trade = cursor.fetchone()
-                
-                if trade:
-                    if trade["initiator_id"] == manager.character_ids.get(user_id):
-                        cursor.execute('''
-                            UPDATE trades SET initiator_items = ?, initiator_gold = ?
-                            WHERE id = ?
-                        ''', (json.dumps(items), gold, trade_id))
-                    elif trade["target_id"] == manager.character_ids.get(user_id):
-                        cursor.execute('''
-                            UPDATE trades SET target_items = ?, target_gold = ?
-                            WHERE id = ?
-                        ''', (json.dumps(items), gold, trade_id))
-                
-                conn.commit()
-                conn.close()
     
     except WebSocketDisconnect:
         manager.disconnect(user_id)
@@ -3568,9 +3047,8 @@ async def health_check():
     # Check database connection
     db_status = "healthy"
     try:
-        conn = get_db_connection()
-        conn.execute("SELECT 1").fetchone()
-        conn.close()
+        client = get_supabase_client()
+        client.table('users').select('count', count='exact').limit(1).execute()
     except:
         db_status = "unhealthy"
     
@@ -3585,7 +3063,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-
-
-
-
