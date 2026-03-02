@@ -15,8 +15,8 @@ app = Flask(__name__)
 CORS(app)
 
 # Load from environment variables on Render
-DISCORD_TOKEN = os.environ.get('R6X_DISCORD_TOKEN', '')
-API_KEY = os.environ.get('R6X_API_KEY', 'your-secret-api-key-here')
+DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN', '')
+API_KEY = os.environ.get('API_KEY', 'your-secret-api-key-here')
 RATE_LIMIT = {}  # Simple rate limiting
 
 def require_api_key(f):
@@ -91,3 +91,4 @@ def status():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
