@@ -1,35 +1,19 @@
 services:
   - type: web
-    name: pixel-rpg-backend
+    name: r6xinspector-backend
     runtime: python
     repo: https://github.com/xotiic4201/bot-hosting-b
     plan: free
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: gunicorn api:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: SUPABASE_URL
+      - key: DISCORD_TOKEN
         sync: false
-      - key: SUPABASE_KEY
+      - key: API_KEY
         sync: false
-      - key: JWT_SECRET
-        sync: false
-      - key: ADMIN_SECRET
-        sync: false
-      - key: CORS_ORIGINS
-        value: https://bothostingf.vercel.app/
       - key: ENVIRONMENT
         value: production
     healthCheckPath: /health
-  
-
-databases:
-  - name: pixel-rpg-db
-    plan: free
-    region: oregon
-    databaseName: pixel_rpg
-    user: pixel_rpg_user
-    ipAllowList: [] # allow only from internal services
-
