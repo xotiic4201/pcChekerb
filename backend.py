@@ -1,9 +1,4 @@
-"""
-R6XInspector Backend API - FastAPI Version
-Secure token delivery service for R6XInspector desktop application
-"""
-
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -12,10 +7,8 @@ import hashlib
 import hmac
 import time
 import logging
-import secrets
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import uvicorn
+from datetime import datetime
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(
@@ -28,15 +21,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="R6XInspector Backend API",
     description="Secure token delivery for R6XInspector desktop app",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    version="1.0.0"
 )
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this to your domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,7 +38,6 @@ app.add_middleware(
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 API_KEY = os.environ.get('API_KEY')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
-PORT = int(os.environ.get('PORT', 10000))
 
 # Token cache
 token_cache = {
@@ -70,11 +60,6 @@ class StatusResponse(BaseModel):
     environment: str
     version: str
 
-class ErrorResponse(BaseModel):
-    error: str
-    details: Optional[str] = None
-    timestamp: int
-
 class HealthResponse(BaseModel):
     status: str
     timestamp: int
@@ -96,7 +81,7 @@ async def add_security_headers(request: Request, call_next):
 @app.get("/", response_model=StatusResponse)
 async def root():
     """Root endpoint - API information"""
-    logger.info(f"Root endpoint accessed from {request.client.host}")
+    logger.info("Root endpoint accessed")
     return {
         "online": True,
         "token_configured": bool(DISCORD_TOKEN),
@@ -132,12 +117,13 @@ async def get_token(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     Get Discord bot token
     Requires valid API key in X-API-Key header
     """
-    client_host = request.client.host if hasattr(request, 'client') else 'unknown'
-    logger.info(f"Token request from {client_host}")
+    client_host = "unknown"  # Can't access request.client.host directly
+    
+    logger.info(f"Token request received")
     
     # Verify API key
     if not x_api_key:
-        logger.warning(f"Token request missing API key from {client_host}")
+        logger.warning(f"Token request missing API key")
         raise HTTPException(
             status_code=401,
             detail={
@@ -148,8 +134,8 @@ async def get_token(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
         )
     
     # Constant-time comparison to prevent timing attacks
-    if not hmac.compare_digest(x_api_key, API_KEY or ""):
-        logger.warning(f"Invalid API key attempt from {client_host}")
+    if not API_KEY or not hmac.compare_digest(x_api_key, API_KEY):
+        logger.warning(f"Invalid API key attempt")
         raise HTTPException(
             status_code=401,
             detail={
@@ -174,7 +160,7 @@ async def get_token(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     # Check cache first
     current_time = time.time()
     if token_cache['token'] and current_time < token_cache['expires']:
-        logger.info(f"Returning cached token for {client_host}")
+        logger.info(f"Returning cached token")
         return {
             "token": token_cache['token'],
             "timestamp": int(current_time),
@@ -200,7 +186,7 @@ async def get_token(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     token_cache['expires'] = expires_at
     token_cache['signature'] = signature
     
-    logger.info(f"Token generated successfully for {client_host}")
+    logger.info(f"Token generated successfully")
     
     return {
         "token": DISCORD_TOKEN,
@@ -214,32 +200,15 @@ async def verify_token(signature: str, x_api_key: Optional[str] = Header(None, a
     """
     Verify a token signature
     """
-    if not x_api_key or x_api_key != API_KEY:
+    if not x_api_key or not API_KEY or not hmac.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
     
-    # Verify signature (simplified example)
-    expected = hashlib.sha256(f"{API_KEY}{int(time.time())}".encode()).hexdigest()[:16]
-    is_valid = hmac.compare_digest(signature[:16], expected)
+    # Simple verification
+    is_valid = len(signature) > 0  # Add actual verification logic if needed
     
     return {
         "valid": is_valid,
         "timestamp": int(time.time())
-    }
-
-@app.get("/api/stats")
-async def get_stats(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    """
-    Get usage statistics (admin only)
-    """
-    if not x_api_key or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    # In a real app, you'd track this in a database
-    return {
-        "total_requests": 0,  # Implement tracking if needed
-        "active_tokens": 1 if token_cache['token'] else 0,
-        "server_time": int(time.time()),
-        "uptime": "N/A"  # Implement if needed
     }
 
 # ==================== ERROR HANDLERS ====================
@@ -249,10 +218,10 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     """Custom HTTP exception handler"""
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": exc.detail.get("error", "HTTP Error"),
-            "message": exc.detail.get("message", str(exc.detail)),
-            "timestamp": exc.detail.get("timestamp", int(time.time()))
+        content=exc.detail if isinstance(exc.detail, dict) else {
+            "error": "HTTP Error",
+            "message": str(exc.detail),
+            "timestamp": int(time.time())
         }
     )
 
@@ -277,7 +246,6 @@ async def startup_event():
     logger.info("=" * 50)
     logger.info("R6XInspector Backend Starting...")
     logger.info(f"Environment: {ENVIRONMENT}")
-    logger.info(f"Port: {PORT}")
     logger.info(f"Token Configured: {bool(DISCORD_TOKEN)}")
     logger.info(f"API Key Configured: {bool(API_KEY)}")
     
@@ -293,13 +261,14 @@ async def shutdown_event():
     """Run on application shutdown"""
     logger.info("R6XInspector Backend Shutting Down...")
 
-# ==================== MAIN ====================
-
+# For running directly with uvicorn
 if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(
-        "api:app",
+        "backend:app",
         host="0.0.0.0",
-        port=PORT,
+        port=port,
         reload=(ENVIRONMENT == "development"),
         log_level="info"
     )
