@@ -1,6 +1,7 @@
 """
 R6XInspector Backend API - FastAPI Version with Supabase
 Complete backend with token delivery, user authentication, registration, and Supabase database
+PLAIN TEXT PASSWORDS - NO HASHING
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -8,16 +9,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
-import hashlib
 import hmac
 import time
 import logging
 import secrets
 import json
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
-from supabase import create_client, Client
-import postgrest.exceptions
+from datetime import datetime
+
+# Try to import supabase
+try:
+    from supabase import create_client, Client
+    from supabase.lib.client_options import ClientOptions
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+    print("⚠️ Supabase not installed. Run: pip install supabase")
 
 # Configure logging
 logging.basicConfig(
@@ -44,19 +51,32 @@ app.add_middleware(
 
 # ==================== SUPABASE CONFIGURATION ====================
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')  # This should be the service_role key
 SUPABASE_JWT_SECRET = os.environ.get('SUPABASE_JWT_SECRET')
 
 # Initialize Supabase client
 supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
+
+if SUPABASE_URL and SUPABASE_KEY and SUPABASE_AVAILABLE:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Use service role key to bypass RLS
+        supabase = create_client(
+            SUPABASE_URL, 
+            SUPABASE_KEY,
+            options=ClientOptions(
+                schema="public",
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "apikey": SUPABASE_KEY
+                }
+            )
+        )
         logger.info("✅ Supabase client initialized successfully")
     except Exception as e:
         logger.error(f"❌ Failed to initialize Supabase: {e}")
+        supabase = None
 else:
-    logger.warning("⚠️ Supabase credentials not set. Running in limited mode.")
+    logger.warning("⚠️ Supabase not configured - using in-memory storage")
 
 # ==================== CONFIGURATION ====================
 # Get from environment variables
@@ -64,9 +84,9 @@ DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 API_KEY = os.environ.get('API_KEY')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production')
 
-# Admin credentials (stored in environment variables as fallback)
+# Admin credentials from environment (plain text)
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'xotiic')
-ADMIN_PASSWORD_HASH = os.environ.get('ADMIN_PASSWORD_HASH')  # SHA256 hash of password
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '40671Mps19*')  # Plain text password
 
 # Token cache
 token_cache = {
@@ -76,274 +96,276 @@ token_cache = {
     'timestamp': 0
 }
 
-# Session store (in production, use Redis, but we'll use Supabase for sessions too)
-# For now, keep sessions in memory for speed
+# Session store (in-memory for speed)
 sessions: Dict[str, Dict] = {}
 
-# Registration tokens (for email verification if needed)
-registration_tokens: Dict[str, Dict] = {}
+# In-memory storage fallback (if Supabase is not available)
+memory_users: Dict[str, Dict] = {}
+memory_scans: List[Dict] = []
+
+# Initialize admin in memory
+memory_users[ADMIN_USERNAME] = {
+    'username': ADMIN_USERNAME,
+    'password': ADMIN_PASSWORD,
+    'email': os.environ.get('ADMIN_EMAIL', 'admin@r6x.com'),
+    'is_admin': True,
+    'is_active': True,
+    'created_at': datetime.now().isoformat(),
+    'registered_via': 'env'
+}
 
 # ==================== DATABASE FUNCTIONS ====================
 
-async def init_database():
-    """Initialize database tables if they don't exist"""
-    if not supabase:
-        logger.error("Supabase not initialized")
-        return False
-    
-    try:
-        # Check if tables exist by trying to query them
-        # Users table
-        try:
-            supabase.table('users').select('*').limit(1).execute()
-            logger.info("✅ Users table exists")
-        except Exception as e:
-            logger.error(f"❌ Users table error: {e}")
-            # Table might not exist - create it via SQL in Supabase dashboard
-            # We'll handle table creation through Supabase migrations
-            pass
-        
-        # Scans table
-        try:
-            supabase.table('scans').select('*').limit(1).execute()
-            logger.info("✅ Scans table exists")
-        except Exception as e:
-            logger.error(f"❌ Scans table error: {e}")
-            pass
-        
-        # Sessions table (optional - we're using memory for now)
-        
-        return True
-    except Exception as e:
-        logger.error(f"Database initialization error: {e}")
-        return False
-
 async def get_user_by_username(username: str) -> Optional[Dict]:
-    """Get user from Supabase by username"""
-    if not supabase:
-        return None
-    
-    try:
-        result = supabase.table('users').select('*').eq('username', username).execute()
-        if result.data and len(result.data) > 0:
-            return result.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"Error getting user {username}: {e}")
-        return None
+    """Get user from database by username"""
+    if supabase:
+        try:
+            # Use service role to bypass RLS
+            result = supabase.table('users').select('*').eq('username', username).execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Supabase error getting user {username}: {e}")
+            # Fall back to memory
+            return memory_users.get(username)
+    else:
+        # Fallback to memory
+        return memory_users.get(username)
 
 async def get_user_by_email(email: str) -> Optional[Dict]:
-    """Get user from Supabase by email"""
-    if not supabase:
-        return None
-    
-    try:
-        result = supabase.table('users').select('*').eq('email', email).execute()
-        if result.data and len(result.data) > 0:
-            return result.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"Error getting user by email {email}: {e}")
+    """Get user from database by email"""
+    if supabase:
+        try:
+            result = supabase.table('users').select('*').eq('email', email).execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Supabase error getting user by email {email}: {e}")
+            # Check memory
+            for user in memory_users.values():
+                if user.get('email') == email:
+                    return user
+            return None
+    else:
+        # Check memory
+        for user in memory_users.values():
+            if user.get('email') == email:
+                return user
         return None
 
-async def create_user(username: str, password_hash: str, email: Optional[str] = None, is_admin: bool = False) -> Optional[Dict]:
-    """Create a new user in Supabase"""
-    if not supabase:
-        return None
+async def create_user(username: str, password: str, email: Optional[str] = None, is_admin: bool = False) -> Optional[Dict]:
+    """Create a new user in database (plain text password)"""
+    now = datetime.now().isoformat()
+    user_data = {
+        'username': username,
+        'password': password,  # Plain text!
+        'email': email or '',
+        'is_admin': is_admin,
+        'is_active': True,
+        'created_at': now,
+        'last_login': None,
+        'registered_via': 'api'
+    }
     
-    try:
-        now = datetime.now().isoformat()
-        user_data = {
-            'username': username,
-            'password_hash': password_hash,
-            'email': email or '',
-            'is_admin': is_admin,
-            'created_at': now,
-            'last_login': None,
-            'registered_via': 'api',
-            'is_active': True
-        }
-        
-        result = supabase.table('users').insert(user_data).execute()
-        if result.data and len(result.data) > 0:
-            logger.info(f"User created in database: {username}")
-            return result.data[0]
-        return None
-    except postgrest.exceptions.APIError as e:
-        if 'duplicate key' in str(e).lower():
-            logger.warning(f"User {username} already exists")
-        else:
-            logger.error(f"Error creating user {username}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error creating user {username}: {e}")
-        return None
+    if supabase:
+        try:
+            result = supabase.table('users').insert(user_data).execute()
+            if result.data and len(result.data) > 0:
+                logger.info(f"User created in Supabase: {username}")
+                return result.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Supabase error creating user {username}: {e}")
+            # Fall back to memory
+            memory_users[username] = user_data
+            return user_data
+    else:
+        # Store in memory
+        memory_users[username] = user_data
+        logger.info(f"User created in memory: {username}")
+        return user_data
 
 async def update_user_login(username: str):
     """Update user's last login time"""
-    if not supabase:
-        return False
+    now = datetime.now().isoformat()
     
-    try:
-        now = datetime.now().isoformat()
-        supabase.table('users').update({'last_login': now}).eq('username', username).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error updating login for {username}: {e}")
-        return False
+    if supabase:
+        try:
+            supabase.table('users').update({'last_login': now}).eq('username', username).execute()
+        except Exception as e:
+            logger.error(f"Supabase error updating login for {username}: {e}")
+    
+    # Also update memory
+    if username in memory_users:
+        memory_users[username]['last_login'] = now
 
 async def save_scan_result(username: str, computer_name: str, scan_data: Dict, timestamp: int) -> Optional[str]:
-    """Save scan result to Supabase"""
-    if not supabase:
-        return None
+    """Save scan result to database"""
+    scan_id = secrets.token_hex(8)
+    now = datetime.now().isoformat()
     
-    try:
-        scan_id = secrets.token_hex(8)
-        now = datetime.now().isoformat()
-        
-        scan_entry = {
-            'scan_id': scan_id,
-            'username': username,
-            'computer_name': computer_name,
-            'timestamp': timestamp,
-            'datetime': datetime.fromtimestamp(timestamp).isoformat(),
-            'data': json.dumps(scan_data),  # Store as JSON string
-            'created_at': now
-        }
-        
-        result = supabase.table('scans').insert(scan_entry).execute()
-        if result.data and len(result.data) > 0:
-            logger.info(f"Scan saved to database: {scan_id} for {username}")
-            return scan_id
-        return None
-    except Exception as e:
-        logger.error(f"Error saving scan for {username}: {e}")
-        return None
+    # Count alerts for quick access
+    alerts = scan_data.get('alerts', [])
+    suspicious_files = scan_data.get('suspicious_files', [])
+    
+    scan_entry = {
+        'scan_id': scan_id,
+        'username': username,
+        'computer_name': computer_name,
+        'timestamp': timestamp,
+        'scan_datetime': datetime.fromtimestamp(timestamp).isoformat(),
+        'data': json.dumps(scan_data),  # Store as JSON string
+        'alerts_count': len(alerts),
+        'suspicious_count': len(suspicious_files),
+        'files_scanned': scan_data.get('files_scanned', 0),
+        'has_suspicious_files': len(suspicious_files) > 0,
+        'has_banned_accounts': len(scan_data.get('steam_accounts', [])) > 0,
+        'created_at': now
+    }
+    
+    if supabase:
+        try:
+            result = supabase.table('scans').insert(scan_entry).execute()
+            if result.data and len(result.data) > 0:
+                logger.info(f"Scan saved to Supabase: {scan_id}")
+                return scan_id
+        except Exception as e:
+            logger.error(f"Supabase error saving scan: {e}")
+    
+    # Fall back to memory
+    memory_scans.append(scan_entry)
+    logger.info(f"Scan saved to memory: {scan_id}")
+    return scan_id
 
 async def get_user_scans(username: str, limit: int = 50, offset: int = 0) -> List[Dict]:
     """Get scans for a specific user"""
-    if not supabase:
-        return []
+    scans = []
     
-    try:
-        result = supabase.table('scans') \
-            .select('*') \
-            .eq('username', username) \
-            .order('timestamp', desc=True) \
-            .range(offset, offset + limit - 1) \
-            .execute()
-        
-        # Parse JSON data back to dict
-        scans = []
-        for scan in result.data:
-            if 'data' in scan and isinstance(scan['data'], str):
-                try:
-                    scan['data'] = json.loads(scan['data'])
-                except:
-                    pass
-            scans.append(scan)
-        
-        return scans
-    except Exception as e:
-        logger.error(f"Error getting scans for {username}: {e}")
-        return []
+    if supabase:
+        try:
+            result = supabase.table('scans') \
+                .select('*') \
+                .eq('username', username) \
+                .order('timestamp', desc=True) \
+                .range(offset, offset + limit - 1) \
+                .execute()
+            
+            # Parse JSON data back to dict
+            for scan in result.data:
+                if 'data' in scan and isinstance(scan['data'], str):
+                    try:
+                        scan['data'] = json.loads(scan['data'])
+                    except:
+                        pass
+                scans.append(scan)
+        except Exception as e:
+            logger.error(f"Supabase error getting scans: {e}")
+    
+    # If no scans from Supabase or using memory, filter memory
+    if not scans:
+        scans = [s for s in memory_scans if s['username'] == username]
+        scans = sorted(scans, key=lambda x: x['timestamp'], reverse=True)[offset:offset+limit]
+    
+    return scans
 
 async def get_all_scans(limit: int = 50, offset: int = 0) -> List[Dict]:
     """Get all scans (admin only)"""
-    if not supabase:
-        return []
+    scans = []
     
-    try:
-        result = supabase.table('scans') \
-            .select('*') \
-            .order('timestamp', desc=True) \
-            .range(offset, offset + limit - 1) \
-            .execute()
-        
-        # Parse JSON data back to dict
-        scans = []
-        for scan in result.data:
-            if 'data' in scan and isinstance(scan['data'], str):
-                try:
-                    scan['data'] = json.loads(scan['data'])
-                except:
-                    pass
-            scans.append(scan)
-        
-        return scans
-    except Exception as e:
-        logger.error(f"Error getting all scans: {e}")
-        return []
+    if supabase:
+        try:
+            result = supabase.table('scans') \
+                .select('*') \
+                .order('timestamp', desc=True) \
+                .range(offset, offset + limit - 1) \
+                .execute()
+            
+            # Parse JSON data back to dict
+            for scan in result.data:
+                if 'data' in scan and isinstance(scan['data'], str):
+                    try:
+                        scan['data'] = json.loads(scan['data'])
+                    except:
+                        pass
+                scans.append(scan)
+        except Exception as e:
+            logger.error(f"Supabase error getting all scans: {e}")
+    
+    # If no scans from Supabase, use memory
+    if not scans:
+        scans = sorted(memory_scans, key=lambda x: x['timestamp'], reverse=True)[offset:offset+limit]
+    
+    return scans
 
 async def get_total_scans_count() -> int:
     """Get total number of scans"""
-    if not supabase:
-        return 0
-    
-    try:
-        result = supabase.table('scans').select('*', count='exact').execute()
-        return result.count if hasattr(result, 'count') else len(result.data)
-    except Exception as e:
-        logger.error(f"Error getting scan count: {e}")
-        return 0
+    if supabase:
+        try:
+            result = supabase.table('scans').select('*', count='exact').execute()
+            return result.count if hasattr(result, 'count') else len(result.data)
+        except:
+            return len(memory_scans)
+    return len(memory_scans)
 
 async def get_total_users_count() -> int:
     """Get total number of users"""
-    if not supabase:
-        return 0
-    
-    try:
-        result = supabase.table('users').select('*', count='exact').execute()
-        return result.count if hasattr(result, 'count') else len(result.data)
-    except Exception as e:
-        logger.error(f"Error getting user count: {e}")
-        return 0
+    if supabase:
+        try:
+            result = supabase.table('users').select('*', count='exact').execute()
+            return result.count if hasattr(result, 'count') else len(result.data)
+        except:
+            return len(memory_users)
+    return len(memory_users)
 
 async def get_all_users() -> List[Dict]:
     """Get all users (admin only)"""
-    if not supabase:
-        return []
+    if supabase:
+        try:
+            result = supabase.table('users').select('*').order('created_at', desc=True).execute()
+            return result.data
+        except Exception as e:
+            logger.error(f"Supabase error getting users: {e}")
     
-    try:
-        result = supabase.table('users').select('*').order('created_at', desc=True).execute()
-        return result.data
-    except Exception as e:
-        logger.error(f"Error getting all users: {e}")
-        return []
+    # Return from memory
+    return list(memory_users.values())
 
 async def delete_user(username: str) -> bool:
     """Delete a user and their scans"""
-    if not supabase:
-        return False
+    if supabase:
+        try:
+            # Delete user's scans first
+            supabase.table('scans').delete().eq('username', username).execute()
+            # Delete user
+            supabase.table('users').delete().eq('username', username).execute()
+            logger.info(f"User deleted from Supabase: {username}")
+            return True
+        except Exception as e:
+            logger.error(f"Supabase error deleting user {username}: {e}")
     
-    try:
-        # Delete user's scans first (foreign key constraint)
-        supabase.table('scans').delete().eq('username', username).execute()
-        # Delete user
-        supabase.table('users').delete().eq('username', username).execute()
-        logger.info(f"User deleted from database: {username}")
+    # Delete from memory
+    if username in memory_users:
+        del memory_users[username]
+        # Also delete scans
+        global memory_scans
+        memory_scans = [s for s in memory_scans if s['username'] != username]
         return True
-    except Exception as e:
-        logger.error(f"Error deleting user {username}: {e}")
-        return False
+    return False
 
-async def create_admin_if_not_exists():
-    """Create admin user if it doesn't exist"""
-    if not supabase or not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
-        return
-    
-    try:
-        existing = await get_user_by_username(ADMIN_USERNAME)
-        if not existing:
-            await create_user(
-                username=ADMIN_USERNAME,
-                password_hash=ADMIN_PASSWORD_HASH,
-                email=os.environ.get('ADMIN_EMAIL', 'admin@r6x.com'),
-                is_admin=True
-            )
-            logger.info(f"Admin user created: {ADMIN_USERNAME}")
-    except Exception as e:
-        logger.error(f"Error creating admin: {e}")
+async def init_admin_user():
+    """Initialize admin user in database"""
+    admin = await get_user_by_username(ADMIN_USERNAME)
+    if not admin:
+        await create_user(
+            username=ADMIN_USERNAME,
+            password=ADMIN_PASSWORD,
+            email=os.environ.get('ADMIN_EMAIL', 'admin@r6x.com'),
+            is_admin=True
+        )
+        logger.info(f"Admin user created: {ADMIN_USERNAME}")
+    else:
+        logger.info(f"Admin user already exists: {ADMIN_USERNAME}")
 
 # ==================== MODELS ====================
 class TokenResponse(BaseModel):
@@ -371,7 +393,7 @@ class HealthResponse(BaseModel):
 
 class LoginRequest(BaseModel):
     username: str
-    password_hash: str
+    password: str  # Plain text password
     token: str
     client_id: Optional[str] = None
 
@@ -385,7 +407,7 @@ class LoginResponse(BaseModel):
 
 class RegisterRequest(BaseModel):
     username: str
-    password_hash: str
+    password: str  # Plain text password
     email: Optional[str] = None
     token: str
     invite_code: Optional[str] = None
@@ -493,10 +515,6 @@ def validate_username(username: str) -> bool:
         return False
     return True
 
-def validate_password(password_hash: str) -> bool:
-    """Validate password hash (basic check)"""
-    return len(password_hash) == 64 and all(c in '0123456789abcdef' for c in password_hash.lower())
-
 # ==================== API ENDPOINTS ====================
 
 @app.get("/", response_model=StatusResponse)
@@ -504,10 +522,7 @@ async def root():
     """Root endpoint - shows API status"""
     cleanup_sessions()
     
-    # Get user count from database
-    users_count = 0
-    if supabase:
-        users_count = await get_total_users_count()
+    users_count = await get_total_users_count()
     
     return {
         "online": True,
@@ -544,10 +559,7 @@ async def api_status():
     """API status endpoint"""
     cleanup_sessions()
     
-    # Get user count from database
-    users_count = 0
-    if supabase:
-        users_count = await get_total_users_count()
+    users_count = await get_total_users_count()
     
     return {
         "online": True,
@@ -647,21 +659,6 @@ async def register(request: RegisterRequest):
             message="Username must be 3-30 characters, start with a letter, and contain only letters, numbers, _ or -"
         )
     
-    # Validate password hash
-    if not validate_password(request.password_hash):
-        return RegisterResponse(
-            success=False,
-            message="Invalid password format"
-        )
-    
-    # Check if Supabase is available
-    if not supabase:
-        logger.error("Database not available")
-        return RegisterResponse(
-            success=False,
-            message="Registration temporarily unavailable"
-        )
-    
     # Check if username already exists
     existing = await get_user_by_username(request.username)
     if existing:
@@ -680,20 +677,10 @@ async def register(request: RegisterRequest):
                 message="Email already registered"
             )
     
-    # Optional: Check invite code if required
-    invite_required = os.environ.get('INVITE_REQUIRED', 'false').lower() == 'true'
-    if invite_required:
-        valid_invites = os.environ.get('VALID_INVITE_CODES', '').split(',')
-        if not request.invite_code or request.invite_code not in valid_invites:
-            return RegisterResponse(
-                success=False,
-                message="Valid invite code required"
-            )
-    
-    # Create user in database
+    # Create user in database (plain text password)
     user = await create_user(
         username=request.username,
-        password_hash=request.password_hash,
+        password=request.password,  # Plain text!
         email=request.email,
         is_admin=False
     )
@@ -706,14 +693,11 @@ async def register(request: RegisterRequest):
     
     logger.info(f"User registered successfully: {request.username}")
     
-    # Optional: Send verification email
-    requires_verification = os.environ.get('EMAIL_VERIFICATION', 'false').lower() == 'true'
-    
     return RegisterResponse(
         success=True,
         message="Registration successful",
         username=request.username,
-        requires_verification=requires_verification
+        requires_verification=False
     )
 
 @app.post("/api/login", response_model=LoginResponse)
@@ -732,15 +716,6 @@ async def login(request: LoginRequest):
             message="Invalid authentication token"
         )
     
-    # Check if Supabase is available
-    if not supabase:
-        logger.error("Database not available")
-        return LoginResponse(
-            success=False,
-            is_admin=False,
-            message="Login temporarily unavailable"
-        )
-    
     # Get user from database
     user = await get_user_by_username(request.username)
     
@@ -752,8 +727,8 @@ async def login(request: LoginRequest):
             message="Invalid username or password"
         )
     
-    # Verify password
-    if not hmac.compare_digest(request.password_hash, user['password_hash']):
+    # Verify password (plain text comparison)
+    if request.password != user['password']:  # Direct string comparison
         logger.warning(f"Invalid password for user: {request.username}")
         return LoginResponse(
             success=False,
@@ -833,37 +808,6 @@ async def submit_scan(request: ScanResultSubmission):
     if session['username'] != request.username:
         raise HTTPException(status_code=403, detail="Username mismatch")
     
-    # Check if Supabase is available
-    if not supabase:
-        # Fallback to memory storage if database not available
-        scan_id = secrets.token_hex(8)
-        scan_entry = {
-            'scan_id': scan_id,
-            'username': request.username,
-            'computer_name': request.computer_name,
-            'timestamp': request.timestamp,
-            'datetime': datetime.fromtimestamp(request.timestamp).isoformat(),
-            'data': request.scan_data,
-            'submitted_by': session['username']
-        }
-        
-        # Store in memory (temporary)
-        if not hasattr(app, 'scan_results'):
-            app.scan_results = []
-        app.scan_results.append(scan_entry)
-        
-        # Keep only last 1000 scans
-        if len(app.scan_results) > 1000:
-            app.scan_results.pop(0)
-        
-        logger.info(f"Scan result saved in memory: {scan_id} from {request.username}")
-        
-        return ScanResultResponse(
-            success=True,
-            message="Scan result submitted successfully (memory)",
-            scan_id=scan_id
-        )
-    
     # Save to database
     scan_id = await save_scan_result(
         username=request.username,
@@ -875,7 +819,7 @@ async def submit_scan(request: ScanResultSubmission):
     if not scan_id:
         raise HTTPException(status_code=500, detail="Failed to save scan result")
     
-    logger.info(f"Scan result saved to database: {scan_id} from {request.username}")
+    logger.info(f"Scan result saved: {scan_id} from {request.username}")
     
     return ScanResultResponse(
         success=True,
@@ -897,19 +841,18 @@ async def get_user_scans_endpoint(
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     
-    # Check if Supabase is available
+    # Get scans
+    scans = await get_user_scans(session['username'], limit, offset)
+    
+    # Get total count
     if supabase:
-        # Get from database
-        scans = await get_user_scans(session['username'], limit, offset)
-        total = len(await get_user_scans(session['username'], 10000, 0))  # Hacky way to get total
+        try:
+            result = supabase.table('scans').select('*', count='exact').eq('username', session['username']).execute()
+            total = result.count if hasattr(result, 'count') else len(result.data)
+        except:
+            total = len([s for s in memory_scans if s['username'] == session['username']])
     else:
-        # Get from memory
-        if not hasattr(app, 'scan_results'):
-            app.scan_results = []
-        
-        user_scans = [s for s in app.scan_results if s['username'] == session['username']]
-        total = len(user_scans)
-        scans = user_scans[offset:offset + limit]
+        total = len([s for s in memory_scans if s['username'] == session['username']])
     
     return {
         'scans': scans,
@@ -940,18 +883,9 @@ async def get_all_scans_endpoint(
         if not session['is_admin']:
             raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Check if Supabase is available
-    if supabase:
-        # Get from database
-        scans = await get_all_scans(limit, offset)
-        total = await get_total_scans_count()
-    else:
-        # Get from memory
-        if not hasattr(app, 'scan_results'):
-            app.scan_results = []
-        
-        total = len(app.scan_results)
-        scans = app.scan_results[offset:offset + limit]
+    # Get scans
+    scans = await get_all_scans(limit, offset)
+    total = await get_total_scans_count()
     
     return AdminScansResponse(
         scans=scans,
@@ -980,28 +914,22 @@ async def get_users_endpoint(
         if not session['is_admin']:
             raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Check if Supabase is available
-    if supabase:
-        # Get from database
-        users_data = await get_all_users()
-        total = len(users_data)
-        
-        # Convert to UserInfo model
-        users = []
-        for user in users_data:
-            users.append(UserInfo(
-                username=user['username'],
-                is_admin=user['is_admin'],
-                email=user.get('email', ''),
-                created_at=user['created_at'],
-                last_login=user.get('last_login'),
-                registered_via=user.get('registered_via', 'unknown'),
-                is_active=user.get('is_active', True)
-            ))
-    else:
-        # Return empty list if no database
-        users = []
-        total = 0
+    # Get users
+    users_data = await get_all_users()
+    total = len(users_data)
+    
+    # Convert to UserInfo model
+    users = []
+    for user in users_data:
+        users.append(UserInfo(
+            username=user['username'],
+            is_admin=user['is_admin'],
+            email=user.get('email', ''),
+            created_at=user.get('created_at', datetime.now().isoformat()),
+            last_login=user.get('last_login'),
+            registered_via=user.get('registered_via', 'unknown'),
+            is_active=user.get('is_active', True)
+        ))
     
     return UsersResponse(
         users=users,
@@ -1031,17 +959,13 @@ async def delete_user_endpoint(
         if not session['is_admin']:
             raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Check if Supabase is available
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    # Get user from database
+    # Get user
     user = await get_user_by_username(username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
     # Don't allow deleting admin
-    if user['is_admin']:
+    if user['is_admin'] and username != session.get('username'):
         raise HTTPException(status_code=403, detail="Cannot delete admin users")
     
     # Delete user
@@ -1112,22 +1036,20 @@ async def startup_event():
     logger.info(f"Token Configured: {bool(DISCORD_TOKEN)}")
     logger.info(f"API Key Configured: {bool(API_KEY)}")
     logger.info(f"Supabase Configured: {bool(SUPABASE_URL and SUPABASE_KEY)}")
+    logger.info(f"Admin User: {ADMIN_USERNAME}")
     
     if supabase:
-        # Initialize database
-        await init_database()
-        # Create admin user if not exists
-        await create_admin_if_not_exists()
+        # Initialize admin user
+        await init_admin_user()
         logger.info("✅ Database connected and initialized")
     else:
-        logger.warning("⚠️ Running without database - data will not persist!")
+        logger.warning("⚠️ Running without database - using in-memory storage")
+        logger.info(f"✅ Admin user ready in memory: {ADMIN_USERNAME}")
     
     if not DISCORD_TOKEN:
         logger.warning("⚠️ DISCORD_TOKEN not set!")
     if not API_KEY:
         logger.warning("⚠️ API_KEY not set!")
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("⚠️ SUPABASE_URL or SUPABASE_KEY not set!")
     
     logger.info("=" * 60)
 
