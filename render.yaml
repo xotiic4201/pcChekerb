@@ -6,7 +6,7 @@ services:
     plan: free
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn api:app
+    startCommand: gunicorn backend:backend
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
@@ -17,3 +17,4 @@ services:
       - key: ENVIRONMENT
         value: production
     healthCheckPath: /health
+
