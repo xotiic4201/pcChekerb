@@ -1,6 +1,6 @@
 """
 R6XInspector Backend API - FastAPI Version
-Complete backend with token delivery and user authentication
+Complete backend with token delivery, user authentication, and registration
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -50,29 +50,37 @@ ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'xotiic')
 ADMIN_PASSWORD_HASH = os.environ.get('ADMIN_PASSWORD_HASH')  # SHA256 hash of password
 
-# User database (in production, use a real database)
-# For now, we'll use environment variables for users
-# Format: USER_1_USERNAME, USER_1_PASSWORD_HASH, USER_2_USERNAME, USER_2_PASSWORD_HASH, etc.
-USERS: Dict[str, Dict] = {}
+# In-memory user database (in production, use a real database like PostgreSQL)
+# Format: {username: {password_hash, is_admin, created_at, email, last_login}}
+users_db: Dict[str, Dict] = {}
 
-# Load users from environment variables
-for i in range(1, 10):  # Support up to 10 users
+# Load initial users from environment variables
+# Format: USER_1_USERNAME, USER_1_PASSWORD_HASH, USER_1_EMAIL, etc.
+for i in range(1, 100):  # Support up to 100 users
     username = os.environ.get(f'USER_{i}_USERNAME')
     password_hash = os.environ.get(f'USER_{i}_PASSWORD_HASH')
+    email = os.environ.get(f'USER_{i}_EMAIL', '')
+    
     if username and password_hash:
-        USERS[username] = {
+        users_db[username] = {
             'password_hash': password_hash,
             'is_admin': False,
-            'created_at': time.time()
+            'email': email,
+            'created_at': time.time(),
+            'last_login': None,
+            'registered_via': 'env'
         }
-        logger.info(f"Loaded user: {username}")
+        logger.info(f"Loaded user from env: {username}")
 
-# Add admin to users if not already there
+# Add admin to users
 if ADMIN_USERNAME and ADMIN_PASSWORD_HASH:
-    USERS[ADMIN_USERNAME] = {
+    users_db[ADMIN_USERNAME] = {
         'password_hash': ADMIN_PASSWORD_HASH,
         'is_admin': True,
-        'created_at': time.time()
+        'email': os.environ.get('ADMIN_EMAIL', 'admin@r6x.com'),
+        'created_at': time.time(),
+        'last_login': None,
+        'registered_via': 'env'
     }
     logger.info(f"Loaded admin user: {ADMIN_USERNAME}")
 
@@ -90,6 +98,9 @@ sessions: Dict[str, Dict] = {}
 # Scan results store (for admin to view all scans)
 scan_results: List[Dict] = []
 
+# Registration tokens (for email verification if needed)
+registration_tokens: Dict[str, Dict] = {}
+
 # ==================== MODELS ====================
 class TokenResponse(BaseModel):
     token: str
@@ -105,6 +116,7 @@ class StatusResponse(BaseModel):
     environment: str
     version: str
     users_configured: int
+    registration_enabled: bool
 
 class HealthResponse(BaseModel):
     status: str
@@ -123,6 +135,20 @@ class LoginResponse(BaseModel):
     message: str
     session_token: Optional[str] = None
     expires_in: Optional[int] = None
+    username: Optional[str] = None
+
+class RegisterRequest(BaseModel):
+    username: str
+    password_hash: str
+    email: Optional[str] = None
+    token: str
+    invite_code: Optional[str] = None
+
+class RegisterResponse(BaseModel):
+    success: bool
+    message: str
+    username: Optional[str] = None
+    requires_verification: bool = False
 
 class VerifyRequest(BaseModel):
     session_token: str
@@ -150,6 +176,19 @@ class AdminScansResponse(BaseModel):
     total: int
     timestamp: int
 
+class UserInfo(BaseModel):
+    username: str
+    is_admin: bool
+    email: Optional[str]
+    created_at: float
+    last_login: Optional[float]
+    registered_via: str
+
+class UsersResponse(BaseModel):
+    users: List[UserInfo]
+    total: int
+    timestamp: int
+
 # ==================== MIDDLEWARE ====================
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -172,6 +211,10 @@ def create_session(username: str, is_admin: bool) -> str:
         'expires_at': expires,
         'last_activity': time.time()
     }
+    
+    # Update last login
+    if username in users_db:
+        users_db[username]['last_login'] = time.time()
     
     return session_token
 
@@ -197,6 +240,20 @@ def cleanup_sessions():
     for token in expired:
         del sessions[token]
 
+def validate_username(username: str) -> bool:
+    """Validate username format"""
+    if len(username) < 3 or len(username) > 30:
+        return False
+    if not username[0].isalpha():
+        return False
+    if not all(c.isalnum() or c in '_-' for c in username):
+        return False
+    return True
+
+def validate_password(password_hash: str) -> bool:
+    """Validate password hash (basic check)"""
+    return len(password_hash) == 64 and all(c in '0123456789abcdef' for c in password_hash.lower())
+
 # ==================== API ENDPOINTS ====================
 
 @app.get("/", response_model=StatusResponse)
@@ -209,7 +266,8 @@ async def root():
         "timestamp": int(time.time()),
         "environment": ENVIRONMENT,
         "version": "4.0.0",
-        "users_configured": len(USERS)
+        "users_configured": len(users_db),
+        "registration_enabled": True
     }
 
 @app.get("/health", response_model=HealthResponse)
@@ -231,7 +289,8 @@ async def api_status():
         "timestamp": int(time.time()),
         "environment": ENVIRONMENT,
         "version": "4.0.0",
-        "users_configured": len(USERS)
+        "users_configured": len(users_db),
+        "registration_enabled": True
     }
 
 @app.get("/api/token", response_model=TokenResponse)
@@ -299,6 +358,75 @@ async def get_token(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
         "nonce": nonce
     }
 
+@app.post("/api/register", response_model=RegisterResponse)
+async def register(request: RegisterRequest):
+    """
+    Register a new user
+    """
+    logger.info(f"Registration attempt for username: {request.username}")
+    
+    # Verify token first
+    if not request.token or request.token != DISCORD_TOKEN:
+        logger.warning("Invalid token in registration request")
+        return RegisterResponse(
+            success=False,
+            message="Invalid authentication token"
+        )
+    
+    # Validate username
+    if not validate_username(request.username):
+        return RegisterResponse(
+            success=False,
+            message="Username must be 3-30 characters, start with a letter, and contain only letters, numbers, _ or -"
+        )
+    
+    # Validate password hash
+    if not validate_password(request.password_hash):
+        return RegisterResponse(
+            success=False,
+            message="Invalid password format"
+        )
+    
+    # Check if username already exists
+    if request.username in users_db:
+        logger.warning(f"Username already exists: {request.username}")
+        return RegisterResponse(
+            success=False,
+            message="Username already taken"
+        )
+    
+    # Optional: Check invite code if required
+    invite_required = os.environ.get('INVITE_REQUIRED', 'false').lower() == 'true'
+    if invite_required:
+        valid_invites = os.environ.get('VALID_INVITE_CODES', '').split(',')
+        if not request.invite_code or request.invite_code not in valid_invites:
+            return RegisterResponse(
+                success=False,
+                message="Valid invite code required"
+            )
+    
+    # Create new user
+    users_db[request.username] = {
+        'password_hash': request.password_hash,
+        'is_admin': False,
+        'email': request.email or '',
+        'created_at': time.time(),
+        'last_login': None,
+        'registered_via': 'api'
+    }
+    
+    logger.info(f"User registered successfully: {request.username}")
+    
+    # Optional: Send verification email
+    requires_verification = os.environ.get('EMAIL_VERIFICATION', 'false').lower() == 'true'
+    
+    return RegisterResponse(
+        success=True,
+        message="Registration successful",
+        username=request.username,
+        requires_verification=requires_verification
+    )
+
 @app.post("/api/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
     """
@@ -316,7 +444,7 @@ async def login(request: LoginRequest):
         )
     
     # Check if user exists
-    if request.username not in USERS:
+    if request.username not in users_db:
         logger.warning(f"User not found: {request.username}")
         return LoginResponse(
             success=False,
@@ -325,7 +453,7 @@ async def login(request: LoginRequest):
         )
     
     # Verify password
-    user_data = USERS[request.username]
+    user_data = users_db[request.username]
     if not hmac.compare_digest(request.password_hash, user_data['password_hash']):
         logger.warning(f"Invalid password for user: {request.username}")
         return LoginResponse(
@@ -344,7 +472,8 @@ async def login(request: LoginRequest):
         is_admin=user_data['is_admin'],
         message="Login successful",
         session_token=session_token,
-        expires_in=86400
+        expires_in=86400,
+        username=request.username
     )
 
 @app.post("/api/verify", response_model=VerifyResponse)
@@ -390,6 +519,10 @@ async def submit_scan(request: ScanResultSubmission):
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     
+    # Verify username matches session
+    if session['username'] != request.username:
+        raise HTTPException(status_code=403, detail="Username mismatch")
+    
     # Store scan result
     scan_id = secrets.token_hex(8)
     scan_entry = {
@@ -415,6 +548,33 @@ async def submit_scan(request: ScanResultSubmission):
         message="Scan result submitted successfully",
         scan_id=scan_id
     )
+
+@app.get("/api/user/scans")
+async def get_user_scans(
+    session_token: str,
+    limit: int = 50,
+    offset: int = 0
+):
+    """
+    Get scan results for current user
+    """
+    # Verify session
+    session = verify_session(session_token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    # Filter scans for this user
+    user_scans = [scan for scan in scan_results if scan['username'] == session['username']]
+    
+    # Apply pagination
+    total = len(user_scans)
+    paginated = user_scans[-limit - offset:][:limit] if user_scans else []
+    
+    return {
+        'scans': paginated,
+        'total': total,
+        'timestamp': int(time.time())
+    }
 
 @app.get("/api/admin/scans", response_model=AdminScansResponse)
 async def get_all_scans(
@@ -449,7 +609,7 @@ async def get_all_scans(
         timestamp=int(time.time())
     )
 
-@app.get("/api/admin/users")
+@app.get("/api/admin/users", response_model=UsersResponse)
 async def get_users(
     session_token: str,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key")
@@ -470,20 +630,66 @@ async def get_users(
         if not session['is_admin']:
             raise HTTPException(status_code=403, detail="Admin access required")
     
-    # Return user list (without password hashes)
+    # Return user list
     user_list = []
-    for username, data in USERS.items():
-        user_list.append({
-            'username': username,
-            'is_admin': data['is_admin'],
-            'created_at': data['created_at']
-        })
+    for username, data in users_db.items():
+        user_list.append(UserInfo(
+            username=username,
+            is_admin=data['is_admin'],
+            email=data.get('email', ''),
+            created_at=data['created_at'],
+            last_login=data.get('last_login'),
+            registered_via=data.get('registered_via', 'unknown')
+        ))
     
-    return {
-        'users': user_list,
-        'total': len(user_list),
-        'timestamp': int(time.time())
-    }
+    return UsersResponse(
+        users=user_list,
+        total=len(user_list),
+        timestamp=int(time.time())
+    )
+
+@app.delete("/api/admin/users/{username}")
+async def delete_user(
+    username: str,
+    session_token: str,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
+    """
+    Delete a user (admin only)
+    """
+    # Verify API key first
+    if x_api_key and API_KEY and x_api_key == API_KEY:
+        # API key access
+        pass
+    else:
+        # Check session
+        session = verify_session(session_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        
+        if not session['is_admin']:
+            raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Check if user exists
+    if username not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Don't allow deleting admin
+    if users_db[username]['is_admin']:
+        raise HTTPException(status_code=403, detail="Cannot delete admin users")
+    
+    # Delete user
+    del users_db[username]
+    
+    # Delete associated sessions
+    sessions_to_delete = [token for token, session in sessions.items() 
+                         if session['username'] == username]
+    for token in sessions_to_delete:
+        del sessions[token]
+    
+    logger.info(f"User deleted: {username}")
+    
+    return {"success": True, "message": f"User {username} deleted"}
 
 @app.get("/api/verify-signature")
 async def verify_signature(
@@ -538,7 +744,8 @@ async def startup_event():
     logger.info(f"Token Configured: {bool(DISCORD_TOKEN)}")
     logger.info(f"API Key Configured: {bool(API_KEY)}")
     logger.info(f"Admin User Configured: {bool(ADMIN_USERNAME and ADMIN_PASSWORD_HASH)}")
-    logger.info(f"Regular Users Configured: {len(USERS) - (1 if ADMIN_USERNAME else 0)}")
+    logger.info(f"Total Users Configured: {len(users_db)}")
+    logger.info(f"Registration Enabled: True")
     
     if not DISCORD_TOKEN:
         logger.warning("⚠️ DISCORD_TOKEN not set!")
