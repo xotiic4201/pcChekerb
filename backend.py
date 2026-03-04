@@ -17,7 +17,7 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
-API_KEY = os.getenv('API_KEY', 'rnd_o2SUQpg4Ln3EsJSJsOYOeCHnLnId')
+API_KEY = os.getenv('API_KEY', '')
 RENDER_URL = os.getenv('RENDER_URL', 'https://r6x-cyberscan-api.onrender.com')
 
 # File paths
@@ -300,3 +300,4 @@ if __name__ == "__main__":
     logger.info(f"Token loaded: {bool(TOKEN)}")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
+
