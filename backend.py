@@ -1,5 +1,5 @@
-# app.py - R6X CYBERSCAN Backend with Supabase & Discord Bot Hosting
-# Deploy this on Render.com
+# app.py - R6X CYBERSCAN Backend with Supabase
+# Single Discord bot for all users
 
 import os
 import jwt
@@ -23,8 +23,6 @@ import traceback
 # Discord imports
 import discord
 from discord.ext import commands
-import asyncio
-import threading
 
 # ========== CONFIGURATION ==========
 class Config:
@@ -35,7 +33,10 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 30
     REFRESH_TOKEN_EXPIRE_DAYS = 7
-    ADMIN_IDS = os.getenv("ADMIN_IDS", "1151697240025464852,1302203907782606880").split(",")
+    
+    # Single Discord bot for everyone
+    DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+    DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
     
 config = Config()
 
@@ -58,10 +59,6 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
 
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
 class ScanResult(BaseModel):
     username: str
     computer: str
@@ -76,104 +73,83 @@ class ScanResult(BaseModel):
     logitech_scripts: Optional[List] = None
     scan_time: str
 
-class BotConnect(BaseModel):
-    user_id: str
-    bot_token: str
-    channel_id: str
-
-# ========== DISCORD BOT MANAGER ==========
-class DiscordBotHost:
+# ========== DISCORD BOT (SINGLE INSTANCE) ==========
+class DiscordBot:
     def __init__(self):
-        self.bots = {}  # user_id -> bot instance
-        self.bot_tasks = {}  # user_id -> task
-        self.loops = {}  # user_id -> event loop
-        self.threads = {}  # user_id -> thread
-        logger.info("✅ Discord Bot Host initialized")
+        self.bot = None
+        self.loop = None
+        self.thread = None
+        self.channel = None
+        self.is_ready = False
         
-    def start_bot_for_user(self, user_id: str, bot_token: str, channel_id: str):
-        """Start a Discord bot for a specific user in its own thread"""
+    def start(self):
+        """Start the Discord bot in a separate thread"""
+        self.thread = threading.Thread(target=self._run_bot, daemon=True)
+        self.thread.start()
         
-        def run_bot():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            self.loops[user_id] = loop
+    def _run_bot(self):
+        """Run the bot in its own event loop"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        try:
+            self.loop.run_until_complete(self._setup_bot())
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
+        finally:
+            self.loop.close()
             
-            try:
-                loop.run_until_complete(self._run_bot(user_id, bot_token, channel_id))
-            except Exception as e:
-                logger.error(f"Bot error for user {user_id}: {e}")
-            finally:
-                loop.close()
-                if user_id in self.loops:
-                    del self.loops[user_id]
-        
-        thread = threading.Thread(target=run_bot, daemon=True)
-        thread.start()
-        self.threads[user_id] = thread
-        
-    async def _run_bot(self, user_id: str, bot_token: str, channel_id: str):
-        """Run the actual bot"""
+    async def _setup_bot(self):
+        """Setup and run the Discord bot"""
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         
-        bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
-        self.bots[user_id] = bot
+        self.bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
         
-        # Get username from database
-        result = service_supabase.table("users").select("username").eq("user_id", user_id).execute()
-        username = result.data[0]["username"] if result.data else "Unknown"
-        
-        @bot.event
+        @self.bot.event
         async def on_ready():
-            logger.info(f"✅ Bot for {username} connected as {bot.user}")
+            logger.info(f"✅ Discord bot connected as {self.bot.user}")
+            self.is_ready = True
             
-            # Store bot info in database
-            service_supabase.table("discord_bots").upsert({
-                "user_id": user_id,
-                "bot_token_preview": bot_token[:10] + "...",
-                "channel_id": channel_id,
-                "bot_name": str(bot.user),
-                "status": "connected",
-                "connected_at": datetime.utcnow().isoformat()
-            }).execute()
-            
-            # Send welcome message
-            channel = bot.get_channel(int(channel_id))
-            if not channel:
-                for guild in bot.guilds:
-                    channel = guild.get_channel(int(channel_id))
-                    if channel:
+            # Get the channel
+            self.channel = self.bot.get_channel(int(config.DISCORD_CHANNEL_ID))
+            if not self.channel:
+                for guild in self.bot.guilds:
+                    self.channel = guild.get_channel(int(config.DISCORD_CHANNEL_ID))
+                    if self.channel:
                         break
             
-            if channel:
+            if self.channel:
                 embed = discord.Embed(
-                    title="🤖 R6X Bot Connected",
-                    description=f"Scanner activated for **{username}**",
+                    title="🤖 R6X Bot Online",
+                    description="Security scanner bot is now active!",
                     color=0x00FF9D,
                     timestamp=datetime.utcnow()
                 )
                 embed.add_field(name="Status", value="🟢 Online", inline=True)
-                embed.add_field(name="Commands", value="!scan, !status, !help", inline=True)
+                embed.add_field(name="Commands", value="!scan [username], !status, !help", inline=True)
                 embed.set_footer(text="R6X CyberScan")
-                await channel.send(embed=embed)
+                
+                await self.channel.send(embed=embed)
         
-        @bot.event
+        @self.bot.event
         async def on_command_error(ctx, error):
             if isinstance(error, commands.CommandNotFound):
                 return
             await ctx.send(f"❌ Error: {str(error)}")
         
-        @bot.command(name='scan')
-        async def scan_command(ctx):
-            """Get latest scan results"""
-            if str(ctx.channel.id) != channel_id:
+        @self.bot.command(name='scan')
+        async def scan_command(ctx, username: str = None):
+            """Get latest scan results for a user"""
+            if not username:
+                await ctx.send("❌ Please specify a username: `!scan username`")
                 return
             
             # Get latest scan from database
-            result = service_supabase.table("scans")\
+            result = supabase.table("scans")\
                 .select("*")\
-                .eq("user_id", user_id)\
+                .eq("username", username)\
                 .order("created_at", desc=True)\
                 .limit(1)\
                 .execute()
@@ -183,8 +159,7 @@ class DiscordBotHost:
                 color = 0x00FF9D if scan['threats_found'] == 0 else 0xFF003C
                 
                 embed = discord.Embed(
-                    title="📊 Latest Scan Results",
-                    description=f"User: {scan['username']}",
+                    title=f"📊 Scan Results: {username}",
                     color=color,
                     timestamp=datetime.fromisoformat(scan['created_at'])
                 )
@@ -197,101 +172,57 @@ class DiscordBotHost:
                 
                 embed.add_field(name="R6 Accounts", value=str(len(r6_accounts)), inline=True)
                 embed.add_field(name="Steam Accounts", value=str(len(steam_accounts)), inline=True)
+                embed.add_field(name="Computer", value=scan['computer'], inline=True)
                 
                 await ctx.send(embed=embed)
             else:
-                await ctx.send("📭 No scans found")
+                await ctx.send(f"📭 No scans found for user: {username}")
         
-        @bot.command(name='status')
+        @self.bot.command(name='status')
         async def status_command(ctx):
             """Check bot status"""
-            if str(ctx.channel.id) != channel_id:
-                return
-                
+            total_users = supabase.table("users").select("*", count="exact").execute()
+            total_scans = supabase.table("scans").select("*", count="exact").execute()
+            
             embed = discord.Embed(
                 title="🟢 Bot Status",
                 description="R6X CyberScan Bot is operational",
                 color=0x00FF9D
             )
-            embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-            embed.add_field(name="User", value=username, inline=True)
+            embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
+            embed.add_field(name="Total Users", value=str(total_users.count if hasattr(total_users, 'count') else 0), inline=True)
+            embed.add_field(name="Total Scans", value=str(total_scans.count if hasattr(total_scans, 'count') else 0), inline=True)
+            
             await ctx.send(embed=embed)
         
-        @bot.command(name='help')
+        @self.bot.command(name='help')
         async def help_command(ctx):
-            """Show commands"""
-            if str(ctx.channel.id) != channel_id:
-                return
-                
+            """Show available commands"""
             embed = discord.Embed(
                 title="🤖 R6X Bot Commands",
                 description="Available commands",
                 color=0x5865F2
             )
-            embed.add_field(name="!scan", value="Get your latest scan", inline=False)
+            embed.add_field(name="!scan [username]", value="Get latest scan for a user", inline=False)
             embed.add_field(name="!status", value="Check bot status", inline=False)
             embed.add_field(name="!help", value="Show this message", inline=False)
+            embed.set_footer(text="R6X CyberScan v4.0")
+            
             await ctx.send(embed=embed)
         
-        # Start bot
-        await bot.start(bot_token)
+        # Start the bot
+        await self.bot.start(config.DISCORD_BOT_TOKEN)
     
-    async def stop_bot(self, user_id: str):
-        """Stop a user's bot"""
-        if user_id in self.bots:
-            try:
-                bot = self.bots[user_id]
-                await bot.close()
-                del self.bots[user_id]
-                
-                if user_id in self.bot_tasks:
-                    self.bot_tasks[user_id].cancel()
-                    del self.bot_tasks[user_id]
-                
-                service_supabase.table("discord_bots")\
-                    .update({"status": "disconnected", "disconnected_at": datetime.utcnow().isoformat()})\
-                    .eq("user_id", user_id)\
-                    .execute()
-                
-                logger.info(f"✅ Bot stopped for user {user_id}")
-                return True
-            except Exception as e:
-                logger.error(f"Error stopping bot: {e}")
-        return False
-    
-    async def send_scan_to_discord(self, user_id: str, scan_data: Dict):
-        """Send scan results to user's Discord channel"""
-        if user_id not in self.bots:
+    async def send_scan_results(self, scan_data: Dict):
+        """Send scan results to Discord channel"""
+        if not self.is_ready or not self.channel:
             return False
             
         try:
-            bot = self.bots[user_id]
-            
-            # Get channel ID from database
-            result = service_supabase.table("discord_bots")\
-                .select("channel_id")\
-                .eq("user_id", user_id)\
-                .execute()
-            
-            if not result.data:
-                return False
-                
-            channel_id = result.data[0]["channel_id"]
-            channel = bot.get_channel(int(channel_id))
-            
-            if not channel:
-                for guild in bot.guilds:
-                    channel = guild.get_channel(int(channel_id))
-                    if channel:
-                        break
-            
-            if not channel:
-                return False
-            
             # Create main embed
             color = 0x00FF9D if scan_data['threats_found'] == 0 else 0xFF003C
             embed = discord.Embed(
-                title=f"📊 Scan Results: {scan_data['username']}",
+                title=f"📊 New Scan: {scan_data['username']}",
                 description=f"Computer: {scan_data['computer']}",
                 color=color,
                 timestamp=datetime.utcnow()
@@ -305,7 +236,7 @@ class DiscordBotHost:
             if scan_data.get('windows_install_date'):
                 embed.add_field(name="💻 Windows Install", value=scan_data['windows_install_date'][:10], inline=True)
             
-            await channel.send(embed=embed)
+            await self.channel.send(embed=embed)
             
             # Send suspicious files if any
             if scan_data['suspicious_files']:
@@ -318,19 +249,15 @@ class DiscordBotHost:
                     sus_list += f"• {f.get('name', 'Unknown')} ({f.get('severity', 'MEDIUM')})\n"
                 if sus_list:
                     sus_embed.description = sus_list
-                    await channel.send(embed=sus_embed)
+                    await self.channel.send(embed=sus_embed)
             
             return True
         except Exception as e:
             logger.error(f"Error sending to Discord: {e}")
             return False
-    
-    def get_bot_status(self, user_id: str):
-        """Check if bot is running for user"""
-        return user_id in self.bots
 
-# Initialize bot host
-bot_host = DiscordBotHost()
+# Initialize Discord bot
+discord_bot = DiscordBot()
 
 # ========== FASTAPI APP ==========
 app = FastAPI(title="R6X CYBERSCAN API")
@@ -373,16 +300,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         pass
     return None
 
-async def get_current_admin(current_user: dict = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(401, "Not authenticated")
-    
-    is_admin = current_user.get("role") == "owner" or current_user.get("user_id") in config.ADMIN_IDS
-    if not is_admin:
-        raise HTTPException(403, "Admin access required")
-    
-    return current_user
-
 # ========== API ROUTES ==========
 
 @app.get("/")
@@ -390,7 +307,7 @@ async def root():
     return {
         "service": "R6X CYBERSCAN API",
         "status": "online",
-        "bots_active": len(bot_host.bots),
+        "bot_status": "connected" if discord_bot.is_ready else "starting",
         "version": "4.0.0"
     }
 
@@ -505,7 +422,6 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "username": current_user["username"],
         "email": current_user["email"],
         "role": current_user.get("role", "user"),
-        "is_admin": current_user.get("role") == "owner" or current_user.get("user_id") in config.ADMIN_IDS,
         "total_scans": current_user.get("total_scans", 0),
         "threats_found": current_user.get("threats_found", 0),
         "created_at": current_user.get("created_at")
@@ -515,7 +431,6 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 async def logout(current_user: dict = Depends(get_current_user)):
     if current_user:
         service_supabase.table("tokens").delete().eq("user_id", current_user["user_id"]).execute()
-        await bot_host.stop_bot(current_user["user_id"])
     return {"success": True}
 
 @app.post("/api/auth/refresh", response_model=Token)
@@ -557,76 +472,6 @@ async def refresh_token(refresh_token: str):
     except:
         raise HTTPException(401, "Invalid refresh token")
 
-# ========== DISCORD BOT ROUTES ==========
-
-@app.post("/api/bot/start")
-async def start_bot(
-    bot_connect: BotConnect,
-    current_user: dict = Depends(get_current_user)
-):
-    """Start a Discord bot for the current user"""
-    if not current_user:
-        raise HTTPException(401, "Not authenticated")
-    
-    # Check if user is authorized to start this bot
-    if bot_connect.user_id != current_user["user_id"] and current_user.get("role") != "owner":
-        raise HTTPException(403, "Not authorized")
-    
-    # Stop existing bot if any
-    await bot_host.stop_bot(bot_connect.user_id)
-    
-    # Start new bot
-    bot_host.start_bot_for_user(
-        user_id=bot_connect.user_id,
-        bot_token=bot_connect.bot_token,
-        channel_id=bot_connect.channel_id
-    )
-    
-    return {"status": "starting", "message": "Bot is starting..."}
-
-@app.post("/api/bot/stop")
-async def stop_bot(
-    user_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    """Stop a user's bot"""
-    if not current_user:
-        raise HTTPException(401, "Not authenticated")
-    
-    if user_id != current_user["user_id"] and current_user.get("role") != "owner":
-        raise HTTPException(403, "Not authorized")
-    
-    success = await bot_host.stop_bot(user_id)
-    return {"status": "stopped" if success else "not_found"}
-
-@app.get("/api/bot/status")
-async def bot_status(
-    user_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get bot status for a user"""
-    if not current_user:
-        raise HTTPException(401, "Not authenticated")
-    
-    if user_id != current_user["user_id"] and current_user.get("role") != "owner":
-        raise HTTPException(403, "Not authorized")
-    
-    is_running = bot_host.get_bot_status(user_id)
-    
-    result = supabase.table("discord_bots")\
-        .select("*")\
-        .eq("user_id", user_id)\
-        .execute()
-    
-    bot_info = result.data[0] if result.data else None
-    
-    return {
-        "connected": is_running,
-        "channel_id": bot_info.get("channel_id") if bot_info else None,
-        "bot_name": bot_info.get("bot_name") if bot_info else None,
-        "status": "connected" if is_running else "disconnected"
-    }
-
 # ========== SCAN ROUTES ==========
 
 @app.post("/api/scan/save")
@@ -635,7 +480,7 @@ async def save_scan(
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
-    """Save scan results and send to Discord if bot connected"""
+    """Save scan results and send to Discord"""
     if not current_user:
         raise HTTPException(401, "Not authenticated")
     
@@ -667,13 +512,8 @@ async def save_scan(
         "threats_found": current_user["threats_found"] + scan.threats_found
     }).eq("user_id", current_user["user_id"]).execute()
     
-    # Send to Discord if bot connected
-    if current_user["user_id"] in bot_host.bots:
-        background_tasks.add_task(
-            bot_host.send_scan_to_discord,
-            current_user["user_id"],
-            scan.dict()
-        )
+    # Send to Discord in background
+    background_tasks.add_task(discord_bot.send_scan_results, scan.dict())
     
     return {"success": True, "scan_id": scan_id}
 
@@ -745,8 +585,11 @@ async def get_scan(
 # ========== ADMIN ROUTES ==========
 
 @app.get("/api/admin/users")
-async def get_users(current_user: dict = Depends(get_current_admin)):
-    """Get all users (admin only)"""
+async def get_users(current_user: dict = Depends(get_current_user)):
+    """Get all users (admin only - username 'xotiic')"""
+    if not current_user or current_user.get("username") != "xotiic":
+        raise HTTPException(403, "Admin only")
+    
     result = supabase.table("users").select("*")\
         .order("created_at")\
         .execute()
@@ -761,23 +604,31 @@ async def get_users(current_user: dict = Depends(get_current_admin)):
     return {"users": users}
 
 @app.get("/api/admin/stats")
-async def get_stats(current_user: dict = Depends(get_current_admin)):
-    """Get system stats (admin only)"""
+async def get_stats(current_user: dict = Depends(get_current_user)):
+    """Get system stats (admin only - username 'xotiic')"""
+    if not current_user or current_user.get("username") != "xotiic":
+        raise HTTPException(403, "Admin only")
+    
     users_result = supabase.table("users").select("*", count="exact").execute()
     scans_result = supabase.table("scans").select("*", count="exact").execute()
     
     return {
         "total_users": users_result.count if hasattr(users_result, 'count') else 0,
         "total_scans": scans_result.count if hasattr(scans_result, 'count') else 0,
-        "active_bots": len(bot_host.bots),
-        "admins": config.ADMIN_IDS
+        "bot_status": "connected" if discord_bot.is_ready else "starting"
     }
 
 # ========== STARTUP ==========
 @app.on_event("startup")
 async def startup():
     logger.info("🚀 R6X CYBERSCAN Backend starting...")
-    logger.info(f"Admin IDs: {config.ADMIN_IDS}")
+    
+    # Start Discord bot
+    if config.DISCORD_BOT_TOKEN and config.DISCORD_CHANNEL_ID:
+        discord_bot.start()
+        logger.info("✅ Discord bot starting...")
+    else:
+        logger.warning("⚠️ Discord bot not configured - check environment variables")
     
     # Check if owner exists
     result = supabase.table("users").select("*").eq("username", "xotiic").execute()
@@ -800,10 +651,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Stop all bots on shutdown"""
+    """Cleanup on shutdown"""
     logger.info("Shutting down...")
-    for user_id in list(bot_host.bots.keys()):
-        await bot_host.stop_bot(user_id)
 
 if __name__ == "__main__":
     import uvicorn
