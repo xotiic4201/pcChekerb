@@ -5,58 +5,137 @@ from discord.ui import View, Button
 import os
 import json
 import asyncio
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import uvicorn
 import threading
 import aiohttp
-import requests
 from dotenv import load_dotenv
 import re
-from bs4 import BeautifulSoup
-import random
-from typing import Optional, List, Dict, Any
-import time
+from typing import Optional, List, Dict, Any, Union
+import uuid
+import logging
+import traceback
 
+# Load environment variables
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
 TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
-AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',')
-API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME')
+AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
+API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME-NOW')
 RENDER_URL = os.getenv('RENDER_URL', 'https://bot-hosting-b-ga04.onrender.com')
+STEAM_API_KEY = os.getenv('STEAM_API_KEY', '')  # Optional
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("r6x-bot")
 
 # ==================== FASTAPI APP ====================
-fastapi_app = FastAPI(title="R6X XScan API", version="1.0.0")
+fastapi_app = FastAPI(
+    title="R6X XScan API", 
+    version="1.0.0",
+    description="API for R6X XScan Discord Bot"
+)
+
+# Add CORS middleware
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==================== PYDANTIC MODELS ====================
+class ThreatModel(BaseModel):
+    name: str
+    severity: int
+    path: str
+    time: str
+
+class FileModel(BaseModel):
+    exe_files: List[str] = []
+    rar_files: List[str] = []
+    suspicious: List[str] = []
+    exe_count: int = 0
+    rar_count: int = 0
+    sus_count: int = 0
+
+class GameBansModel(BaseModel):
+    rainbow_six: List[str] = []
+    steam: List[str] = []
+
+class PrefetchModel(BaseModel):
+    name: str
+    last_accessed: str
+
+class LogitechScriptModel(BaseModel):
+    path: str
+    modified: str
+
+class HardwareMonitorModel(BaseModel):
+    name: str
+    serial: str
+
+class HardwarePCIAModel(BaseModel):
+    name: str
+    status: str
+
+class HardwareModel(BaseModel):
+    monitors: List[HardwareMonitorModel] = []
+    pcie_devices: List[HardwarePCIAModel] = []
+
+class SystemInfoModel(BaseModel):
+    install_date: str = "Unknown"
+    secure_boot: str = "Unknown"
+    dma_protection: str = "Unknown"
+
+class SecurityModel(BaseModel):
+    antivirus_enabled: bool = False
+    antivirus_list: List[str] = []
+    defender_enabled: bool = False
+    realtime: bool = False
+    firewall: bool = False
+
 class ScanData(BaseModel):
     scan_id: str
     user_id: str
     timestamp: str
-    system_info: Dict[str, Any]
-    security: Dict[str, Any]
-    threats: List[Dict[str, Any]]
-    files: Dict[str, Any]
-    executed_programs: List[str]
-    game_bans: Dict[str, List[str]]
-    prefetch: List[Dict[str, str]]
-    logitech_scripts: List[Dict[str, str]]
-    hardware: Dict[str, List[Dict[str, str]]]
+    system_info: SystemInfoModel
+    security: SecurityModel
+    threats: List[ThreatModel] = []
+    files: FileModel
+    executed_programs: List[str] = []
+    game_bans: GameBansModel
+    prefetch: List[PrefetchModel] = []
+    logitech_scripts: List[LogitechScriptModel] = []
+    hardware: HardwareModel
 
 class ScanResponse(BaseModel):
     status: str
     message: str
+    scan_id: Optional[str] = None
+
+class HealthResponse(BaseModel):
+    status: str
+    active_scans: int
+    total_scans: int
+    authorized_users: int
+    uptime: str
+    bot_status: str
 
 # ==================== DISCORD BOT SETUP ====================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Remove default help command
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ==================== DATA STORAGE ====================
 active_scans = {}
@@ -90,170 +169,12 @@ def parse_threat_severity(severity):
     }
     return severity_map.get(severity, "Unknown")
 
-# ==================== WEB SCRAPING FUNCTIONS ====================
-async def check_steam_ban_web_scrape(steam_id: str, account_name: str = None):
-    """Check Steam ban status by scraping community profile"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://steamcommunity.com/profiles/{steam_id}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status != 200:
-                    return None
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # Get profile name if not provided
-                if not account_name:
-                    name_tag = soup.find('span', class_='actual_persona_name')
-                    account_name = name_tag.text if name_tag else f"Profile_{steam_id[-6:]}"
-                
-                # Check for ban information
-                ban_info = {
-                    'vac_banned': False,
-                    'game_banned': False,
-                    'community_banned': False,
-                    'trade_ban': False,
-                    'days_since_last_ban': None
-                }
-                
-                # Look for ban indicators in profile
-                profile_content = soup.find('div', class_='profile_content')
-                if profile_content:
-                    # Check for VAC ban message
-                    vac_text = profile_content.find(string=re.compile(r'VAC ban', re.I))
-                    if vac_text:
-                        ban_info['vac_banned'] = True
-                        
-                        # Try to extract days since last ban
-                        days_match = re.search(r'(\d+)\s+day', str(vac_text), re.I)
-                        if days_match:
-                            ban_info['days_since_last_ban'] = int(days_match.group(1))
-                    
-                    # Check for game ban
-                    game_ban_text = profile_content.find(string=re.compile(r'game ban', re.I))
-                    if game_ban_text:
-                        ban_info['game_banned'] = True
-                    
-                    # Check for community ban
-                    community_text = profile_content.find(string=re.compile(r'community ban', re.I))
-                    if community_text:
-                        ban_info['community_banned'] = True
-                    
-                    # Check for trade ban
-                    trade_text = profile_content.find(string=re.compile(r'trade ban|trade hold', re.I))
-                    if trade_text:
-                        ban_info['trade_ban'] = True
-                
-                # Also check the right column for ban info
-                right_col = soup.find('div', class_='profile_rightcol')
-                if right_col:
-                    ban_elements = right_col.find_all(string=re.compile(r'ban', re.I))
-                    for element in ban_elements:
-                        if 'VAC' in element:
-                            ban_info['vac_banned'] = True
-                        if 'game' in element.lower():
-                            ban_info['game_banned'] = True
-                
-                return {
-                    'account_name': account_name,
-                    'steam_id': steam_id,
-                    'ban_info': ban_info
-                }
-                
-    except Exception as e:
-        print(f"Error scraping Steam profile {steam_id}: {e}")
-        return None
-
-async def check_r6_ban_web_scrape(account_name: str):
-    """Check Rainbow Six Siege ban status by scraping stats.cc"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://stats.cc/siege/{account_name}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 404:
-                    return {
-                        'account_name': account_name,
-                        'exists': False,
-                        'status': 'Not Found'
-                    }
-                
-                if response.status != 200:
-                    return None
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                # Extract actual account name from title
-                title_tag = soup.find('title')
-                actual_name = account_name
-                if title_tag:
-                    title_match = re.search(r'Siege Stats - Stats\.CC (.*?) -', title_tag.text)
-                    if title_match:
-                        actual_name = title_match.group(1)
-                
-                # Check for bans
-                ban_type = "None"
-                status = "Active"
-                
-                # Look for Ubisoft bans section
-                ubisoft_bans = soup.find('div', id='Ubisoft Bans')
-                if ubisoft_bans:
-                    ban_div = ubisoft_bans.find('div')
-                    if ban_div:
-                        ban_text = ban_div.text
-                        if 'Cheating' in ban_text:
-                            ban_type = "Cheating"
-                            status = "BANNED"
-                        elif 'Toxic' in ban_text:
-                            ban_type = "Toxic Behavior"
-                            status = "BANNED"
-                        elif 'Botting' in ban_text:
-                            ban_type = "Botting"
-                            status = "BANNED"
-                
-                # Check for reputation bans
-                reputation_bans = soup.find('div', id='Reputation Bans')
-                if reputation_bans and 'Reputation Bans' in reputation_bans.text:
-                    ban_type = "Reputation"
-                    status = "BANNED"
-                
-                # Get match count
-                match_count = "Unknown"
-                match_div = soup.find('div', string=re.compile(r'Matches'))
-                if match_div:
-                    parent = match_div.find_parent('div')
-                    if parent:
-                        count_div = parent.find('div', class_='text-2xl')
-                        if count_div:
-                            match_count = count_div.text.strip()
-                
-                return {
-                    'account_name': actual_name,
-                    'exists': True,
-                    'status': status,
-                    'ban_type': ban_type,
-                    'matches': match_count
-                }
-                
-    except Exception as e:
-        print(f"Error scraping R6 profile {account_name}: {e}")
-        return None
-
 # ==================== DISCORD BOT EVENTS ====================
 @bot.event
 async def on_ready():
-    print(f'✅ R6X XScan Bot is online as {bot.user.name}')
-    print(f'📊 Bot ID: {bot.user.id}')
-    print(f'📋 Channel ID: {CHANNEL_ID}')
+    logger.info(f'✅ R6X XScan Bot is online as {bot.user.name}')
+    logger.info(f'📊 Bot ID: {bot.user.id}')
+    logger.info(f'📋 Channel ID: {CHANNEL_ID}')
     
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
@@ -276,7 +197,8 @@ async def on_command_error(ctx, error):
         await ctx.send("❌ This command is owner only.")
     else:
         await ctx.send(f"❌ An error occurred: {str(error)}")
-        print(f"Error: {error}")
+        logger.error(f"Command error: {error}")
+        logger.error(traceback.format_exc())
 
 # ==================== DISCORD COMMANDS ====================
 
@@ -300,7 +222,8 @@ async def help_command(ctx):
     embed.add_field(
         name="📊 **Information Commands**",
         value="`!stats [user]` - Show scan statistics\n"
-              "`!recent` - Show recent scans",
+              "`!recent [limit]` - Show recent scans\n"
+              "`!ping` - Check bot latency",
         inline=False
     )
     
@@ -316,7 +239,7 @@ async def help_command(ctx):
     embed.add_field(
         name="📝 **How to Use**",
         value="1. Type `!scan` to get a scan ID\n"
-              "2. Run the PowerShell script with your Discord ID\n"
+              "2. Run the Python scanner with your Discord ID\n"
               "3. Wait for results to appear here\n"
               "4. You'll be pinged when scan completes",
         inline=False
@@ -325,10 +248,21 @@ async def help_command(ctx):
     embed.set_footer(text="R6X XScan v1.0 | Made for security professionals")
     
     view = View()
-    view.add_item(Button(label="📖 Documentation", url="https://github.com/yourrepo", style=ButtonStyle.link))
-    view.add_item(Button(label="🆘 Support", url="https://discord.gg/yourserver", style=ButtonStyle.link))
+    view.add_item(Button(label="📖 GitHub", url="https://github.com/", style=ButtonStyle.link))
+    view.add_item(Button(label="🆘 Support", url="https://discord.gg/", style=ButtonStyle.link))
     
     await ctx.send(embed=embed, view=view)
+
+@bot.command(name='ping')
+async def ping_command(ctx):
+    """Check bot latency"""
+    latency = round(bot.latency * 1000)
+    embed = Embed(
+        title="🏓 Pong!",
+        description=f"Latency: **{latency}ms**",
+        color=Color.green()
+    )
+    await ctx.send(embed=embed)
 
 @bot.command(name='scan')
 async def start_scan(ctx):
@@ -380,16 +314,24 @@ async def start_scan(ctx):
     
     embed.add_field(
         name="📋 Instructions",
-        value="1. **Open PowerShell as Administrator**\n"
-              "2. **Copy and run this command:**",
+        value="1. **Download the Python scanner**\n"
+              "2. **Install requirements:** `pip install requests`\n"
+              "3. **Run this command:**",
         inline=False
     )
     
-    # PowerShell command - using iex to download and run
-    ps_command = f'iex (iwr -Uri "{RENDER_URL}/scan.ps1").Content; R6X-XScan -ScanID "{scan_id}" -UserID "{ctx.author.id}"'
+    # Python command
+    py_command = f'python r6x_scanner.py -ScanID "{scan_id}" -UserID "{ctx.author.id}"'
     embed.add_field(
-        name="💻 PowerShell Command",
-        value=f"```powershell\n{ps_command}\n```",
+        name="🐍 Python Command",
+        value=f"```bash\n{py_command}\n```",
+        inline=False
+    )
+    
+    # Download links
+    embed.add_field(
+        name="📥 Download Scanner",
+        value=f"[Click here to download scanner.py]({RENDER_URL}/scanner.py)",
         inline=False
     )
     
@@ -405,7 +347,7 @@ async def start_scan(ctx):
               "• Security Status\n"
               "• File Scanner\n"
               "• Registry Analysis\n"
-              "• Game Ban Checks (Web Scraping)\n"
+              "• Game Ban Checks\n"
               "• Hardware Info",
         inline=True
     )
@@ -630,9 +572,6 @@ async def add_user(ctx, user_id: str):
     if user_id not in AUTHORIZED_USERS:
         AUTHORIZED_USERS.append(user_id)
         
-        # Update environment variable (in memory)
-        os.environ['AUTHORIZED_USERS'] = ','.join(AUTHORIZED_USERS)
-        
         embed = Embed(
             title="✅ User Added",
             description=f"Added <@{user_id}> to authorized users.",
@@ -650,9 +589,6 @@ async def remove_user(ctx, user_id: str):
     
     if user_id in AUTHORIZED_USERS:
         AUTHORIZED_USERS.remove(user_id)
-        
-        # Update environment variable (in memory)
-        os.environ['AUTHORIZED_USERS'] = ','.join(AUTHORIZED_USERS)
         
         embed = Embed(
             title="✅ User Removed",
@@ -707,20 +643,25 @@ async def broadcast(ctx, *, message: str):
 
 # ==================== FASTAPI ROUTES ====================
 
-@fastapi_app.get("/health")
+@fastapi_app.get("/", response_class=PlainTextResponse)
+async def root():
+    """Root endpoint"""
+    return "R6X XScan API is running. Visit /docs for documentation."
+
+@fastapi_app.get("/health", response_model=HealthResponse)
 async def health():
     """Health check endpoint"""
-    return {
-        'status': 'healthy',
-        'active_scans': len(active_scans),
-        'total_scans': len(scan_history),
-        'authorized_users': len(AUTHORIZED_USERS),
-        'uptime': str(datetime.now() - bot_start_time),
-        'bot_status': 'online'
-    }
+    return HealthResponse(
+        status='healthy',
+        active_scans=len(active_scans),
+        total_scans=len(scan_history),
+        authorized_users=len(AUTHORIZED_USERS),
+        uptime=str(datetime.now() - bot_start_time).split('.')[0],
+        bot_status='online'
+    )
 
 @fastapi_app.get("/stats")
-async def get_stats(x_api_key: str = Header(...)):
+async def get_stats(x_api_key: Optional[str] = Header(None)):
     """Get bot statistics (protected)"""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -730,29 +671,39 @@ async def get_stats(x_api_key: str = Header(...)):
         'total_scans': len(scan_history),
         'authorized_users': len(AUTHORIZED_USERS),
         'user_stats': user_stats,
-        'bot_uptime': str(datetime.now() - bot_start_time)
+        'bot_uptime': str(datetime.now() - bot_start_time).split('.')[0]
     }
 
 @fastapi_app.post("/api/scan", response_model=ScanResponse)
-async def receive_scan(scan_data: ScanData, x_api_key: str = Header(...), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Receive scan data from PowerShell script"""
+async def receive_scan(
+    scan_data: ScanData, 
+    x_api_key: Optional[str] = Header(None),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """Receive scan data from Python scanner"""
     # Verify API key
     if x_api_key != API_KEY:
+        logger.warning(f"Invalid API key attempt: {x_api_key}")
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     scan_id = scan_data.scan_id
     user_id = scan_data.user_id
     
+    logger.info(f"Received scan data for scan_id: {scan_id}, user_id: {user_id}")
+    
     # Verify user is authorized
     if str(user_id) not in AUTHORIZED_USERS:
+        logger.warning(f"Unauthorized user attempt: {user_id}")
         raise HTTPException(status_code=403, detail="User not authorized")
     
     # Check if scan exists
     if scan_id not in active_scans:
+        logger.warning(f"Invalid scan ID: {scan_id}")
         raise HTTPException(status_code=404, detail="Invalid or expired scan ID")
     
     # Verify user matches
     if active_scans[scan_id]['user_id'] != int(user_id):
+        logger.warning(f"User mismatch: scan user {active_scans[scan_id]['user_id']} != {user_id}")
         raise HTTPException(status_code=403, detail="User mismatch - This scan ID belongs to another user")
     
     # Store data and update status
@@ -763,50 +714,90 @@ async def receive_scan(scan_data: ScanData, x_api_key: str = Header(...), backgr
     # Send to Discord in background
     background_tasks.add_task(send_scan_results_discord, scan_id, scan_data.dict())
     
+    logger.info(f"Scan {scan_id} processed successfully")
+    
     return ScanResponse(
         status='success',
-        message='Scan data received successfully. Check Discord for results.'
+        message='Scan data received successfully. Check Discord for results.',
+        scan_id=scan_id
     )
 
-@fastapi_app.get("/scan.ps1", response_class=PlainTextResponse)
-async def serve_script():
-    """Serve the PowerShell script"""
+@fastapi_app.get("/scanner.py", response_class=PlainTextResponse)
+async def serve_scanner():
+    """Serve the Python scanner script"""
     try:
-        script_path = os.path.join(os.path.dirname(__file__), 'R6X-XScan.ps1')
+        scanner_path = os.path.join(os.path.dirname(__file__), 'r6x_scanner.py')
         
         # Check if script exists
-        if not os.path.exists(script_path):
-            # Create default script file
-            create_default_script(script_path)
+        if not os.path.exists(scanner_path):
+            # Return embedded scanner code if file doesn't exist
+            return get_embedded_scanner()
         
-        with open(script_path, 'r', encoding='utf-8') as f:
-            script_content = f.read()
+        with open(scanner_path, 'r', encoding='utf-8') as f:
+            scanner_content = f.read()
         
-        # Replace placeholders with actual values
-        script_content = script_content.replace('YOUR_RENDER_URL', RENDER_URL)
-        script_content = script_content.replace('YOUR_API_KEY', API_KEY)
+        # Replace API URL and key
+        scanner_content = scanner_content.replace(
+            'API_URL = "https://bot-hosting-b-ga04.onrender.com/api/scan"',
+            f'API_URL = "{RENDER_URL}/api/scan"'
+        )
+        scanner_content = scanner_content.replace(
+            'API_KEY = "rnd_o2SUQpg4Ln3EsJSJsOYOeCHnLnId"',
+            f'API_KEY = "{API_KEY}"'
+        )
         
-        return script_content
+        return scanner_content
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error serving scanner: {e}")
+        return PlainTextResponse(get_embedded_scanner(), status_code=200)
 
-def create_default_script(path):
-    """Create default PowerShell script if not exists"""
-    # This would contain the full PowerShell script from previous messages
-    # For brevity, I'm including a placeholder - you'll need to add the full script
-    default_script = """# R6X XScan - Advanced System Scanner
-param(
-    [string]$ScanID,
-    [string]$UserID,
-    [string]$APIUrl = "YOUR_RENDER_URL/api/scan",
-    [string]$APIKey = "YOUR_API_KEY"
-)
-
-Write-Host "R6X XScan - Running scan..." -ForegroundColor Cyan
-# Full PowerShell script content goes here
+def get_embedded_scanner():
+    """Return embedded scanner code"""
+    return '''#!/usr/bin/env python3
 """
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(default_script)
+R6X XScan - Advanced System Security Scanner
+Download the full version from the Discord bot!
+"""
+
+import argparse
+import requests
+import sys
+import json
+import time
+import os
+from datetime import datetime
+
+def main():
+    print("="*50)
+    print("R6X XScan - Please download the full scanner from Discord")
+    print("="*50)
+    print("\\nRun this command to download the full scanner:")
+    print(f"  curl -O {RENDER_URL}/scanner.py")
+    print("\\nThen run:")
+    print("  python scanner.py -ScanID <SCAN_ID> -UserID <USER_ID>")
+
+if __name__ == "__main__":
+    main()
+'''
+
+@fastapi_app.get("/api/active_scans")
+async def get_active_scans(x_api_key: Optional[str] = Header(None)):
+    """Get list of active scans (protected)"""
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    scans = []
+    for scan_id, scan in active_scans.items():
+        scans.append({
+            'scan_id': scan_id,
+            'user_id': scan['user_id'],
+            'user_name': scan['user_name'],
+            'start_time': scan['start_time'].isoformat(),
+            'status': scan['status'],
+            'has_data': scan['data'] is not None
+        })
+    
+    return {'active_scans': scans}
 
 # ==================== DISCORD RESULT HANDLING ====================
 
@@ -815,7 +806,7 @@ async def send_scan_results_discord(scan_id: str, data: Dict):
     try:
         channel = bot.get_channel(CHANNEL_ID)
         if not channel:
-            print(f"Channel {CHANNEL_ID} not found")
+            logger.error(f"Channel {CHANNEL_ID} not found")
             return
         
         scan_info = active_scans.get(scan_id, {})
@@ -865,7 +856,7 @@ async def send_scan_results_discord(scan_id: str, data: Dict):
                 await msg.edit(embed=processing_embed, view=None)
                 
             except Exception as e:
-                print(f"Error updating message: {e}")
+                logger.error(f"Error updating message: {e}")
         
         # Send all results
         await send_main_results(channel, data, user_mention, scan_id)
@@ -891,7 +882,8 @@ async def send_scan_results_discord(scan_id: str, data: Dict):
             pass  # User might have DMs disabled
             
     except Exception as e:
-        print(f"Error sending results: {e}")
+        logger.error(f"Error sending results: {e}")
+        logger.error(traceback.format_exc())
         # Try to send error message
         try:
             channel = bot.get_channel(CHANNEL_ID)
@@ -1039,7 +1031,7 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
             )
             
             for threat in chunk:
-                severity = parse_threat_severity(threat.get('severity'))
+                severity = parse_threat_severity(threat.get('severity', 0))
                 name = truncate_string(threat.get('name', 'Unknown'), 100)
                 path = truncate_string(threat.get('path', 'Unknown'), 200)
                 
@@ -1051,7 +1043,7 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
     # Suspicious Files
     sus_files = data.get('files', {}).get('suspicious', [])
     if sus_files:
-        chunks = [sus_files[i:i:5] for i in range(0, len(sus_files), 5)]
+        chunks = [sus_files[i:i+5] for i in range(0, len(sus_files), 5)]
         for i, chunk in enumerate(chunks):
             embed = Embed(
                 title=f"⚠️ Suspicious Files Found (Part {i+1}/{len(chunks)})",
@@ -1102,11 +1094,11 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
         
         await channel.send(embed=embed)
     
-    # Steam Bans (from web scraping)
+    # Steam Bans
     steam_accounts = game_bans.get('steam', [])
     if steam_accounts:
         embed = Embed(
-            title="🎮 Steam Account Status (Web Scraped)",
+            title="🎮 Steam Account Status",
             description=f"Checking {len(steam_accounts)} accounts",
             color=Color.blue()
         )
@@ -1134,7 +1126,6 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
                 inline=False
             )
         
-        embed.set_footer(text="Note: Ban status determined by web scraping")
         await channel.send(embed=embed)
     
     # Top Executed Programs
@@ -1228,7 +1219,8 @@ async def send_summary(channel, data, user_mention, scan_id):
 
 def run_fastapi():
     """Run FastAPI server"""
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.getenv('PORT', 5000)))
+    port = int(os.getenv('PORT', 5000))
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
 
 async def run_bot():
     """Run Discord bot"""
