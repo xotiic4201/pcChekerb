@@ -1,12 +1,14 @@
-# app.py - R6X CYBERSCAN Backend (No Login Required)
+# app.py - R6X CYBERSCAN Backend (Fixed)
+# No email validator needed - removed EmailStr
 
 import os
 import uuid
 import json
 import asyncio
 import threading
+import time
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -33,22 +35,22 @@ logger = logging.getLogger("r6x-backend")
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 service_supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 
-# ========== PYDANTIC MODELS ==========
+# ========== PYDANTIC MODELS (No EmailStr) ==========
 class ScanResult(BaseModel):
     username: str
     computer: str
     files_scanned: int
     threats_found: int
-    suspicious_files: List[Dict]
-    r6_accounts: List[Dict]
-    steam_accounts: List[Dict]
+    suspicious_files: List[Dict[str, Any]]
+    r6_accounts: List[Dict[str, Any]]
+    steam_accounts: List[Dict[str, Any]]
     windows_install_date: Optional[str] = None
     antivirus_status: Optional[str] = None
-    prefetch_files: Optional[List] = None
-    logitech_scripts: Optional[List] = None
+    prefetch_files: Optional[List[Dict[str, Any]]] = None
+    logitech_scripts: Optional[List[Dict[str, Any]]] = None
     scan_time: str
 
-# ========== DISCORD BOT (SINGLE INSTANCE) ==========
+# ========== DISCORD BOT (Fixed - No rate limits) ==========
 class DiscordBot:
     def __init__(self):
         self.bot = None
@@ -56,9 +58,11 @@ class DiscordBot:
         self.thread = None
         self.channel = None
         self.is_ready = False
+        self.retry_count = 0
+        self.max_retries = 5
         
     def start(self):
-        """Start the Discord bot in a separate thread"""
+        """Start the Discord bot in a separate thread with retry logic"""
         if not config.DISCORD_BOT_TOKEN or not config.DISCORD_CHANNEL_ID:
             logger.warning("Discord bot not configured - check environment variables")
             return
@@ -67,17 +71,21 @@ class DiscordBot:
         self.thread.start()
         
     def _run_bot(self):
-        """Run the bot in its own event loop"""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        
-        try:
-            self.loop.run_until_complete(self._setup_bot())
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-        finally:
-            self.loop.close()
-            
+        """Run the bot in its own event loop with retry logic"""
+        while self.retry_count < self.max_retries:
+            try:
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.loop.run_until_complete(self._setup_bot())
+                break
+            except Exception as e:
+                self.retry_count += 1
+                logger.error(f"Bot error (attempt {self.retry_count}/{self.max_retries}): {e}")
+                time.sleep(5 * self.retry_count)  # Exponential backoff
+            finally:
+                if self.loop:
+                    self.loop.close()
+                    
     async def _setup_bot(self):
         """Setup and run the Discord bot"""
         intents = discord.Intents.default()
@@ -90,27 +98,32 @@ class DiscordBot:
         async def on_ready():
             logger.info(f"✅ Discord bot connected as {self.bot.user}")
             self.is_ready = True
+            self.retry_count = 0  # Reset retry count on success
             
             # Get the channel
-            self.channel = self.bot.get_channel(int(config.DISCORD_CHANNEL_ID))
-            if not self.channel:
-                for guild in self.bot.guilds:
-                    self.channel = guild.get_channel(int(config.DISCORD_CHANNEL_ID))
-                    if self.channel:
-                        break
-            
-            if self.channel:
-                embed = discord.Embed(
-                    title="🤖 R6X Bot Online",
-                    description="Security scanner bot is now active!",
-                    color=0x00FF9D,
-                    timestamp=datetime.utcnow()
-                )
-                embed.add_field(name="Status", value="🟢 Online", inline=True)
-                embed.add_field(name="Commands", value="!scan [username], !stats, !help", inline=True)
-                embed.set_footer(text="R6X CyberScan")
+            try:
+                self.channel = self.bot.get_channel(int(config.DISCORD_CHANNEL_ID))
+                if not self.channel:
+                    for guild in self.bot.guilds:
+                        self.channel = guild.get_channel(int(config.DISCORD_CHANNEL_ID))
+                        if self.channel:
+                            break
                 
-                await self.channel.send(embed=embed)
+                if self.channel:
+                    embed = discord.Embed(
+                        title="🤖 R6X Bot Online",
+                        description="Security scanner bot is now active!",
+                        color=0x00FF9D,
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Status", value="🟢 Online", inline=True)
+                    embed.add_field(name="Commands", value="!scan [username], !stats, !help", inline=True)
+                    embed.set_footer(text="R6X CyberScan")
+                    
+                    await self.channel.send(embed=embed)
+                    logger.info("✅ Welcome message sent to Discord")
+            except Exception as e:
+                logger.error(f"Error sending welcome message: {e}")
         
         @self.bot.event
         async def on_command_error(ctx, error):
@@ -125,60 +138,72 @@ class DiscordBot:
                 await ctx.send("❌ Please specify a username: `!scan username`")
                 return
             
-            # Get latest scan from database
-            result = supabase.table("scans")\
-                .select("*")\
-                .eq("username", username)\
-                .order("created_at", desc=True)\
-                .limit(1)\
-                .execute()
-            
-            if result.data and len(result.data) > 0:
-                scan = result.data[0]
-                color = 0x00FF9D if scan['threats_found'] == 0 else 0xFF003C
+            try:
+                # Get latest scan from database
+                result = supabase.table("scans")\
+                    .select("*")\
+                    .eq("username", username)\
+                    .order("created_at", desc=True)\
+                    .limit(1)\
+                    .execute()
                 
-                embed = discord.Embed(
-                    title=f"📊 Latest Scan: {username}",
-                    color=color,
-                    timestamp=datetime.fromisoformat(scan['created_at'])
-                )
-                embed.add_field(name="Files Scanned", value=str(scan['files_scanned']), inline=True)
-                embed.add_field(name="Threats Found", value=str(scan['threats_found']), inline=True)
-                
-                # Parse JSON fields
-                r6_accounts = json.loads(scan['r6_accounts']) if scan['r6_accounts'] else []
-                steam_accounts = json.loads(scan['steam_accounts']) if scan['steam_accounts'] else []
-                
-                embed.add_field(name="R6 Accounts", value=str(len(r6_accounts)), inline=True)
-                embed.add_field(name="Steam Accounts", value=str(len(steam_accounts)), inline=True)
-                embed.add_field(name="Computer", value=scan['computer'], inline=True)
-                
-                await ctx.send(embed=embed)
-            else:
-                await ctx.send(f"📭 No scans found for user: {username}")
+                if result.data and len(result.data) > 0:
+                    scan = result.data[0]
+                    color = 0x00FF9D if scan['threats_found'] == 0 else 0xFF003C
+                    
+                    embed = discord.Embed(
+                        title=f"📊 Latest Scan: {username}",
+                        color=color,
+                        timestamp=datetime.fromisoformat(scan['created_at'].replace('Z', '+00:00'))
+                    )
+                    embed.add_field(name="Files Scanned", value=str(scan['files_scanned']), inline=True)
+                    embed.add_field(name="Threats Found", value=str(scan['threats_found']), inline=True)
+                    
+                    # Parse JSON fields safely
+                    try:
+                        r6_accounts = json.loads(scan['r6_accounts']) if scan['r6_accounts'] else []
+                        steam_accounts = json.loads(scan['steam_accounts']) if scan['steam_accounts'] else []
+                    except:
+                        r6_accounts = []
+                        steam_accounts = []
+                    
+                    embed.add_field(name="R6 Accounts", value=str(len(r6_accounts)), inline=True)
+                    embed.add_field(name="Steam Accounts", value=str(len(steam_accounts)), inline=True)
+                    embed.add_field(name="Computer", value=scan.get('computer', 'Unknown'), inline=True)
+                    
+                    await ctx.send(embed=embed)
+                else:
+                    await ctx.send(f"📭 No scans found for user: {username}")
+            except Exception as e:
+                logger.error(f"Error in scan command: {e}")
+                await ctx.send("❌ Error retrieving scan data")
         
         @self.bot.command(name='stats')
         async def stats_command(ctx):
             """Get bot statistics"""
-            scans_result = supabase.table("scans").select("*", count="exact").execute()
-            
-            # Get unique users
-            users_result = supabase.table("scans").select("username").execute()
-            unique_users = set()
-            if users_result.data:
-                for scan in users_result.data:
-                    unique_users.add(scan['username'])
-            
-            embed = discord.Embed(
-                title="📊 Bot Statistics",
-                color=0x00FF9D,
-                timestamp=datetime.utcnow()
-            )
-            embed.add_field(name="Total Scans", value=str(scans_result.count if hasattr(scans_result, 'count') else 0), inline=True)
-            embed.add_field(name="Unique Users", value=str(len(unique_users)), inline=True)
-            embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
-            
-            await ctx.send(embed=embed)
+            try:
+                scans_result = supabase.table("scans").select("*", count="exact").execute()
+                
+                # Get unique users
+                users_result = supabase.table("scans").select("username").execute()
+                unique_users = set()
+                if users_result.data:
+                    for scan in users_result.data:
+                        unique_users.add(scan['username'])
+                
+                embed = discord.Embed(
+                    title="📊 Bot Statistics",
+                    color=0x00FF9D,
+                    timestamp=datetime.utcnow()
+                )
+                embed.add_field(name="Total Scans", value=str(scans_result.count if hasattr(scans_result, 'count') else 0), inline=True)
+                embed.add_field(name="Unique Users", value=str(len(unique_users)), inline=True)
+                embed.add_field(name="Latency", value=f"{round(self.bot.latency * 1000)}ms", inline=True)
+                
+                await ctx.send(embed=embed)
+            except Exception as e:
+                logger.error(f"Error in stats command: {e}")
+                await ctx.send("❌ Error retrieving stats")
         
         @self.bot.command(name='help')
         async def help_command(ctx):
@@ -196,11 +221,20 @@ class DiscordBot:
             await ctx.send(embed=embed)
         
         # Start the bot
-        await self.bot.start(config.DISCORD_BOT_TOKEN)
+        try:
+            await self.bot.start(config.DISCORD_BOT_TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                logger.error("Rate limited by Discord. Waiting before retry...")
+                await asyncio.sleep(60)  # Wait 1 minute on rate limit
+                raise
+            else:
+                raise
     
     async def send_scan_results(self, scan_data: Dict):
         """Send scan results to Discord channel"""
         if not self.is_ready or not self.channel:
+            logger.warning("Discord bot not ready, cannot send results")
             return False
             
         try:
@@ -254,7 +288,15 @@ class DiscordBot:
                     account_embed.description = account_text
                     await self.channel.send(embed=account_embed)
             
+            logger.info(f"✅ Scan results sent to Discord for {scan_data['username']}")
             return True
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                logger.error("Rate limited by Discord. Waiting before next message...")
+                await asyncio.sleep(10)
+            else:
+                logger.error(f"Error sending to Discord: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error sending to Discord: {e}")
             return False
@@ -281,7 +323,7 @@ async def root():
     return {
         "service": "R6X CYBERSCAN API",
         "status": "online",
-        "bot_status": "connected" if discord_bot.is_ready else "starting",
+        "bot_status": "connected" if discord_bot.is_ready else "connecting",
         "version": "4.0.0"
     }
 
@@ -335,16 +377,19 @@ async def get_history(username: str, limit: int = 10):
     
     # Parse JSON fields for response
     for scan in scans:
-        if scan.get("r6_accounts"):
-            scan["r6_accounts"] = json.loads(scan["r6_accounts"])
-        if scan.get("steam_accounts"):
-            scan["steam_accounts"] = json.loads(scan["steam_accounts"])
-        if scan.get("suspicious_files"):
-            scan["suspicious_files"] = json.loads(scan["suspicious_files"])
-        if scan.get("prefetch_files"):
-            scan["prefetch_files"] = json.loads(scan["prefetch_files"])
-        if scan.get("logitech_scripts"):
-            scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
+        try:
+            if scan.get("r6_accounts"):
+                scan["r6_accounts"] = json.loads(scan["r6_accounts"])
+            if scan.get("steam_accounts"):
+                scan["steam_accounts"] = json.loads(scan["steam_accounts"])
+            if scan.get("suspicious_files"):
+                scan["suspicious_files"] = json.loads(scan["suspicious_files"])
+            if scan.get("prefetch_files"):
+                scan["prefetch_files"] = json.loads(scan["prefetch_files"])
+            if scan.get("logitech_scripts"):
+                scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
+        except:
+            pass
     
     return {"scans": scans}
 
@@ -359,21 +404,24 @@ async def get_latest_scan(username: str):
         .execute()
     
     if not result.data or len(result.data) == 0:
-        raise HTTPException(404, "No scans found for this user")
+        raise HTTPException(status_code=404, detail="No scans found for this user")
     
     scan = result.data[0]
     
     # Parse JSON fields
-    if scan.get("r6_accounts"):
-        scan["r6_accounts"] = json.loads(scan["r6_accounts"])
-    if scan.get("steam_accounts"):
-        scan["steam_accounts"] = json.loads(scan["steam_accounts"])
-    if scan.get("suspicious_files"):
-        scan["suspicious_files"] = json.loads(scan["suspicious_files"])
-    if scan.get("prefetch_files"):
-        scan["prefetch_files"] = json.loads(scan["prefetch_files"])
-    if scan.get("logitech_scripts"):
-        scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
+    try:
+        if scan.get("r6_accounts"):
+            scan["r6_accounts"] = json.loads(scan["r6_accounts"])
+        if scan.get("steam_accounts"):
+            scan["steam_accounts"] = json.loads(scan["steam_accounts"])
+        if scan.get("suspicious_files"):
+            scan["suspicious_files"] = json.loads(scan["suspicious_files"])
+        if scan.get("prefetch_files"):
+            scan["prefetch_files"] = json.loads(scan["prefetch_files"])
+        if scan.get("logitech_scripts"):
+            scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
+    except:
+        pass
     
     return scan
 
@@ -400,7 +448,7 @@ async def get_stats():
         "total_scans": scans_result.count if hasattr(scans_result, 'count') else 0,
         "unique_users": len(unique_users),
         "total_threats": total_threats,
-        "bot_status": "connected" if discord_bot.is_ready else "starting"
+        "bot_status": "connected" if discord_bot.is_ready else "connecting"
     }
 
 # ========== STARTUP ==========
@@ -408,9 +456,19 @@ async def get_stats():
 async def startup():
     logger.info("🚀 R6X CYBERSCAN Backend starting...")
     
+    # Test Supabase connection
+    try:
+        test = supabase.table("scans").select("*").limit(1).execute()
+        logger.info("✅ Supabase connected")
+    except Exception as e:
+        logger.error(f"❌ Supabase connection failed: {e}")
+    
     # Start Discord bot
-    discord_bot.start()
-    logger.info("✅ Discord bot starting...")
+    if config.DISCORD_BOT_TOKEN and config.DISCORD_CHANNEL_ID:
+        discord_bot.start()
+        logger.info("✅ Discord bot starting...")
+    else:
+        logger.warning("⚠️ Discord bot not configured - check environment variables")
 
 @app.on_event("shutdown")
 async def shutdown():
