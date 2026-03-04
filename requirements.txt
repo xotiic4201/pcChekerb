@@ -1,9 +1,10 @@
-# requirements.txt - Latest compatible versions
-
-fastapi==0.115.12
-uvicorn[standard]==0.34.0
-supabase
-discord.py==2.5.0
-python-dotenv==1.1.0
-pydantic==2.11.3
-httpx==0.28.1  # Works with latest supabase
+discord.py==2.3.2
+flask==3.0.0
+python-dotenv==1.0.0
+aiohttp==3.9.1
+requests==2.31.0
+pillow==10.1.0
+io
+json
+asyncio
+datetime
