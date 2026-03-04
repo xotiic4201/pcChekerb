@@ -996,7 +996,7 @@ async def send_summary(channel, data, user_mention, scan_id):
 def run_fastapi():
     """Run FastAPI server"""
     port = int(os.getenv('PORT', 5000))
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
+    uvicorn backend:app --host 0.0.0.0 --port $PORT)
 
 async def run_bot():
     """Run Discord bot"""
@@ -1013,4 +1013,5 @@ if __name__ == "__main__":
     
     # Run Discord bot
     run_bot_sync()
+
 
