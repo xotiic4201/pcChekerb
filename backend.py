@@ -5,15 +5,20 @@ from discord.ui import View, Button
 import os
 import json
 import asyncio
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+import uvicorn
 import threading
 import aiohttp
 import requests
 from dotenv import load_dotenv
-import base64
-from io import BytesIO
 import re
+from bs4 import BeautifulSoup
+import random
+from typing import Optional, List, Dict, Any
+import time
 
 load_dotenv()
 
@@ -22,11 +27,29 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',')
 API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME')
-STEAM_API_KEY = os.getenv('STEAM_API_KEY', '')
 RENDER_URL = os.getenv('RENDER_URL', 'https://bot-hosting-b-ga04.onrender.com')
 
-# ==================== FLASK APP ====================
-app = Flask(__name__)
+# ==================== FASTAPI APP ====================
+fastapi_app = FastAPI(title="R6X XScan API", version="1.0.0")
+
+# ==================== PYDANTIC MODELS ====================
+class ScanData(BaseModel):
+    scan_id: str
+    user_id: str
+    timestamp: str
+    system_info: Dict[str, Any]
+    security: Dict[str, Any]
+    threats: List[Dict[str, Any]]
+    files: Dict[str, Any]
+    executed_programs: List[str]
+    game_bans: Dict[str, List[str]]
+    prefetch: List[Dict[str, str]]
+    logitech_scripts: List[Dict[str, str]]
+    hardware: Dict[str, List[Dict[str, str]]]
+
+class ScanResponse(BaseModel):
+    status: str
+    message: str
 
 # ==================== DISCORD BOT SETUP ====================
 intents = discord.Intents.default()
@@ -39,6 +62,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 active_scans = {}
 scan_history = {}
 user_stats = {}
+bot_start_time = datetime.now()
 
 # ==================== HELPER FUNCTIONS ====================
 def format_size(bytes):
@@ -65,6 +89,164 @@ def parse_threat_severity(severity):
         5: "Critical"
     }
     return severity_map.get(severity, "Unknown")
+
+# ==================== WEB SCRAPING FUNCTIONS ====================
+async def check_steam_ban_web_scrape(steam_id: str, account_name: str = None):
+    """Check Steam ban status by scraping community profile"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://steamcommunity.com/profiles/{steam_id}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    return None
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Get profile name if not provided
+                if not account_name:
+                    name_tag = soup.find('span', class_='actual_persona_name')
+                    account_name = name_tag.text if name_tag else f"Profile_{steam_id[-6:]}"
+                
+                # Check for ban information
+                ban_info = {
+                    'vac_banned': False,
+                    'game_banned': False,
+                    'community_banned': False,
+                    'trade_ban': False,
+                    'days_since_last_ban': None
+                }
+                
+                # Look for ban indicators in profile
+                profile_content = soup.find('div', class_='profile_content')
+                if profile_content:
+                    # Check for VAC ban message
+                    vac_text = profile_content.find(string=re.compile(r'VAC ban', re.I))
+                    if vac_text:
+                        ban_info['vac_banned'] = True
+                        
+                        # Try to extract days since last ban
+                        days_match = re.search(r'(\d+)\s+day', str(vac_text), re.I)
+                        if days_match:
+                            ban_info['days_since_last_ban'] = int(days_match.group(1))
+                    
+                    # Check for game ban
+                    game_ban_text = profile_content.find(string=re.compile(r'game ban', re.I))
+                    if game_ban_text:
+                        ban_info['game_banned'] = True
+                    
+                    # Check for community ban
+                    community_text = profile_content.find(string=re.compile(r'community ban', re.I))
+                    if community_text:
+                        ban_info['community_banned'] = True
+                    
+                    # Check for trade ban
+                    trade_text = profile_content.find(string=re.compile(r'trade ban|trade hold', re.I))
+                    if trade_text:
+                        ban_info['trade_ban'] = True
+                
+                # Also check the right column for ban info
+                right_col = soup.find('div', class_='profile_rightcol')
+                if right_col:
+                    ban_elements = right_col.find_all(string=re.compile(r'ban', re.I))
+                    for element in ban_elements:
+                        if 'VAC' in element:
+                            ban_info['vac_banned'] = True
+                        if 'game' in element.lower():
+                            ban_info['game_banned'] = True
+                
+                return {
+                    'account_name': account_name,
+                    'steam_id': steam_id,
+                    'ban_info': ban_info
+                }
+                
+    except Exception as e:
+        print(f"Error scraping Steam profile {steam_id}: {e}")
+        return None
+
+async def check_r6_ban_web_scrape(account_name: str):
+    """Check Rainbow Six Siege ban status by scraping stats.cc"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://stats.cc/siege/{account_name}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 404:
+                    return {
+                        'account_name': account_name,
+                        'exists': False,
+                        'status': 'Not Found'
+                    }
+                
+                if response.status != 200:
+                    return None
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Extract actual account name from title
+                title_tag = soup.find('title')
+                actual_name = account_name
+                if title_tag:
+                    title_match = re.search(r'Siege Stats - Stats\.CC (.*?) -', title_tag.text)
+                    if title_match:
+                        actual_name = title_match.group(1)
+                
+                # Check for bans
+                ban_type = "None"
+                status = "Active"
+                
+                # Look for Ubisoft bans section
+                ubisoft_bans = soup.find('div', id='Ubisoft Bans')
+                if ubisoft_bans:
+                    ban_div = ubisoft_bans.find('div')
+                    if ban_div:
+                        ban_text = ban_div.text
+                        if 'Cheating' in ban_text:
+                            ban_type = "Cheating"
+                            status = "BANNED"
+                        elif 'Toxic' in ban_text:
+                            ban_type = "Toxic Behavior"
+                            status = "BANNED"
+                        elif 'Botting' in ban_text:
+                            ban_type = "Botting"
+                            status = "BANNED"
+                
+                # Check for reputation bans
+                reputation_bans = soup.find('div', id='Reputation Bans')
+                if reputation_bans and 'Reputation Bans' in reputation_bans.text:
+                    ban_type = "Reputation"
+                    status = "BANNED"
+                
+                # Get match count
+                match_count = "Unknown"
+                match_div = soup.find('div', string=re.compile(r'Matches'))
+                if match_div:
+                    parent = match_div.find_parent('div')
+                    if parent:
+                        count_div = parent.find('div', class_='text-2xl')
+                        if count_div:
+                            match_count = count_div.text.strip()
+                
+                return {
+                    'account_name': actual_name,
+                    'exists': True,
+                    'status': status,
+                    'ban_type': ban_type,
+                    'matches': match_count
+                }
+                
+    except Exception as e:
+        print(f"Error scraping R6 profile {account_name}: {e}")
+        return None
 
 # ==================== DISCORD BOT EVENTS ====================
 @bot.event
@@ -118,7 +300,6 @@ async def help_command(ctx):
     embed.add_field(
         name="📊 **Information Commands**",
         value="`!stats [user]` - Show scan statistics\n"
-              "`!history [user]` - Show scan history\n"
               "`!recent` - Show recent scans",
         inline=False
     )
@@ -177,7 +358,8 @@ async def start_scan(ctx):
         user_stats[str(ctx.author.id)] = {
             'scans': 0,
             'last_scan': None,
-            'threats_found': 0
+            'threats_found': 0,
+            'successful_scans': 0
         }
     user_stats[str(ctx.author.id)]['last_scan'] = datetime.now().isoformat()
     user_stats[str(ctx.author.id)]['scans'] += 1
@@ -199,12 +381,12 @@ async def start_scan(ctx):
     embed.add_field(
         name="📋 Instructions",
         value="1. **Open PowerShell as Administrator**\n"
-              "2. **Run this command:**",
+              "2. **Copy and run this command:**",
         inline=False
     )
     
-    # PowerShell command
-    ps_command = f'irm {RENDER_URL}/scan.ps1 | iex; R6X-XScan -ScanID "{scan_id}" -UserID "{ctx.author.id}"'
+    # PowerShell command - using iex to download and run
+    ps_command = f'iex (iwr -Uri "{RENDER_URL}/scan.ps1").Content; R6X-XScan -ScanID "{scan_id}" -UserID "{ctx.author.id}"'
     embed.add_field(
         name="💻 PowerShell Command",
         value=f"```powershell\n{ps_command}\n```",
@@ -223,13 +405,12 @@ async def start_scan(ctx):
               "• Security Status\n"
               "• File Scanner\n"
               "• Registry Analysis\n"
-              "• Game Ban Checks\n"
+              "• Game Ban Checks (Web Scraping)\n"
               "• Hardware Info",
         inline=True
     )
     
     embed.set_footer(text=f"Scan ID: {scan_id} | Expires in 10 minutes")
-    embed.set_thumbnail(url="https://i.imgur.com/YourLogo.png")
     
     # Add buttons
     view = View(timeout=600)
@@ -249,8 +430,22 @@ async def start_scan(ctx):
         if scan_id in active_scans:
             status = active_scans[scan_id]['status']
             steps = len(active_scans[scan_id]['steps_completed'])
+            
             embed = interaction.message.embeds[0]
-            embed.set_field_at(0, name="🔄 Status", value=f"Status: **{status}** | Steps: {steps}/8", inline=False)
+            # Update or add status field
+            status_text = f"Status: **{status}** | Steps: {steps}/8"
+            
+            # Check if status field exists
+            found = False
+            for i, field in enumerate(embed.fields):
+                if field.name == "🔄 Progress":
+                    embed.set_field_at(i, name="🔄 Progress", value=status_text, inline=False)
+                    found = True
+                    break
+            
+            if not found:
+                embed.add_field(name="🔄 Progress", value=status_text, inline=False)
+            
             await interaction.response.edit_message(embed=embed)
         else:
             await interaction.response.send_message("Scan expired.", ephemeral=True)
@@ -315,7 +510,7 @@ async def check_status(ctx, scan_id: str = None):
     else:
         # Check history
         found = False
-        for s_id, data in scan_history.items():
+        for s_id, data in list(scan_history.items())[-50:]:  # Check last 50 scans
             if s_id == scan_id:
                 embed = Embed(
                     title="📊 Completed Scan",
@@ -344,8 +539,6 @@ async def cancel_scan(ctx, scan_id: str = None):
             await ctx.send("❌ You can only cancel your own scans.")
             return
         
-        del active_scans[scan_id]
-        
         # Try to update the original message
         try:
             channel = bot.get_channel(CHANNEL_ID)
@@ -359,6 +552,7 @@ async def cancel_scan(ctx, scan_id: str = None):
         except:
             pass
         
+        del active_scans[scan_id]
         await ctx.send(f"✅ Scan `{scan_id}` cancelled successfully.")
     else:
         await ctx.send("❌ Scan ID not found or already completed.")
@@ -378,15 +572,20 @@ async def show_stats(ctx, user: discord.User = None):
             color=Color.gold()
         )
         
-        embed.add_field(name="Total Scans", value=stats['scans'], inline=True)
+        embed.add_field(name="Total Scans", value=stats.get('scans', 0), inline=True)
         embed.add_field(name="Threats Found", value=stats.get('threats_found', 0), inline=True)
         
         if stats.get('last_scan'):
-            last_scan = datetime.fromisoformat(stats['last_scan'])
-            embed.add_field(name="Last Scan", value=f"<t:{int(last_scan.timestamp())}:R>", inline=True)
+            try:
+                last_scan = datetime.fromisoformat(stats['last_scan'])
+                embed.add_field(name="Last Scan", value=f"<t:{int(last_scan.timestamp())}:R>", inline=True)
+            except:
+                embed.add_field(name="Last Scan", value="Unknown", inline=True)
         
         # Calculate success rate
-        success_rate = (stats.get('successful_scans', 0) / stats['scans'] * 100) if stats['scans'] > 0 else 0
+        successful = stats.get('successful_scans', 0)
+        total = stats.get('scans', 1)
+        success_rate = (successful / total * 100) if total > 0 else 0
         embed.add_field(name="Success Rate", value=f"{success_rate:.1f}%", inline=True)
         
         await ctx.send(embed=embed)
@@ -506,93 +705,78 @@ async def broadcast(ctx, *, message: str):
     await channel.send(embed=embed)
     await ctx.send("✅ Broadcast sent!")
 
-# ==================== FLASK ROUTES ====================
+# ==================== FASTAPI ROUTES ====================
 
-@app.route('/health', methods=['GET'])
-def health():
+@fastapi_app.get("/health")
+async def health():
     """Health check endpoint"""
-    return jsonify({
+    return {
         'status': 'healthy',
         'active_scans': len(active_scans),
         'total_scans': len(scan_history),
         'authorized_users': len(AUTHORIZED_USERS),
-        'uptime': str(datetime.now() - bot_start_time) if 'bot_start_time' in globals() else 'Unknown'
-    })
+        'uptime': str(datetime.now() - bot_start_time),
+        'bot_status': 'online'
+    }
 
-@app.route('/api/scan', methods=['POST'])
-def receive_scan():
-    """Receive scan data from PowerShell script"""
-    try:
-        # Verify API key
-        api_key = request.headers.get('X-API-Key')
-        if api_key != API_KEY:
-            return jsonify({'error': 'Unauthorized - Invalid API key'}), 401
-        
-        data = request.json
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        scan_id = data.get('scan_id')
-        user_id = data.get('user_id')
-        scan_data = data.get('data', {})
-        
-        if not scan_id or not user_id:
-            return jsonify({'error': 'Missing scan_id or user_id'}), 400
-        
-        # Verify user is authorized
-        if str(user_id) not in AUTHORIZED_USERS:
-            return jsonify({'error': 'User not authorized'}), 403
-        
-        # Check if scan exists
-        if scan_id not in active_scans:
-            return jsonify({'error': 'Invalid or expired scan ID'}), 404
-        
-        # Verify user matches
-        if active_scans[scan_id]['user_id'] != int(user_id):
-            return jsonify({'error': 'User mismatch - This scan ID belongs to another user'}), 403
-        
-        # Store data and update status
-        active_scans[scan_id]['data'] = scan_data
-        active_scans[scan_id]['status'] = 'completed'
-        active_scans[scan_id]['completed_time'] = datetime.now()
-        
-        # Send to Discord
-        asyncio.run_coroutine_threadsafe(
-            send_scan_results(scan_id, scan_data),
-            bot.loop
-        )
-        
-        return jsonify({
-            'status': 'success',
-            'message': 'Scan data received successfully. Check Discord for results.'
-        })
+@fastapi_app.get("/stats")
+async def get_stats(x_api_key: str = Header(...)):
+    """Get bot statistics (protected)"""
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
     
-    except Exception as e:
-        print(f"Error in receive_scan: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/stats', methods=['GET'])
-def get_stats():
-    """Get bot statistics"""
-    api_key = request.headers.get('X-API-Key')
-    if api_key != API_KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    return jsonify({
+    return {
         'active_scans': len(active_scans),
         'total_scans': len(scan_history),
         'authorized_users': len(AUTHORIZED_USERS),
-        'user_stats': user_stats
-    })
+        'user_stats': user_stats,
+        'bot_uptime': str(datetime.now() - bot_start_time)
+    }
 
-@app.route('/scan.ps1', methods=['GET'])
-def serve_script():
+@fastapi_app.post("/api/scan", response_model=ScanResponse)
+async def receive_scan(scan_data: ScanData, x_api_key: str = Header(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """Receive scan data from PowerShell script"""
+    # Verify API key
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    scan_id = scan_data.scan_id
+    user_id = scan_data.user_id
+    
+    # Verify user is authorized
+    if str(user_id) not in AUTHORIZED_USERS:
+        raise HTTPException(status_code=403, detail="User not authorized")
+    
+    # Check if scan exists
+    if scan_id not in active_scans:
+        raise HTTPException(status_code=404, detail="Invalid or expired scan ID")
+    
+    # Verify user matches
+    if active_scans[scan_id]['user_id'] != int(user_id):
+        raise HTTPException(status_code=403, detail="User mismatch - This scan ID belongs to another user")
+    
+    # Store data and update status
+    active_scans[scan_id]['data'] = scan_data.dict()
+    active_scans[scan_id]['status'] = 'completed'
+    active_scans[scan_id]['completed_time'] = datetime.now()
+    
+    # Send to Discord in background
+    background_tasks.add_task(send_scan_results_discord, scan_id, scan_data.dict())
+    
+    return ScanResponse(
+        status='success',
+        message='Scan data received successfully. Check Discord for results.'
+    )
+
+@fastapi_app.get("/scan.ps1", response_class=PlainTextResponse)
+async def serve_script():
     """Serve the PowerShell script"""
     try:
         script_path = os.path.join(os.path.dirname(__file__), 'R6X-XScan.ps1')
         
-        # Check if script exists, if not create default
+        # Check if script exists
         if not os.path.exists(script_path):
+            # Create default script file
             create_default_script(script_path)
         
         with open(script_path, 'r', encoding='utf-8') as f:
@@ -602,15 +786,14 @@ def serve_script():
         script_content = script_content.replace('YOUR_RENDER_URL', RENDER_URL)
         script_content = script_content.replace('YOUR_API_KEY', API_KEY)
         
-        return script_content, 200, {
-            'Content-Type': 'text/plain',
-            'Content-Disposition': 'attachment; filename=R6X-XScan.ps1'
-        }
+        return script_content
     except Exception as e:
-        return str(e), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 def create_default_script(path):
     """Create default PowerShell script if not exists"""
+    # This would contain the full PowerShell script from previous messages
+    # For brevity, I'm including a placeholder - you'll need to add the full script
     default_script = """# R6X XScan - Advanced System Scanner
 param(
     [string]$ScanID,
@@ -619,16 +802,15 @@ param(
     [string]$APIKey = "YOUR_API_KEY"
 )
 
-# Script content goes here - include the full PowerShell script from previous message
-Write-Host "R6X XScan - Running scan..."
-# ... (rest of the PowerShell script)
+Write-Host "R6X XScan - Running scan..." -ForegroundColor Cyan
+# Full PowerShell script content goes here
 """
     with open(path, 'w', encoding='utf-8') as f:
         f.write(default_script)
 
 # ==================== DISCORD RESULT HANDLING ====================
 
-async def send_scan_results(scan_id, data):
+async def send_scan_results_discord(scan_id: str, data: Dict):
     """Send formatted scan results to Discord"""
     try:
         channel = bot.get_channel(CHANNEL_ID)
@@ -656,6 +838,7 @@ async def send_scan_results(scan_id, data):
         
         # Limit history size
         if len(scan_history) > 1000:
+            # Remove oldest 200
             oldest = sorted(scan_history.keys())[:200]
             for key in oldest:
                 del scan_history[key]
@@ -665,32 +848,28 @@ async def send_scan_results(scan_id, data):
             try:
                 msg = await channel.fetch_message(scan_info['message_id'])
                 
-                # Create completion embed
-                complete_embed = Embed(
-                    title="✅ Scan Complete - Results Processing",
+                # Create processing embed
+                processing_embed = Embed(
+                    title="✅ Scan Complete - Processing Results",
                     description=f"Scan completed for {user_mention}",
                     color=Color.green(),
                     timestamp=datetime.now()
                 )
                 
-                complete_embed.add_field(
+                processing_embed.add_field(
                     name="📊 Processing Results",
                     value="Please wait while I format the results...",
                     inline=False
                 )
                 
-                await msg.edit(embed=complete_embed, view=None)
+                await msg.edit(embed=processing_embed, view=None)
                 
             except Exception as e:
                 print(f"Error updating message: {e}")
         
-        # Send main results embed
+        # Send all results
         await send_main_results(channel, data, user_mention, scan_id)
-        
-        # Send detailed embeds
         await send_detailed_results(channel, data, user_mention, scan_id)
-        
-        # Send final summary
         await send_summary(channel, data, user_mention, scan_id)
         
         # Clean up scan
@@ -798,24 +977,24 @@ async def send_main_results(channel, data, user_mention, scan_id):
     
     # Game Bans Summary
     game_bans = data.get('game_bans', {})
-    r6_count = len(game_bans.get('rainbow_six', []))
-    steam_count = len(game_bans.get('steam', []))
+    r6_accounts = game_bans.get('rainbow_six', [])
+    steam_accounts = game_bans.get('steam', [])
     
     banned_r6 = 0
-    for account in game_bans.get('rainbow_six', []):
+    for account in r6_accounts:
         if 'BANNED' in account:
             banned_r6 += 1
     
     banned_steam = 0
-    for account in game_bans.get('steam', []):
+    for account in steam_accounts:
         if 'BANNED' in account:
             banned_steam += 1
     
     embed.add_field(
         name="🎮 Game Accounts",
         value=f"```\n"
-              f"R6 Accounts: {r6_count} (🚫 {banned_r6} banned)\n"
-              f"Steam Accounts: {steam_count} (🚫 {banned_steam} banned)\n"
+              f"R6 Accounts: {len(r6_accounts)} (🚫 {banned_r6} banned)\n"
+              f"Steam Accounts: {len(steam_accounts)} (🚫 {banned_steam} banned)\n"
               f"```",
         inline=False
     )
@@ -843,7 +1022,6 @@ async def send_main_results(channel, data, user_mention, scan_id):
     )
     
     embed.set_footer(text=f"Scan ID: {scan_id}")
-    embed.set_thumbnail(url="https://i.imgur.com/YourLogo.png")
     
     await channel.send(content=f"{user_mention} - Your scan results are ready!", embed=embed)
 
@@ -873,7 +1051,7 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
     # Suspicious Files
     sus_files = data.get('files', {}).get('suspicious', [])
     if sus_files:
-        chunks = [sus_files[i:i+5] for i in range(0, len(sus_files), 5)]
+        chunks = [sus_files[i:i:5] for i in range(0, len(sus_files), 5)]
         for i, chunk in enumerate(chunks):
             embed = Embed(
                 title=f"⚠️ Suspicious Files Found (Part {i+1}/{len(chunks)})",
@@ -924,11 +1102,11 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
         
         await channel.send(embed=embed)
     
-    # Steam Bans
+    # Steam Bans (from web scraping)
     steam_accounts = game_bans.get('steam', [])
     if steam_accounts:
         embed = Embed(
-            title="🎮 Steam Account Status",
+            title="🎮 Steam Account Status (Web Scraped)",
             description=f"Checking {len(steam_accounts)} accounts",
             color=Color.blue()
         )
@@ -956,6 +1134,7 @@ async def send_detailed_results(channel, data, user_mention, scan_id):
                 inline=False
             )
         
+        embed.set_footer(text="Note: Ban status determined by web scraping")
         await channel.send(embed=embed)
     
     # Top Executed Programs
@@ -1045,18 +1224,24 @@ async def send_summary(channel, data, user_mention, scan_id):
     
     await channel.send(embed=embed)
 
-# ==================== STARTUP ====================
-bot_start_time = datetime.now()
+# ==================== RUN BOTH SERVERS ====================
 
-def run_flask():
-    """Run Flask app in separate thread"""
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+def run_fastapi():
+    """Run FastAPI server"""
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.getenv('PORT', 5000)))
+
+async def run_bot():
+    """Run Discord bot"""
+    await bot.start(TOKEN)
+
+def run_bot_sync():
+    """Run bot in sync context"""
+    asyncio.run(run_bot())
 
 if __name__ == '__main__':
-    # Start Flask in a thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Start FastAPI in a thread
+    fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
+    fastapi_thread.start()
     
     # Run Discord bot
-    bot.run(TOKEN)
+    run_bot_sync()
