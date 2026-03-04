@@ -1,4 +1,4 @@
-# backend.py - R6X CYBERSCAN Production Backend with Fixed Discord Integration
+# backend.py - R6X CYBERSCAN Production Backend
 # Deploy this on Render.com
 
 import os
@@ -8,7 +8,7 @@ import datetime
 import asyncio
 import uuid
 import json
-import threading  # <-- This was missing!
+import threading
 import traceback
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
@@ -20,9 +20,14 @@ import logging
 from datetime import datetime, timedelta
 import secrets
 
-# Discord imports
-import discord
-from discord.ext import commands
+# Discord imports - make them optional
+try:
+    import discord
+    from discord.ext import commands
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+    print("⚠️ Discord.py not installed - bot features disabled")
 
 # Configuration
 class Config:
@@ -44,7 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("r6x-backend")
 
-# Database setup
+# Database setup - FIXED: removed await from top level
 try:
     logger.info(f"Connecting to MongoDB...")
     client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGODB_URL)
@@ -57,11 +62,9 @@ try:
     bots_collection = db["discord_bots"]
     threats_collection = db["threats"]
     
-    # Test connection
-    await client.admin.command('ping')
-    logger.info("✅ Connected to MongoDB Atlas successfully")
+    logger.info("✅ MongoDB client created successfully")
 except Exception as e:
-    logger.error(f"❌ Failed to connect to MongoDB: {e}")
+    logger.error(f"❌ Failed to create MongoDB client: {e}")
     raise
 
 # Pydantic models
@@ -74,6 +77,10 @@ class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     password: str = Field(..., min_length=8)
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
 
 class ScanResult(BaseModel):
     name: str
@@ -99,291 +106,309 @@ class RoleUpdate(BaseModel):
     username: str
     role: str
 
-# Discord Bot Manager - Fixed with proper threading import
-class DiscordBotManager:
-    def __init__(self):
-        self.bots = {}  # user_id -> bot instance
-        self.bot_tasks = {}  # user_id -> task
-        self.loop = None
-        self.thread = None
-        self._start_loop()
-        logger.info("✅ Discord Bot Manager initialized")
-        
-    def _start_loop(self):
-        """Start the asyncio event loop in a separate thread"""
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
-        logger.info("✅ Discord bot loop started in thread")
-        
-    def _run_loop(self):
-        """Run the asyncio event loop"""
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-        
-    async def start_bot(self, token: str, channel_id: str, user_id: str):
-        """Start a Discord bot instance for a user"""
-        try:
-            bot_id = str(uuid.uuid4())
+# Discord Bot Manager (only if discord is available)
+if DISCORD_AVAILABLE:
+    class DiscordBotManager:
+        def __init__(self):
+            self.bots = {}  # user_id -> bot instance
+            self.bot_tasks = {}  # user_id -> task
+            self.loop = None
+            self.thread = None
+            self._start_loop()
+            logger.info("✅ Discord Bot Manager initialized")
             
-            # Configure bot intents
-            intents = discord.Intents.default()
-            intents.message_content = True
-            intents.guilds = True
+        def _start_loop(self):
+            """Start the asyncio event loop in a separate thread"""
+            self.loop = asyncio.new_event_loop()
+            self.thread = threading.Thread(target=self._run_loop, daemon=True)
+            self.thread.start()
+            logger.info("✅ Discord bot loop started in thread")
             
-            bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+        def _run_loop(self):
+            """Run the asyncio event loop"""
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_forever()
             
-            @bot.event
-            async def on_ready():
-                logger.info(f"✅ Bot {bot.user} connected for user {user_id}")
+        async def start_bot(self, token: str, channel_id: str, user_id: str):
+            """Start a Discord bot instance for a user"""
+            try:
+                bot_id = str(uuid.uuid4())
                 
-                # Get the channel
-                channel = None
-                for guild in bot.guilds:
-                    channel = guild.get_channel(int(channel_id))
-                    if channel:
-                        break
+                # Configure bot intents
+                intents = discord.Intents.default()
+                intents.message_content = True
+                intents.guilds = True
+                
+                bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+                
+                @bot.event
+                async def on_ready():
+                    logger.info(f"✅ Bot {bot.user} connected for user {user_id}")
+                    
+                    # Get the channel
+                    channel = None
+                    for guild in bot.guilds:
+                        channel = guild.get_channel(int(channel_id))
+                        if channel:
+                            break
+                    
+                    if not channel:
+                        try:
+                            channel = await bot.fetch_channel(int(channel_id))
+                        except:
+                            logger.error(f"Could not find channel {channel_id}")
+                            return
+                    
+                    # Send connection success message
+                    embed = discord.Embed(
+                        title="🤖 R6X Bot Connected",
+                        description="Your security scanner bot is now active!",
+                        color=0x00FF9D,
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Status", value="🟢 Online", inline=True)
+                    embed.add_field(name="Commands", value="!scan, !status, !help", inline=True)
+                    embed.set_footer(text="R6X CyberScan")
+                    
+                    await channel.send(embed=embed)
+                    
+                    # Store bot info in database
+                    await bots_collection.update_one(
+                        {"user_id": user_id},
+                        {"$set": {
+                            "bot_id": bot_id,
+                            "token_preview": token[:10] + "...",
+                            "channel_id": channel_id,
+                            "bot_name": str(bot.user),
+                            "status": "connected",
+                            "connected_at": datetime.utcnow()
+                        }},
+                        upsert=True
+                    )
+                    
+                @bot.event
+                async def on_command_error(ctx, error):
+                    if isinstance(error, commands.CommandNotFound):
+                        return
+                    logger.error(f"Bot error for user {user_id}: {error}")
+                    await ctx.send(f"❌ Error: {str(error)}")
+                    
+                @bot.command(name='scan')
+                async def scan_command(ctx):
+                    """Get latest scan results"""
+                    if str(ctx.channel.id) != channel_id:
+                        return
+                    
+                    # Get latest scan for user
+                    latest_scan = await scans_collection.find_one(
+                        {"user_id": user_id},
+                        sort=[("created_at", -1)]
+                    )
+                    
+                    if latest_scan:
+                        color = 0x00FF9D if latest_scan['threats_found'] == 0 else 0xFF003C
+                        
+                        embed = discord.Embed(
+                            title="📊 Latest Scan Results",
+                            description=f"Scan: {latest_scan['name']}",
+                            color=color,
+                            timestamp=latest_scan['created_at']
+                        )
+                        embed.add_field(name="Files Scanned", value=str(latest_scan['files_scanned']), inline=True)
+                        embed.add_field(name="Threats Found", value=str(latest_scan['threats_found']), inline=True)
+                        embed.add_field(name="Duration", value=f"{latest_scan['scan_duration']:.2f}s", inline=True)
+                        
+                        if latest_scan.get('r6_accounts'):
+                            embed.add_field(name="R6 Accounts", value=str(len(latest_scan['r6_accounts'])), inline=True)
+                        
+                        if latest_scan.get('steam_accounts'):
+                            embed.add_field(name="Steam Accounts", value=str(len(latest_scan['steam_accounts'])), inline=True)
+                        
+                        embed.set_footer(text=f"User: {latest_scan['username']}")
+                        await ctx.send(embed=embed)
+                    else:
+                        await ctx.send("📭 No scans found for your account")
+                        
+                @bot.command(name='help')
+                async def help_command(ctx):
+                    """Show available commands"""
+                    if str(ctx.channel.id) != channel_id:
+                        return
+                        
+                    embed = discord.Embed(
+                        title="🤖 R6X Bot Commands",
+                        description="Available commands for this channel",
+                        color=0x5865F2
+                    )
+                    embed.add_field(name="!scan", value="Get your latest scan results", inline=False)
+                    embed.add_field(name="!status", value="Check bot status", inline=False)
+                    embed.add_field(name="!help", value="Show this message", inline=False)
+                    embed.set_footer(text="R6X CyberScan v4.0")
+                    
+                    await ctx.send(embed=embed)
+                    
+                @bot.command(name='status')
+                async def status_command(ctx):
+                    """Check bot status"""
+                    if str(ctx.channel.id) != channel_id:
+                        return
+                        
+                    embed = discord.Embed(
+                        title="🟢 Bot Status",
+                        description="R6X CyberScan Bot is operational",
+                        color=0x00FF9D
+                    )
+                    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+                    embed.add_field(name="Connected Since", value=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+                    
+                    await ctx.send(embed=embed)
+                
+                # Start the bot in the event loop
+                future = asyncio.run_coroutine_threadsafe(bot.start(token), self.loop)
+                self.bot_tasks[user_id] = future
+                self.bots[user_id] = {
+                    "bot": bot,
+                    "channel_id": channel_id,
+                    "bot_id": bot_id
+                }
+                
+                return bot_id
+                
+            except Exception as e:
+                logger.error(f"Failed to start bot for user {user_id}: {e}")
+                logger.error(traceback.format_exc())
+                raise
+                
+        async def send_scan_results(self, user_id: str, channel_id: str, scan_data: Dict):
+            """Send scan results to Discord"""
+            if user_id not in self.bots:
+                logger.error(f"No bot found for user {user_id}")
+                return False
+                
+            try:
+                bot_data = self.bots[user_id]
+                bot = bot_data["bot"]
+                
+                # Find the channel
+                channel = bot.get_channel(int(channel_id))
+                if not channel:
+                    for guild in bot.guilds:
+                        channel = guild.get_channel(int(channel_id))
+                        if channel:
+                            break
                 
                 if not channel:
-                    try:
-                        channel = await bot.fetch_channel(int(channel_id))
-                    except:
-                        logger.error(f"Could not find channel {channel_id}")
-                        return
+                    logger.error(f"Channel {channel_id} not found for user {user_id}")
+                    return False
                 
-                # Send connection success message
-                embed = discord.Embed(
-                    title="🤖 R6X Bot Connected",
-                    description="Your security scanner bot is now active!",
-                    color=0x00FF9D,
+                # Create main embed
+                color = 0x00FF9D if scan_data.get('threats_found', 0) == 0 else 0xFF003C
+                
+                main_embed = discord.Embed(
+                    title=f"📊 Scan Complete: {scan_data.get('name', 'Unknown')}",
+                    description=f"Security scan finished at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
+                    color=color,
                     timestamp=datetime.utcnow()
                 )
-                embed.add_field(name="Status", value="🟢 Online", inline=True)
-                embed.add_field(name="Commands", value="!scan, !status, !help", inline=True)
-                embed.set_footer(text="R6X CyberScan")
                 
-                await channel.send(embed=embed)
+                # Statistics
+                main_embed.add_field(name="📁 Files Scanned", value=str(scan_data.get('files_scanned', 0)), inline=True)
+                main_embed.add_field(name="🚨 Threats Found", value=str(scan_data.get('threats_found', 0)), inline=True)
+                main_embed.add_field(name="⏱️ Duration", value=f"{scan_data.get('scan_duration', 0):.2f}s", inline=True)
                 
-                # Store bot info in database
-                await bots_collection.update_one(
-                    {"user_id": user_id},
-                    {"$set": {
-                        "bot_id": bot_id,
-                        "token_preview": token[:10] + "...",
-                        "channel_id": channel_id,
-                        "bot_name": str(bot.user),
-                        "status": "connected",
-                        "connected_at": datetime.utcnow()
-                    }},
-                    upsert=True
-                )
+                # Account info
+                r6_count = len(scan_data.get('r6_accounts', []))
+                steam_count = len(scan_data.get('steam_accounts', []))
+                main_embed.add_field(name="🎮 R6 Accounts", value=str(r6_count), inline=True)
+                main_embed.add_field(name="🔄 Steam Accounts", value=str(steam_count), inline=True)
                 
-            @bot.event
-            async def on_command_error(ctx, error):
-                if isinstance(error, commands.CommandNotFound):
-                    return
-                logger.error(f"Bot error for user {user_id}: {error}")
-                await ctx.send(f"❌ Error: {str(error)}")
+                # System info
+                if scan_data.get('system_info'):
+                    sys_info = scan_data['system_info']
+                    main_embed.add_field(name="💻 System", value=sys_info.get('computer_name', 'Unknown'), inline=True)
+                    main_embed.add_field(name="👤 User", value=sys_info.get('user_name', 'Unknown'), inline=True)
                 
-            @bot.command(name='scan')
-            async def scan_command(ctx):
-                """Get latest scan results"""
-                if str(ctx.channel.id) != channel_id:
-                    return
+                main_embed.set_footer(text="R6X CyberScan v4.0")
                 
-                # Get latest scan for user
-                latest_scan = await scans_collection.find_one(
-                    {"user_id": user_id},
-                    sort=[("created_at", -1)]
-                )
+                await channel.send(embed=main_embed)
                 
-                if latest_scan:
-                    color = 0x00FF9D if latest_scan['threats_found'] == 0 else 0xFF003C
-                    
-                    embed = discord.Embed(
-                        title="📊 Latest Scan Results",
-                        description=f"Scan: {latest_scan['name']}",
-                        color=color,
-                        timestamp=latest_scan['created_at']
+                # Send threats if any
+                if scan_data.get('threats_found', 0) > 0 and scan_data.get('suspicious_files'):
+                    threat_embed = discord.Embed(
+                        title="⚠️ Detected Threats",
+                        color=0xFF003C
                     )
-                    embed.add_field(name="Files Scanned", value=str(latest_scan['files_scanned']), inline=True)
-                    embed.add_field(name="Threats Found", value=str(latest_scan['threats_found']), inline=True)
-                    embed.add_field(name="Duration", value=f"{latest_scan['scan_duration']:.2f}s", inline=True)
                     
-                    if latest_scan.get('r6_accounts'):
-                        embed.add_field(name="R6 Accounts", value=str(len(latest_scan['r6_accounts'])), inline=True)
+                    threat_list = ""
+                    for threat in scan_data['suspicious_files'][:10]:
+                        threat_list += f"• **{threat.get('name', 'Unknown')}** - Severity: {threat.get('severity', 'MEDIUM')}\n"
                     
-                    if latest_scan.get('steam_accounts'):
-                        embed.add_field(name="Steam Accounts", value=str(len(latest_scan['steam_accounts'])), inline=True)
-                    
-                    embed.set_footer(text=f"User: {latest_scan['username']}")
-                    await ctx.send(embed=embed)
-                else:
-                    await ctx.send("📭 No scans found for your account")
-                    
-            @bot.command(name='help')
-            async def help_command(ctx):
-                """Show available commands"""
-                if str(ctx.channel.id) != channel_id:
-                    return
-                    
-                embed = discord.Embed(
-                    title="🤖 R6X Bot Commands",
-                    description="Available commands for this channel",
-                    color=0x5865F2
-                )
-                embed.add_field(name="!scan", value="Get your latest scan results", inline=False)
-                embed.add_field(name="!status", value="Check bot status", inline=False)
-                embed.add_field(name="!help", value="Show this message", inline=False)
-                embed.set_footer(text="R6X CyberScan v4.0")
+                    if threat_list:
+                        threat_embed.description = threat_list
+                        await channel.send(embed=threat_embed)
                 
-                await ctx.send(embed=embed)
-                
-            @bot.command(name='status')
-            async def status_command(ctx):
-                """Check bot status"""
-                if str(ctx.channel.id) != channel_id:
-                    return
-                    
-                embed = discord.Embed(
-                    title="🟢 Bot Status",
-                    description="R6X CyberScan Bot is operational",
-                    color=0x00FF9D
-                )
-                embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-                embed.add_field(name="Connected Since", value=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), inline=True)
-                
-                await ctx.send(embed=embed)
-            
-            # Start the bot in the event loop
-            future = asyncio.run_coroutine_threadsafe(bot.start(token), self.loop)
-            self.bot_tasks[user_id] = future
-            self.bots[user_id] = {
-                "bot": bot,
-                "channel_id": channel_id,
-                "bot_id": bot_id
-            }
-            
-            return bot_id
-            
-        except Exception as e:
-            logger.error(f"Failed to start bot for user {user_id}: {e}")
-            logger.error(traceback.format_exc())
-            raise
-            
-    async def send_scan_results(self, user_id: str, channel_id: str, scan_data: Dict):
-        """Send scan results to Discord"""
-        if user_id not in self.bots:
-            logger.error(f"No bot found for user {user_id}")
-            return False
-            
-        try:
-            bot_data = self.bots[user_id]
-            bot = bot_data["bot"]
-            
-            # Find the channel
-            channel = bot.get_channel(int(channel_id))
-            if not channel:
-                for guild in bot.guilds:
-                    channel = guild.get_channel(int(channel_id))
-                    if channel:
-                        break
-            
-            if not channel:
-                logger.error(f"Channel {channel_id} not found for user {user_id}")
-                return False
-            
-            # Create main embed
-            color = 0x00FF9D if scan_data.get('threats_found', 0) == 0 else 0xFF003C
-            
-            main_embed = discord.Embed(
-                title=f"📊 Scan Complete: {scan_data.get('name', 'Unknown')}",
-                description=f"Security scan finished at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
-                color=color,
-                timestamp=datetime.utcnow()
-            )
-            
-            # Statistics
-            main_embed.add_field(name="📁 Files Scanned", value=str(scan_data.get('files_scanned', 0)), inline=True)
-            main_embed.add_field(name="🚨 Threats Found", value=str(scan_data.get('threats_found', 0)), inline=True)
-            main_embed.add_field(name="⏱️ Duration", value=f"{scan_data.get('scan_duration', 0):.2f}s", inline=True)
-            
-            # Account info
-            r6_count = len(scan_data.get('r6_accounts', []))
-            steam_count = len(scan_data.get('steam_accounts', []))
-            main_embed.add_field(name="🎮 R6 Accounts", value=str(r6_count), inline=True)
-            main_embed.add_field(name="🔄 Steam Accounts", value=str(steam_count), inline=True)
-            
-            # System info
-            if scan_data.get('system_info'):
-                sys_info = scan_data['system_info']
-                main_embed.add_field(name="💻 System", value=sys_info.get('computer_name', 'Unknown'), inline=True)
-                main_embed.add_field(name="👤 User", value=sys_info.get('user_name', 'Unknown'), inline=True)
-            
-            main_embed.set_footer(text="R6X CyberScan v4.0")
-            
-            await channel.send(embed=main_embed)
-            
-            # Send threats if any
-            if scan_data.get('threats_found', 0) > 0 and scan_data.get('suspicious_files'):
-                threat_embed = discord.Embed(
-                    title="⚠️ Detected Threats",
-                    color=0xFF003C
-                )
-                
-                threat_list = ""
-                for threat in scan_data['suspicious_files'][:10]:
-                    threat_list += f"• **{threat.get('name', 'Unknown')}** - Severity: {threat.get('severity', 'MEDIUM')}\n"
-                
-                if threat_list:
-                    threat_embed.description = threat_list
-                    await channel.send(embed=threat_embed)
-            
-            logger.info(f"✅ Scan results sent to Discord for user {user_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to send scan results to Discord: {e}")
-            logger.error(traceback.format_exc())
-            return False
-            
-    async def disconnect_bot(self, user_id: str):
-        """Disconnect user's bot"""
-        if user_id in self.bots:
-            try:
-                bot = self.bots[user_id]["bot"]
-                
-                # Close the bot connection
-                if bot.is_ready():
-                    asyncio.run_coroutine_threadsafe(bot.close(), self.loop)
-                
-                # Cancel the task
-                if user_id in self.bot_tasks:
-                    self.bot_tasks[user_id].cancel()
-                    
-                del self.bots[user_id]
-                if user_id in self.bot_tasks:
-                    del self.bot_tasks[user_id]
-                
-                await bots_collection.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"status": "disconnected", "disconnected_at": datetime.utcnow()}}
-                )
-                
-                logger.info(f"✅ Bot disconnected for user {user_id}")
+                logger.info(f"✅ Scan results sent to Discord for user {user_id}")
                 return True
+                
             except Exception as e:
-                logger.error(f"Error disconnecting bot for user {user_id}: {e}")
+                logger.error(f"Failed to send scan results to Discord: {e}")
+                logger.error(traceback.format_exc())
                 return False
-        return False
-        
-    async def disconnect_all_bots(self):
-        """Disconnect all bots"""
-        for user_id in list(self.bots.keys()):
-            await self.disconnect_bot(user_id)
+                
+        async def disconnect_bot(self, user_id: str):
+            """Disconnect user's bot"""
+            if user_id in self.bots:
+                try:
+                    bot = self.bots[user_id]["bot"]
+                    
+                    # Close the bot connection
+                    if bot.is_ready():
+                        asyncio.run_coroutine_threadsafe(bot.close(), self.loop)
+                    
+                    # Cancel the task
+                    if user_id in self.bot_tasks:
+                        self.bot_tasks[user_id].cancel()
+                        
+                    del self.bots[user_id]
+                    if user_id in self.bot_tasks:
+                        del self.bot_tasks[user_id]
+                    
+                    await bots_collection.update_one(
+                        {"user_id": user_id},
+                        {"$set": {"status": "disconnected", "disconnected_at": datetime.utcnow()}}
+                    )
+                    
+                    logger.info(f"✅ Bot disconnected for user {user_id}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Error disconnecting bot for user {user_id}: {e}")
+                    return False
+            return False
+            
+        async def disconnect_all_bots(self):
+            """Disconnect all bots"""
+            for user_id in list(self.bots.keys()):
+                await self.disconnect_bot(user_id)
 
-# Initialize Discord Bot Manager
-discord_manager = DiscordBotManager()
+    # Initialize Discord Bot Manager
+    discord_manager = DiscordBotManager()
+else:
+    # Dummy class for when discord is not available
+    class DiscordBotManager:
+        async def start_bot(self, *args, **kwargs):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Discord integration not available on this server"
+            )
+        async def send_scan_results(self, *args, **kwargs):
+            return False
+        async def disconnect_bot(self, *args, **kwargs):
+            return False
+        async def disconnect_all_bots(self):
+            pass
+    
+    discord_manager = DiscordBotManager()
+    logger.info("⚠️ Discord Bot Manager running in dummy mode")
 
 # FastAPI app
 app = FastAPI(
@@ -456,22 +481,25 @@ async def root():
         "service": "R6X CYBERSCAN API",
         "version": config.API_VERSION,
         "status": "operational",
-        "bots_active": len(discord_manager.bots),
+        "discord_available": DISCORD_AVAILABLE,
+        "bots_active": len(discord_manager.bots) if hasattr(discord_manager, 'bots') else 0,
         "timestamp": datetime.utcnow().isoformat()
     }
 
 @app.get("/api/health")
 async def health_check():
     try:
+        # Test database connection
         await db.command("ping")
         db_status = "connected"
-    except:
-        db_status = "disconnected"
+    except Exception as e:
+        db_status = f"disconnected: {e}"
         
     return {
         "status": "healthy",
         "database": db_status,
-        "bots_active": len(discord_manager.bots),
+        "discord_available": DISCORD_AVAILABLE,
+        "bots_active": len(discord_manager.bots) if hasattr(discord_manager, 'bots') else 0,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -671,7 +699,8 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
 async def logout(current_user: dict = Depends(get_current_user)):
     if current_user:
         await tokens_collection.delete_many({"user_id": current_user["user_id"]})
-        await discord_manager.disconnect_bot(current_user["user_id"])
+        if DISCORD_AVAILABLE:
+            await discord_manager.disconnect_bot(current_user["user_id"])
     return {"success": True, "message": "Logged out successfully"}
 
 @app.post("/api/discord/connect")
@@ -684,6 +713,12 @@ async def connect_discord_bot(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated"
+        )
+    
+    if not DISCORD_AVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Discord integration is not available on this server"
         )
     
     try:
@@ -729,6 +764,9 @@ async def send_discord_message(
             detail="Not authenticated"
         )
     
+    if not DISCORD_AVAILABLE:
+        return {"success": False, "message": "Discord integration not available"}
+    
     success = await discord_manager.send_scan_results(
         user_id=current_user["user_id"],
         channel_id=message.channel_id,
@@ -749,6 +787,9 @@ async def disconnect_discord_bot(current_user: dict = Depends(get_current_user))
             detail="Not authenticated"
         )
     
+    if not DISCORD_AVAILABLE:
+        return {"success": False, "message": "Discord integration not available"}
+    
     success = await discord_manager.disconnect_bot(current_user["user_id"])
     
     if success:
@@ -762,7 +803,10 @@ async def get_bot_status(current_user: dict = Depends(get_current_user)):
     if not current_user:
         return {"connected": False, "status": "not_authenticated"}
     
-    is_connected = current_user["user_id"] in discord_manager.bots
+    if not DISCORD_AVAILABLE:
+        return {"connected": False, "status": "not_available"}
+    
+    is_connected = current_user["user_id"] in discord_manager.bots if hasattr(discord_manager, 'bots') else False
     bot_info = await bots_collection.find_one({"user_id": current_user["user_id"]})
     
     return {
@@ -832,7 +876,7 @@ async def save_scan_result(
             await threats_collection.insert_one(threat_doc)
     
     # Auto-send to Discord if bot is connected
-    if current_user["user_id"] in discord_manager.bots:
+    if DISCORD_AVAILABLE and current_user["user_id"] in discord_manager.bots:
         bot_info = await bots_collection.find_one({"user_id": current_user["user_id"]})
         if bot_info and bot_info.get("channel_id"):
             # Send in background
@@ -842,13 +886,16 @@ async def save_scan_result(
                 bot_info["channel_id"],
                 scan_doc
             )
+            discord_sent = True
+    else:
+        discord_sent = False
     
     logger.info(f"✅ Scan saved for user {current_user['username']}: {scan.name}")
     
     return {
         "success": True,
         "scan_id": scan_doc["scan_id"],
-        "discord_sent": current_user["user_id"] in discord_manager.bots
+        "discord_sent": discord_sent if 'discord_sent' in locals() else False
     }
 
 @app.get("/api/scans/history")
@@ -986,7 +1033,7 @@ async def startup_event():
         
         logger.info(f"🚀 R6X CYBERSCAN Backend v{config.API_VERSION} started")
         logger.info(f"💾 MongoDB: Connected")
-        logger.info(f"🤖 Discord Manager: Active with {len(discord_manager.bots)} bots")
+        logger.info(f"🤖 Discord Available: {DISCORD_AVAILABLE}")
         
     except Exception as e:
         logger.error(f"Startup error: {e}")
@@ -996,8 +1043,9 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("Shutting down...")
-    await discord_manager.disconnect_all_bots()
-    logger.info("All Discord bots disconnected")
+    if DISCORD_AVAILABLE:
+        await discord_manager.disconnect_all_bots()
+    logger.info("Shutdown complete")
 
 # For local testing
 if __name__ == "__main__":
