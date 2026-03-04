@@ -28,7 +28,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
 API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME-NOW')
-RENDER_URL = os.getenv('RENDER_URL', 'https://your-render-url.onrender.com')
+RENDER_URL = os.getenv('RENDER_URL', 'https://bot-hosting-b-ga04.onrender.com')
 GITHUB_REPO = os.getenv('GITHUB_REPO', 'yourusername/R6XScan')  # e.g., "username/R6XScan"
 
 # File paths
@@ -1013,3 +1013,4 @@ if __name__ == "__main__":
     
     # Run Discord bot
     run_bot_sync()
+
