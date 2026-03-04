@@ -8,8 +8,10 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.6
 pydantic==2.4.2
 pydantic-settings==2.0.3
+pydantic[email]==2.4.2  # This includes email-validator
 discord.py==2.3.2
 bcrypt==4.0.1
 pyjwt==2.8.0
 python-dotenv==1.0.0
 httpx==0.25.1
+email-validator==2.1.0  # Explicitly add email-validator
