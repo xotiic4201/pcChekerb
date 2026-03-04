@@ -1,5 +1,4 @@
-# app.py - R6X CYBERSCAN Backend (Fixed)
-# No email validator needed - removed EmailStr
+# app.py - R6X CYBERSCAN Backend (Fixed Rate Limits)
 
 import os
 import uuid
@@ -7,7 +6,7 @@ import json
 import asyncio
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +34,7 @@ logger = logging.getLogger("r6x-backend")
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 service_supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 
-# ========== PYDANTIC MODELS (No EmailStr) ==========
+# ========== PYDANTIC MODELS ==========
 class ScanResult(BaseModel):
     username: str
     computer: str
@@ -50,7 +49,7 @@ class ScanResult(BaseModel):
     logitech_scripts: Optional[List[Dict[str, Any]]] = None
     scan_time: str
 
-# ========== DISCORD BOT (Fixed - No rate limits) ==========
+# ========== DISCORD BOT (Fixed Rate Limiting) ==========
 class DiscordBot:
     def __init__(self):
         self.bot = None
@@ -59,10 +58,13 @@ class DiscordBot:
         self.channel = None
         self.is_ready = False
         self.retry_count = 0
-        self.max_retries = 5
+        self.max_retries = 10
+        self.rate_limited_until = None
+        self.message_queue = asyncio.Queue()
+        self._running = False
         
     def start(self):
-        """Start the Discord bot in a separate thread with retry logic"""
+        """Start the Discord bot in a separate thread"""
         if not config.DISCORD_BOT_TOKEN or not config.DISCORD_CHANNEL_ID:
             logger.warning("Discord bot not configured - check environment variables")
             return
@@ -71,45 +73,45 @@ class DiscordBot:
         self.thread.start()
         
     def _run_bot(self):
-        """Run the bot in its own event loop with retry logic"""
-        while self.retry_count < self.max_retries:
-            try:
-                self.loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self.loop)
-                self.loop.run_until_complete(self._setup_bot())
-                break
-            except Exception as e:
-                self.retry_count += 1
-                logger.error(f"Bot error (attempt {self.retry_count}/{self.max_retries}): {e}")
-                time.sleep(5 * self.retry_count)  # Exponential backoff
-            finally:
-                if self.loop:
-                    self.loop.close()
+        """Run the bot in its own event loop"""
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(self._setup_bot())
+        except Exception as e:
+            logger.error(f"Bot thread error: {e}")
+        finally:
+            if self.loop:
+                self.loop.close()
                     
     async def _setup_bot(self):
-        """Setup and run the Discord bot"""
+        """Setup and run the Discord bot with rate limit handling"""
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         
         self.bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+        self._running = True
         
         @self.bot.event
         async def on_ready():
             logger.info(f"✅ Discord bot connected as {self.bot.user}")
             self.is_ready = True
-            self.retry_count = 0  # Reset retry count on success
+            self.retry_count = 0
+            self.rate_limited_until = None
             
             # Get the channel
             try:
-                self.channel = self.bot.get_channel(int(config.DISCORD_CHANNEL_ID))
+                channel_id = int(config.DISCORD_CHANNEL_ID)
+                self.channel = self.bot.get_channel(channel_id)
                 if not self.channel:
-                    for guild in self.bot.guilds:
-                        self.channel = guild.get_channel(int(config.DISCORD_CHANNEL_ID))
-                        if self.channel:
-                            break
+                    # Try to fetch if not in cache
+                    self.channel = await self.bot.fetch_channel(channel_id)
                 
                 if self.channel:
+                    # Start message processor
+                    asyncio.create_task(self._process_message_queue())
+                    
                     embed = discord.Embed(
                         title="🤖 R6X Bot Online",
                         description="Security scanner bot is now active!",
@@ -123,15 +125,20 @@ class DiscordBot:
                     await self.channel.send(embed=embed)
                     logger.info("✅ Welcome message sent to Discord")
             except Exception as e:
-                logger.error(f"Error sending welcome message: {e}")
+                logger.error(f"Error in on_ready: {e}")
         
         @self.bot.event
         async def on_command_error(ctx, error):
             if isinstance(error, commands.CommandNotFound):
                 return
-            await ctx.send(f"❌ Error: {str(error)}")
+            
+            if isinstance(error, commands.CommandOnCooldown):
+                await ctx.send(f"⏰ Command on cooldown. Try again in {error.retry_after:.2f}s")
+            else:
+                await ctx.send(f"❌ Error: {str(error)}")
         
         @self.bot.command(name='scan')
+        @commands.cooldown(1, 5, commands.BucketType.user)  # 1 per 5 seconds per user
         async def scan_command(ctx, username: str = None):
             """Get latest scan results for a user"""
             if not username:
@@ -179,6 +186,7 @@ class DiscordBot:
                 await ctx.send("❌ Error retrieving scan data")
         
         @self.bot.command(name='stats')
+        @commands.cooldown(1, 10, commands.BucketType.default)  # 1 per 10 seconds globally
         async def stats_command(ctx):
             """Get bot statistics"""
             try:
@@ -220,23 +228,85 @@ class DiscordBot:
             
             await ctx.send(embed=embed)
         
-        # Start the bot
-        try:
-            await self.bot.start(config.DISCORD_BOT_TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                logger.error("Rate limited by Discord. Waiting before retry...")
-                await asyncio.sleep(60)  # Wait 1 minute on rate limit
-                raise
-            else:
-                raise
+        # Start the bot with rate limit handling
+        while self._running and self.retry_count < self.max_retries:
+            try:
+                await self.bot.start(config.DISCORD_BOT_TOKEN)
+                break
+            except discord.errors.HTTPException as e:
+                if e.status == 429:
+                    retry_after = 60  # Default 60 seconds
+                    # Try to get retry time from response
+                    if hasattr(e, 'retry_after'):
+                        retry_after = e.retry_after
+                    
+                    self.rate_limited_until = datetime.utcnow() + timedelta(seconds=retry_after)
+                    self.retry_count += 1
+                    
+                    logger.error(f"Rate limited by Discord. Waiting {retry_after}s (attempt {self.retry_count}/{self.max_retries})")
+                    
+                    # Wait before retry
+                    await asyncio.sleep(retry_after)
+                else:
+                    logger.error(f"Discord HTTP error: {e}")
+                    self.retry_count += 1
+                    await asyncio.sleep(30 * self.retry_count)  # Exponential backoff
+            except Exception as e:
+                logger.error(f"Unexpected bot error: {e}")
+                self.retry_count += 1
+                await asyncio.sleep(30)
+        
+        if self.retry_count >= self.max_retries:
+            logger.error("Max retries reached. Discord bot failed to start.")
+    
+    async def _process_message_queue(self):
+        """Process queued messages with rate limiting"""
+        while self._running:
+            try:
+                if self.message_queue.empty():
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Check if we're rate limited
+                if self.rate_limited_until and datetime.utcnow() < self.rate_limited_until:
+                    wait_time = (self.rate_limited_until - datetime.utcnow()).total_seconds()
+                    await asyncio.sleep(min(wait_time, 5))
+                    continue
+                
+                # Get next message from queue
+                message_data = await self.message_queue.get()
+                
+                try:
+                    # Send the message
+                    await self.channel.send(**message_data)
+                    
+                    # Small delay between messages to avoid rate limits
+                    await asyncio.sleep(1)
+                except discord.errors.HTTPException as e:
+                    if e.status == 429:
+                        # Put message back in queue
+                        await self.message_queue.put(message_data)
+                        
+                        retry_after = getattr(e, 'retry_after', 10)
+                        self.rate_limited_until = datetime.utcnow() + timedelta(seconds=retry_after)
+                        logger.warning(f"Rate limited while sending. Waiting {retry_after}s")
+                        
+                        await asyncio.sleep(retry_after)
+                    else:
+                        logger.error(f"Error sending message: {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error sending message: {e}")
+                
+            except Exception as e:
+                logger.error(f"Message processor error: {e}")
+                await asyncio.sleep(5)
     
     async def send_scan_results(self, scan_data: Dict):
-        """Send scan results to Discord channel"""
+        """Queue scan results to send to Discord"""
         if not self.is_ready or not self.channel:
             logger.warning("Discord bot not ready, cannot send results")
             return False
-            
+        
         try:
             # Create main embed
             color = 0x00FF9D if scan_data['threats_found'] == 0 else 0xFF003C
@@ -258,9 +328,10 @@ class DiscordBot:
             if scan_data.get('antivirus_status'):
                 embed.add_field(name="🛡️ Antivirus", value=scan_data['antivirus_status'][:50], inline=True)
             
-            await self.channel.send(embed=embed)
+            # Queue the main embed
+            await self.message_queue.put({"embed": embed})
             
-            # Send suspicious files if any
+            # Queue suspicious files if any
             if scan_data['suspicious_files']:
                 sus_embed = discord.Embed(
                     title="⚠️ Suspicious Files Found",
@@ -271,9 +342,9 @@ class DiscordBot:
                     sus_list += f"• {f.get('name', 'Unknown')} ({f.get('severity', 'MEDIUM')})\n"
                 if sus_list:
                     sus_embed.description = sus_list
-                    await self.channel.send(embed=sus_embed)
+                    await self.message_queue.put({"embed": sus_embed})
             
-            # Send account info if any
+            # Queue account info if any
             if scan_data['r6_accounts'] or scan_data['steam_accounts']:
                 account_embed = discord.Embed(
                     title="🎮 Gaming Accounts Found",
@@ -286,19 +357,13 @@ class DiscordBot:
                     account_text += f"• Steam: {acc.get('name', 'Unknown')}\n"
                 if account_text:
                     account_embed.description = account_text
-                    await self.channel.send(embed=account_embed)
+                    await self.message_queue.put({"embed": account_embed})
             
-            logger.info(f"✅ Scan results sent to Discord for {scan_data['username']}")
+            logger.info(f"✅ Scan results queued for Discord for {scan_data['username']}")
             return True
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                logger.error("Rate limited by Discord. Waiting before next message...")
-                await asyncio.sleep(10)
-            else:
-                logger.error(f"Error sending to Discord: {e}")
-            return False
+            
         except Exception as e:
-            logger.error(f"Error sending to Discord: {e}")
+            logger.error(f"Error queueing Discord message: {e}")
             return False
 
 # Initialize Discord bot
@@ -324,7 +389,7 @@ async def root():
         "service": "R6X CYBERSCAN API",
         "status": "online",
         "bot_status": "connected" if discord_bot.is_ready else "connecting",
-        "version": "4.0.0"
+        "version": "4.1.0"
     }
 
 @app.get("/api/health")
@@ -473,6 +538,8 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Shutting down...")
+    if hasattr(discord_bot, '_running'):
+        discord_bot._running = False
 
 if __name__ == "__main__":
     import uvicorn
