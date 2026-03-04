@@ -7,7 +7,7 @@ import json
 import asyncio
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
-from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -16,12 +16,8 @@ import aiohttp
 from dotenv import load_dotenv
 import re
 from typing import Optional, List, Dict, Any
-import uuid
 import logging
 import traceback
-import subprocess
-import shutil
-import zipfile
 from pathlib import Path
 
 # Load environment variables
@@ -33,12 +29,11 @@ CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
 API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME-NOW')
 RENDER_URL = os.getenv('RENDER_URL', 'https://your-render-url.onrender.com')
+GITHUB_REPO = os.getenv('GITHUB_REPO', 'yourusername/R6XScan')  # e.g., "username/R6XScan"
 
 # File paths
-SCANNER_PY_PATH = os.path.join(os.path.dirname(__file__), 'r6x_scanner.py')
-SCANNER_EXE_PATH = os.path.join(os.path.dirname(__file__), 'dist', 'R6X-XScan.exe')
-SCANNER_ZIP_PATH = os.path.join(os.path.dirname(__file__), 'dist', 'R6X-XScan.zip')
-BUILD_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), 'build_exe.py')
+EXE_FILENAME = "R6XScan.exe"
+EXE_PATH = os.path.join(os.path.dirname(__file__), EXE_FILENAME)
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -169,77 +164,15 @@ def parse_threat_severity(severity):
     }
     return severity_map.get(severity, "Unknown")
 
-# ==================== BUILD EXE FUNCTION ====================
-def build_exe_if_needed():
-    """Build the EXE if it doesn't exist"""
-    if os.path.exists(SCANNER_EXE_PATH):
-        logger.info(f"EXE already exists at {SCANNER_EXE_PATH}")
-        return True
-    
-    logger.info("Building EXE...")
-    
-    try:
-        # Create build script if it doesn't exist
-        if not os.path.exists(BUILD_SCRIPT_PATH):
-            with open(BUILD_SCRIPT_PATH, 'w') as f:
-                f.write('''import PyInstaller.__main__
-import os
-import sys
-
-# Build the executable
-PyInstaller.__main__.run([
-    'r6x_scanner.py',
-    '--onefile',
-    '--name=R6X-XScan',
-    '--console',
-    '--hidden-import=requests',
-    '--hidden-import=winreg',
-    '--hidden-import=ctypes',
-    '--hidden-import=platform',
-    '--hidden-import=json',
-    '--hidden-import=re',
-    '--hidden-import=time',
-    '--hidden-import=datetime',
-    '--hidden-import=subprocess',
-    '--add-data=README.txt;.' if os.path.exists('README.txt') else '',
-    '--clean',
-    '--noconfirm'
-])
-
-print("Build complete!")
-''')
-        
-        # Run the build script
-        result = subprocess.run(
-            [sys.executable, BUILD_SCRIPT_PATH],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(__file__)
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Build failed: {result.stderr}")
-            return False
-        
-        # Create zip file
-        if os.path.exists(SCANNER_EXE_PATH):
-            with zipfile.ZipFile(SCANNER_ZIP_PATH, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(SCANNER_EXE_PATH, arcname='R6X-XScan.exe')
-                
-                # Add README if it exists
-                readme_path = os.path.join(os.path.dirname(__file__), 'README.txt')
-                if os.path.exists(readme_path):
-                    zipf.write(readme_path, arcname='README.txt')
-            
-            logger.info(f"EXE built and zipped successfully")
-            return True
-        else:
-            logger.error("EXE not found after build")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error building EXE: {e}")
-        return False
+def check_exe_exists():
+    """Check if the EXE file exists"""
+    exists = os.path.exists(EXE_PATH)
+    if exists:
+        size = os.path.getsize(EXE_PATH)
+        logger.info(f"EXE found at {EXE_PATH} - Size: {size} bytes")
+    else:
+        logger.warning(f"EXE not found at {EXE_PATH}")
+    return exists
 
 # ==================== DISCORD BOT EVENTS ====================
 @bot.event
@@ -248,8 +181,8 @@ async def on_ready():
     logger.info(f'📊 Bot ID: {bot.user.id}')
     logger.info(f'📋 Channel ID: {CHANNEL_ID}')
     
-    # Build EXE on startup
-    await asyncio.to_thread(build_exe_if_needed)
+    # Check if EXE exists
+    check_exe_exists()
     
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
@@ -273,6 +206,7 @@ async def on_command_error(ctx, error):
     else:
         await ctx.send(f"❌ An error occurred: {str(error)}")
         logger.error(f"Command error: {error}")
+        logger.error(traceback.format_exc())
 
 # ==================== DISCORD COMMANDS ====================
 
@@ -324,7 +258,7 @@ async def help_command(ctx):
     
     view = View()
     view.add_item(Button(label="📥 Download EXE", url=f"{RENDER_URL}/download-exe", style=ButtonStyle.link))
-    view.add_item(Button(label="📖 GitHub", url="https://github.com/", style=ButtonStyle.link))
+    view.add_item(Button(label="📖 GitHub", url=f"https://github.com/{GITHUB_REPO}", style=ButtonStyle.link))
     
     await ctx.send(embed=embed, view=view)
 
@@ -356,7 +290,7 @@ async def start_scan(ctx):
     
     embed.add_field(
         name="📥 **Step 1: Download**",
-        value=f"[Click here to download R6X-XScan.exe]({RENDER_URL}/download-exe)",
+        value=f"[Click here to download R6XScan.exe]({RENDER_URL}/download-exe)",
         inline=False
     )
     
@@ -430,6 +364,23 @@ async def check_status(ctx, scan_id: str = None):
         
         if not found:
             await ctx.send("❌ Scan ID not found.")
+
+@bot.command(name='cancel')
+async def cancel_scan(ctx, scan_id: str = None):
+    """Cancel a pending scan"""
+    if not scan_id:
+        await ctx.send("❌ Please provide a scan ID. Usage: `!cancel <scan_id>`")
+        return
+    
+    if scan_id in active_scans:
+        if active_scans[scan_id]['user_id'] != ctx.author.id and not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ You can only cancel your own scans.")
+            return
+        
+        del active_scans[scan_id]
+        await ctx.send(f"✅ Scan `{scan_id}` cancelled successfully.")
+    else:
+        await ctx.send("❌ Scan ID not found or already completed.")
 
 @bot.command(name='stats')
 async def show_stats(ctx, user: discord.User = None):
@@ -574,6 +525,22 @@ async def broadcast(ctx, *, message: str):
 
 # ==================== FASTAPI ROUTES ====================
 
+@fastapi_app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "name": "R6X XScan API",
+        "version": "1.0.0",
+        "status": "online",
+        "endpoints": {
+            "/health": "Health check",
+            "/download-exe": "Download R6XScan.exe",
+            "/api/start-scan": "Start a new scan",
+            "/api/scan": "Submit scan data",
+            "/docs": "API documentation"
+        }
+    }
+
 @fastapi_app.post("/api/start-scan", response_model=StartScanResponse)
 async def start_scan(request: StartScanRequest, x_api_key: Optional[str] = Header(None)):
     """Start a new scan and return scan ID"""
@@ -662,54 +629,24 @@ async def receive_scan(
 
 @fastapi_app.get("/download-exe")
 async def download_exe():
-    """Download the compiled EXE"""
-    if not os.path.exists(SCANNER_EXE_PATH):
-        # Try to build it
-        success = await asyncio.to_thread(build_exe_if_needed)
-        if not success:
-            raise HTTPException(status_code=404, detail="EXE not available")
+    """Download the R6XScan.exe file"""
+    if not os.path.exists(EXE_PATH):
+        logger.error(f"EXE not found at {EXE_PATH}")
+        # Try to find it in the current directory
+        alt_path = os.path.join(os.getcwd(), EXE_FILENAME)
+        if os.path.exists(alt_path):
+            return FileResponse(
+                path=alt_path,
+                filename=EXE_FILENAME,
+                media_type="application/octet-stream"
+            )
+        raise HTTPException(status_code=404, detail=f"EXE not found. Please ensure {EXE_FILENAME} is in the same directory as the bot.")
     
     return FileResponse(
-        path=SCANNER_EXE_PATH,
-        filename="R6X-XScan.exe",
+        path=EXE_PATH,
+        filename=EXE_FILENAME,
         media_type="application/octet-stream"
     )
-
-@fastapi_app.get("/download-zip")
-async def download_zip():
-    """Download the EXE as a ZIP file"""
-    if not os.path.exists(SCANNER_ZIP_PATH):
-        # Try to build it
-        success = await asyncio.to_thread(build_exe_if_needed)
-        if not success:
-            raise HTTPException(status_code=404, detail="ZIP not available")
-    
-    return FileResponse(
-        path=SCANNER_ZIP_PATH,
-        filename="R6X-XScan.zip",
-        media_type="application/zip"
-    )
-
-@fastapi_app.get("/scanner.py")
-async def serve_scanner_py():
-    """Serve the Python source"""
-    if not os.path.exists(SCANNER_PY_PATH):
-        raise HTTPException(status_code=404, detail="Scanner source not found")
-    
-    with open(SCANNER_PY_PATH, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Replace API URL and key
-    content = content.replace(
-        'API_URL = "https://bot-hosting-b-ga04.onrender.com/api/scan"',
-        f'API_URL = "{RENDER_URL}/api/scan"'
-    )
-    content = content.replace(
-        'API_KEY = "rnd_o2SUQpg4Ln3EsJSJsOYOeCHnLnId"',
-        f'API_KEY = "{API_KEY}"'
-    )
-    
-    return PlainTextResponse(content)
 
 @fastapi_app.get("/health")
 async def health():
@@ -719,9 +656,29 @@ async def health():
         'active_scans': len(active_scans),
         'total_scans': len(scan_history),
         'authorized_users': len(AUTHORIZED_USERS),
-        'exe_available': os.path.exists(SCANNER_EXE_PATH),
+        'exe_available': os.path.exists(EXE_PATH),
+        'exe_path': str(EXE_PATH),
         'uptime': str(datetime.now() - bot_start_time).split('.')[0]
     }
+
+@fastapi_app.get("/api/active_scans")
+async def get_active_scans(x_api_key: Optional[str] = Header(None)):
+    """Get list of active scans (protected)"""
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    scans = []
+    for scan_id, scan in active_scans.items():
+        scans.append({
+            'scan_id': scan_id,
+            'user_id': scan['user_id'],
+            'user_name': scan['user_name'],
+            'start_time': scan['start_time'].isoformat(),
+            'status': scan['status'],
+            'has_data': scan['data'] is not None
+        })
+    
+    return {'active_scans': scans}
 
 # ==================== DISCORD RESULT HANDLING ====================
 
@@ -782,6 +739,7 @@ async def send_scan_results_discord(scan_id: str, data: Dict):
             
     except Exception as e:
         logger.error(f"Error sending results: {e}")
+        logger.error(traceback.format_exc())
 
 async def send_main_results(channel, data, user_mention, scan_id):
     """Send main results embed"""
@@ -1048,7 +1006,7 @@ def run_bot_sync():
     """Run bot in sync context"""
     asyncio.run(run_bot())
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Start FastAPI in a thread
     fastapi_thread = threading.Thread(target=run_fastapi, daemon=True)
     fastapi_thread.start()
