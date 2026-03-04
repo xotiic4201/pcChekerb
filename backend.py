@@ -1,4 +1,4 @@
-# backend.py - R6X CYBERSCAN Production Backend with Supabase
+# app.py - R6X CYBERSCAN Backend with Supabase & Discord Bot Hosting
 # Deploy this on Render.com
 
 import os
@@ -9,7 +9,6 @@ import asyncio
 import uuid
 import json
 import threading
-import traceback
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,57 +18,36 @@ from supabase import create_client, Client
 import logging
 from datetime import datetime, timedelta
 import secrets
-import requests
-from dotenv import load_dotenv
+import traceback
 
-# Load environment variables
-load_dotenv()
+# Discord imports
+import discord
+from discord.ext import commands
+import asyncio
+import threading
 
-# Discord imports - make them optional
-try:
-    import discord
-    from discord.ext import commands
-    DISCORD_AVAILABLE = True
-except ImportError:
-    DISCORD_AVAILABLE = False
-    print("⚠️ Discord.py not installed - bot features disabled")
-
-# Configuration
+# ========== CONFIGURATION ==========
 class Config:
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
     SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 30
     REFRESH_TOKEN_EXPIRE_DAYS = 7
-    
-    # Supabase configuration
-    SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-supabase-anon-key")
-    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "your-service-role-key")
-    
-    API_VERSION = "4.0.0"
-    ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+    ADMIN_IDS = os.getenv("ADMIN_IDS", "1151697240025464852,1302203907782606880").split(",")
     
 config = Config()
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# ========== LOGGING ==========
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("r6x-backend")
 
-# Initialize Supabase client
-try:
-    supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-    # Test connection
-    supabase.table("users").select("*").limit(1).execute()
-    logger.info("✅ Connected to Supabase successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to connect to Supabase: {e}")
-    # Don't raise, allow app to start but with limited functionality
-    supabase = None
+# ========== SUPABASE ==========
+supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+service_supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 
-# Pydantic models
+# ========== PYDANTIC MODELS ==========
 class Token(BaseModel):
     access_token: str
     refresh_token: str
@@ -85,342 +63,279 @@ class UserLogin(BaseModel):
     password: str
 
 class ScanResult(BaseModel):
-    name: str
+    username: str
+    computer: str
     files_scanned: int
     threats_found: int
+    suspicious_files: List[Dict]
     r6_accounts: List[Dict]
     steam_accounts: List[Dict]
-    suspicious_files: List[Dict]
-    scan_duration: float
-    status: str
-    system_info: Optional[Dict] = None
+    windows_install_date: Optional[str] = None
+    antivirus_status: Optional[str] = None
+    prefetch_files: Optional[List] = None
+    logitech_scripts: Optional[List] = None
+    scan_time: str
 
-class DiscordBotConnect(BaseModel):
-    token: str
+class BotConnect(BaseModel):
+    user_id: str
+    bot_token: str
     channel_id: str
 
-class DiscordMessage(BaseModel):
-    channel_id: str
-    content: str
-    results: Optional[Dict] = None
-
-class RoleUpdate(BaseModel):
-    username: str
-    role: str
-
-# Discord Bot Manager (only if discord is available)
-if DISCORD_AVAILABLE:
-    class DiscordBotManager:
-        def __init__(self):
-            self.bots = {}  # user_id -> bot instance
-            self.bot_tasks = {}  # user_id -> task
-            self.loop = None
-            self.thread = None
-            self._start_loop()
-            logger.info("✅ Discord Bot Manager initialized")
+# ========== DISCORD BOT MANAGER ==========
+class DiscordBotHost:
+    def __init__(self):
+        self.bots = {}  # user_id -> bot instance
+        self.bot_tasks = {}  # user_id -> task
+        self.loops = {}  # user_id -> event loop
+        self.threads = {}  # user_id -> thread
+        logger.info("✅ Discord Bot Host initialized")
+        
+    def start_bot_for_user(self, user_id: str, bot_token: str, channel_id: str):
+        """Start a Discord bot for a specific user in its own thread"""
+        
+        def run_bot():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.loops[user_id] = loop
             
-        def _start_loop(self):
-            """Start the asyncio event loop in a separate thread"""
-            self.loop = asyncio.new_event_loop()
-            self.thread = threading.Thread(target=self._run_loop, daemon=True)
-            self.thread.start()
-            logger.info("✅ Discord bot loop started in thread")
-            
-        def _run_loop(self):
-            """Run the asyncio event loop"""
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_forever()
-            
-        async def start_bot(self, token: str, channel_id: str, user_id: str):
-            """Start a Discord bot instance for a user"""
             try:
-                bot_id = str(uuid.uuid4())
-                
-                # Configure bot intents
-                intents = discord.Intents.default()
-                intents.message_content = True
-                intents.guilds = True
-                
-                bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
-                
-                @bot.event
-                async def on_ready():
-                    logger.info(f"✅ Bot {bot.user} connected for user {user_id}")
-                    
-                    # Get the channel
-                    channel = None
-                    for guild in bot.guilds:
-                        channel = guild.get_channel(int(channel_id))
-                        if channel:
-                            break
-                    
-                    if not channel:
-                        try:
-                            channel = await bot.fetch_channel(int(channel_id))
-                        except:
-                            logger.error(f"Could not find channel {channel_id}")
-                            return
-                    
-                    # Send connection success message
-                    embed = discord.Embed(
-                        title="🤖 R6X Bot Connected",
-                        description="Your security scanner bot is now active!",
-                        color=0x00FF9D,
-                        timestamp=datetime.utcnow()
-                    )
-                    embed.add_field(name="Status", value="🟢 Online", inline=True)
-                    embed.add_field(name="Commands", value="!scan, !status, !help", inline=True)
-                    embed.set_footer(text="R6X CyberScan")
-                    
-                    await channel.send(embed=embed)
-                    
-                    # Store bot info in database
-                    if supabase:
-                        supabase.table("discord_bots").upsert({
-                            "user_id": user_id,
-                            "bot_id": bot_id,
-                            "token_preview": token[:10] + "...",
-                            "channel_id": channel_id,
-                            "bot_name": str(bot.user),
-                            "status": "connected",
-                            "connected_at": datetime.utcnow().isoformat()
-                        }).execute()
-                    
-                @bot.event
-                async def on_command_error(ctx, error):
-                    if isinstance(error, commands.CommandNotFound):
-                        return
-                    logger.error(f"Bot error for user {user_id}: {error}")
-                    await ctx.send(f"❌ Error: {str(error)}")
-                    
-                @bot.command(name='scan')
-                async def scan_command(ctx):
-                    """Get latest scan results"""
-                    if str(ctx.channel.id) != channel_id:
-                        return
-                    
-                    # Get latest scan for user from Supabase
-                    if supabase:
-                        result = supabase.table("scans")\
-                            .select("*")\
-                            .eq("user_id", user_id)\
-                            .order("created_at", desc=True)\
-                            .limit(1)\
-                            .execute()
-                        
-                        if result.data and len(result.data) > 0:
-                            latest_scan = result.data[0]
-                            color = 0x00FF9D if latest_scan['threats_found'] == 0 else 0xFF003C
-                            
-                            embed = discord.Embed(
-                                title="📊 Latest Scan Results",
-                                description=f"Scan: {latest_scan['name']}",
-                                color=color,
-                                timestamp=datetime.fromisoformat(latest_scan['created_at'])
-                            )
-                            embed.add_field(name="Files Scanned", value=str(latest_scan['files_scanned']), inline=True)
-                            embed.add_field(name="Threats Found", value=str(latest_scan['threats_found']), inline=True)
-                            embed.add_field(name="Duration", value=f"{latest_scan['scan_duration']:.2f}s", inline=True)
-                            
-                            embed.set_footer(text=f"User: {latest_scan['username']}")
-                            await ctx.send(embed=embed)
-                        else:
-                            await ctx.send("📭 No scans found for your account")
-                    else:
-                        await ctx.send("❌ Database connection error")
-                        
-                @bot.command(name='help')
-                async def help_command(ctx):
-                    """Show available commands"""
-                    if str(ctx.channel.id) != channel_id:
-                        return
-                        
-                    embed = discord.Embed(
-                        title="🤖 R6X Bot Commands",
-                        description="Available commands for this channel",
-                        color=0x5865F2
-                    )
-                    embed.add_field(name="!scan", value="Get your latest scan results", inline=False)
-                    embed.add_field(name="!status", value="Check bot status", inline=False)
-                    embed.add_field(name="!help", value="Show this message", inline=False)
-                    embed.set_footer(text="R6X CyberScan v4.0")
-                    
-                    await ctx.send(embed=embed)
-                    
-                @bot.command(name='status')
-                async def status_command(ctx):
-                    """Check bot status"""
-                    if str(ctx.channel.id) != channel_id:
-                        return
-                        
-                    embed = discord.Embed(
-                        title="🟢 Bot Status",
-                        description="R6X CyberScan Bot is operational",
-                        color=0x00FF9D
-                    )
-                    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-                    embed.add_field(name="Connected Since", value=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), inline=True)
-                    
-                    await ctx.send(embed=embed)
-                
-                # Start the bot in the event loop
-                future = asyncio.run_coroutine_threadsafe(bot.start(token), self.loop)
-                self.bot_tasks[user_id] = future
-                self.bots[user_id] = {
-                    "bot": bot,
-                    "channel_id": channel_id,
-                    "bot_id": bot_id
-                }
-                
-                return bot_id
-                
+                loop.run_until_complete(self._run_bot(user_id, bot_token, channel_id))
             except Exception as e:
-                logger.error(f"Failed to start bot for user {user_id}: {e}")
-                logger.error(traceback.format_exc())
-                raise
-                
-        async def send_scan_results(self, user_id: str, channel_id: str, scan_data: Dict):
-            """Send scan results to Discord"""
-            if user_id not in self.bots:
-                logger.error(f"No bot found for user {user_id}")
-                return False
-                
-            try:
-                bot_data = self.bots[user_id]
-                bot = bot_data["bot"]
-                
-                # Find the channel
-                channel = bot.get_channel(int(channel_id))
-                if not channel:
-                    for guild in bot.guilds:
-                        channel = guild.get_channel(int(channel_id))
-                        if channel:
-                            break
-                
-                if not channel:
-                    logger.error(f"Channel {channel_id} not found for user {user_id}")
-                    return False
-                
-                # Create main embed
-                color = 0x00FF9D if scan_data.get('threats_found', 0) == 0 else 0xFF003C
-                
-                main_embed = discord.Embed(
-                    title=f"📊 Scan Complete: {scan_data.get('name', 'Unknown')}",
-                    description=f"Security scan finished at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
-                    color=color,
+                logger.error(f"Bot error for user {user_id}: {e}")
+            finally:
+                loop.close()
+                if user_id in self.loops:
+                    del self.loops[user_id]
+        
+        thread = threading.Thread(target=run_bot, daemon=True)
+        thread.start()
+        self.threads[user_id] = thread
+        
+    async def _run_bot(self, user_id: str, bot_token: str, channel_id: str):
+        """Run the actual bot"""
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        
+        bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+        self.bots[user_id] = bot
+        
+        # Get username from database
+        result = service_supabase.table("users").select("username").eq("user_id", user_id).execute()
+        username = result.data[0]["username"] if result.data else "Unknown"
+        
+        @bot.event
+        async def on_ready():
+            logger.info(f"✅ Bot for {username} connected as {bot.user}")
+            
+            # Store bot info in database
+            service_supabase.table("discord_bots").upsert({
+                "user_id": user_id,
+                "bot_token_preview": bot_token[:10] + "...",
+                "channel_id": channel_id,
+                "bot_name": str(bot.user),
+                "status": "connected",
+                "connected_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            # Send welcome message
+            channel = bot.get_channel(int(channel_id))
+            if not channel:
+                for guild in bot.guilds:
+                    channel = guild.get_channel(int(channel_id))
+                    if channel:
+                        break
+            
+            if channel:
+                embed = discord.Embed(
+                    title="🤖 R6X Bot Connected",
+                    description=f"Scanner activated for **{username}**",
+                    color=0x00FF9D,
                     timestamp=datetime.utcnow()
                 )
+                embed.add_field(name="Status", value="🟢 Online", inline=True)
+                embed.add_field(name="Commands", value="!scan, !status, !help", inline=True)
+                embed.set_footer(text="R6X CyberScan")
+                await channel.send(embed=embed)
+        
+        @bot.event
+        async def on_command_error(ctx, error):
+            if isinstance(error, commands.CommandNotFound):
+                return
+            await ctx.send(f"❌ Error: {str(error)}")
+        
+        @bot.command(name='scan')
+        async def scan_command(ctx):
+            """Get latest scan results"""
+            if str(ctx.channel.id) != channel_id:
+                return
+            
+            # Get latest scan from database
+            result = service_supabase.table("scans")\
+                .select("*")\
+                .eq("user_id", user_id)\
+                .order("created_at", desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if result.data and len(result.data) > 0:
+                scan = result.data[0]
+                color = 0x00FF9D if scan['threats_found'] == 0 else 0xFF003C
                 
-                # Statistics
-                main_embed.add_field(name="📁 Files Scanned", value=str(scan_data.get('files_scanned', 0)), inline=True)
-                main_embed.add_field(name="🚨 Threats Found", value=str(scan_data.get('threats_found', 0)), inline=True)
-                main_embed.add_field(name="⏱️ Duration", value=f"{scan_data.get('scan_duration', 0):.2f}s", inline=True)
+                embed = discord.Embed(
+                    title="📊 Latest Scan Results",
+                    description=f"User: {scan['username']}",
+                    color=color,
+                    timestamp=datetime.fromisoformat(scan['created_at'])
+                )
+                embed.add_field(name="Files Scanned", value=str(scan['files_scanned']), inline=True)
+                embed.add_field(name="Threats Found", value=str(scan['threats_found']), inline=True)
                 
-                # Account info
-                r6_count = len(scan_data.get('r6_accounts', []))
-                steam_count = len(scan_data.get('steam_accounts', []))
-                main_embed.add_field(name="🎮 R6 Accounts", value=str(r6_count), inline=True)
-                main_embed.add_field(name="🔄 Steam Accounts", value=str(steam_count), inline=True)
+                # Parse JSON fields
+                r6_accounts = json.loads(scan['r6_accounts']) if scan['r6_accounts'] else []
+                steam_accounts = json.loads(scan['steam_accounts']) if scan['steam_accounts'] else []
                 
-                # System info
-                if scan_data.get('system_info'):
-                    sys_info = scan_data['system_info']
-                    main_embed.add_field(name="💻 System", value=sys_info.get('computer_name', 'Unknown'), inline=True)
-                    main_embed.add_field(name="👤 User", value=sys_info.get('user_name', 'Unknown'), inline=True)
+                embed.add_field(name="R6 Accounts", value=str(len(r6_accounts)), inline=True)
+                embed.add_field(name="Steam Accounts", value=str(len(steam_accounts)), inline=True)
                 
-                main_embed.set_footer(text="R6X CyberScan v4.0")
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("📭 No scans found")
+        
+        @bot.command(name='status')
+        async def status_command(ctx):
+            """Check bot status"""
+            if str(ctx.channel.id) != channel_id:
+                return
                 
-                await channel.send(embed=main_embed)
+            embed = discord.Embed(
+                title="🟢 Bot Status",
+                description="R6X CyberScan Bot is operational",
+                color=0x00FF9D
+            )
+            embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+            embed.add_field(name="User", value=username, inline=True)
+            await ctx.send(embed=embed)
+        
+        @bot.command(name='help')
+        async def help_command(ctx):
+            """Show commands"""
+            if str(ctx.channel.id) != channel_id:
+                return
                 
-                # Send threats if any
-                if scan_data.get('threats_found', 0) > 0 and scan_data.get('suspicious_files'):
-                    threat_embed = discord.Embed(
-                        title="⚠️ Detected Threats",
-                        color=0xFF003C
-                    )
-                    
-                    threat_list = ""
-                    for threat in scan_data['suspicious_files'][:10]:
-                        threat_list += f"• **{threat.get('name', 'Unknown')}** - Severity: {threat.get('severity', 'MEDIUM')}\n"
-                    
-                    if threat_list:
-                        threat_embed.description = threat_list
-                        await channel.send(embed=threat_embed)
+            embed = discord.Embed(
+                title="🤖 R6X Bot Commands",
+                description="Available commands",
+                color=0x5865F2
+            )
+            embed.add_field(name="!scan", value="Get your latest scan", inline=False)
+            embed.add_field(name="!status", value="Check bot status", inline=False)
+            embed.add_field(name="!help", value="Show this message", inline=False)
+            await ctx.send(embed=embed)
+        
+        # Start bot
+        await bot.start(bot_token)
+    
+    async def stop_bot(self, user_id: str):
+        """Stop a user's bot"""
+        if user_id in self.bots:
+            try:
+                bot = self.bots[user_id]
+                await bot.close()
+                del self.bots[user_id]
                 
-                logger.info(f"✅ Scan results sent to Discord for user {user_id}")
+                if user_id in self.bot_tasks:
+                    self.bot_tasks[user_id].cancel()
+                    del self.bot_tasks[user_id]
+                
+                service_supabase.table("discord_bots")\
+                    .update({"status": "disconnected", "disconnected_at": datetime.utcnow().isoformat()})\
+                    .eq("user_id", user_id)\
+                    .execute()
+                
+                logger.info(f"✅ Bot stopped for user {user_id}")
                 return True
-                
             except Exception as e:
-                logger.error(f"Failed to send scan results to Discord: {e}")
-                logger.error(traceback.format_exc())
-                return False
-                
-        async def disconnect_bot(self, user_id: str):
-            """Disconnect user's bot"""
-            if user_id in self.bots:
-                try:
-                    bot = self.bots[user_id]["bot"]
-                    
-                    # Close the bot connection
-                    if bot.is_ready():
-                        asyncio.run_coroutine_threadsafe(bot.close(), self.loop)
-                    
-                    # Cancel the task
-                    if user_id in self.bot_tasks:
-                        self.bot_tasks[user_id].cancel()
-                        
-                    del self.bots[user_id]
-                    if user_id in self.bot_tasks:
-                        del self.bot_tasks[user_id]
-                    
-                    if supabase:
-                        supabase.table("discord_bots")\
-                            .update({"status": "disconnected", "disconnected_at": datetime.utcnow().isoformat()})\
-                            .eq("user_id", user_id)\
-                            .execute()
-                    
-                    logger.info(f"✅ Bot disconnected for user {user_id}")
-                    return True
-                except Exception as e:
-                    logger.error(f"Error disconnecting bot for user {user_id}: {e}")
-                    return False
+                logger.error(f"Error stopping bot: {e}")
+        return False
+    
+    async def send_scan_to_discord(self, user_id: str, scan_data: Dict):
+        """Send scan results to user's Discord channel"""
+        if user_id not in self.bots:
             return False
             
-        async def disconnect_all_bots(self):
-            """Disconnect all bots"""
-            for user_id in list(self.bots.keys()):
-                await self.disconnect_bot(user_id)
-
-    # Initialize Discord Bot Manager
-    discord_manager = DiscordBotManager()
-else:
-    # Dummy class for when discord is not available
-    class DiscordBotManager:
-        async def start_bot(self, *args, **kwargs):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Discord integration not available on this server"
+        try:
+            bot = self.bots[user_id]
+            
+            # Get channel ID from database
+            result = service_supabase.table("discord_bots")\
+                .select("channel_id")\
+                .eq("user_id", user_id)\
+                .execute()
+            
+            if not result.data:
+                return False
+                
+            channel_id = result.data[0]["channel_id"]
+            channel = bot.get_channel(int(channel_id))
+            
+            if not channel:
+                for guild in bot.guilds:
+                    channel = guild.get_channel(int(channel_id))
+                    if channel:
+                        break
+            
+            if not channel:
+                return False
+            
+            # Create main embed
+            color = 0x00FF9D if scan_data['threats_found'] == 0 else 0xFF003C
+            embed = discord.Embed(
+                title=f"📊 Scan Results: {scan_data['username']}",
+                description=f"Computer: {scan_data['computer']}",
+                color=color,
+                timestamp=datetime.utcnow()
             )
-        async def send_scan_results(self, *args, **kwargs):
+            
+            embed.add_field(name="📁 Files Scanned", value=str(scan_data['files_scanned']), inline=True)
+            embed.add_field(name="🚨 Threats Found", value=str(scan_data['threats_found']), inline=True)
+            embed.add_field(name="🎮 R6 Accounts", value=str(len(scan_data['r6_accounts'])), inline=True)
+            embed.add_field(name="🔄 Steam Accounts", value=str(len(scan_data['steam_accounts'])), inline=True)
+            
+            if scan_data.get('windows_install_date'):
+                embed.add_field(name="💻 Windows Install", value=scan_data['windows_install_date'][:10], inline=True)
+            
+            await channel.send(embed=embed)
+            
+            # Send suspicious files if any
+            if scan_data['suspicious_files']:
+                sus_embed = discord.Embed(
+                    title="⚠️ Suspicious Files Found",
+                    color=0xFF003C
+                )
+                sus_list = ""
+                for f in scan_data['suspicious_files'][:10]:
+                    sus_list += f"• {f.get('name', 'Unknown')} ({f.get('severity', 'MEDIUM')})\n"
+                if sus_list:
+                    sus_embed.description = sus_list
+                    await channel.send(embed=sus_embed)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error sending to Discord: {e}")
             return False
-        async def disconnect_bot(self, *args, **kwargs):
-            return False
-        async def disconnect_all_bots(self):
-            pass
     
-    discord_manager = DiscordBotManager()
-    logger.info("⚠️ Discord Bot Manager running in dummy mode")
+    def get_bot_status(self, user_id: str):
+        """Check if bot is running for user"""
+        return user_id in self.bots
 
-# FastAPI app
-app = FastAPI(
-    title="R6X CYBERSCAN API",
-    version=config.API_VERSION,
-    description="Enterprise Security Scanner Backend",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
+# Initialize bot host
+bot_host = DiscordBotHost()
 
-# CORS middleware
+# ========== FASTAPI APP ==========
+app = FastAPI(title="R6X CYBERSCAN API")
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -429,137 +344,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OAuth2 scheme
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
+# Auth
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
-# Helper functions
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def create_access_token(data: dict):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire, "type": "access"})
-    encoded_jwt = jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.ALGORITHM)
-    return encoded_jwt
+    expire = datetime.utcnow() + timedelta(minutes=config.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.ALGORITHM)
 
 def create_refresh_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
-    encoded_jwt = jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.ALGORITHM)
-    return encoded_jwt
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, config.SECRET_KEY, algorithm=config.ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     if not token:
         return None
-        
     try:
         payload = jwt.decode(token, config.SECRET_KEY, algorithms=[config.ALGORITHM])
-        username: str = payload.get("sub")
-        
-        if username is None:
-            return None
-        
-        if supabase:
+        username = payload.get("sub")
+        if username:
             result = supabase.table("users").select("*").eq("username", username).execute()
             if result.data and len(result.data) > 0:
                 return result.data[0]
-        return None
     except:
-        return None
+        pass
+    return None
 
-async def get_current_owner(current_user: dict = Depends(get_current_user)):
-    if not current_user or current_user.get("role") != "owner":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Owner access required"
-        )
+async def get_current_admin(current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Not authenticated")
+    
+    is_admin = current_user.get("role") == "owner" or current_user.get("user_id") in config.ADMIN_IDS
+    if not is_admin:
+        raise HTTPException(403, "Admin access required")
+    
     return current_user
 
-# API Routes
+# ========== API ROUTES ==========
+
 @app.get("/")
 async def root():
     return {
         "service": "R6X CYBERSCAN API",
-        "version": config.API_VERSION,
-        "status": "operational",
-        "database": "supabase",
-        "database_status": "connected" if supabase else "disconnected",
-        "discord_available": DISCORD_AVAILABLE,
-        "bots_active": len(discord_manager.bots) if hasattr(discord_manager, 'bots') else 0,
-        "timestamp": datetime.utcnow().isoformat()
+        "status": "online",
+        "bots_active": len(bot_host.bots),
+        "version": "4.0.0"
     }
 
 @app.get("/api/health")
-async def health_check():
-    db_status = "connected"
-    try:
-        if supabase:
-            supabase.table("users").select("*").limit(1).execute()
-        else:
-            db_status = "disconnected"
-    except Exception as e:
-        db_status = f"error: {e}"
-        
-    return {
-        "status": "healthy",
-        "database": db_status,
-        "discord_available": DISCORD_AVAILABLE,
-        "bots_active": len(discord_manager.bots) if hasattr(discord_manager, 'bots') else 0,
-        "timestamp": datetime.utcnow().isoformat()
-    }
+async def health():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+# ========== AUTH ROUTES ==========
 
 @app.post("/api/auth/register", response_model=Token)
 async def register(user: UserCreate):
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
-    
     # Check if user exists
     result = supabase.table("users").select("*")\
         .or_("username.eq.{},email.eq.{}".format(user.username, user.email))\
         .execute()
     
     if result.data and len(result.data) > 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email already registered"
-        )
+        raise HTTPException(400, "Username or email already registered")
     
     # Hash password
-    hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+    hashed = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt())
     
-    # Create user document
+    # Create user
     user_id = str(uuid.uuid4())
     user_doc = {
         "user_id": user_id,
         "username": user.username,
         "email": user.email,
-        "hashed_password": hashed_password.decode('utf-8'),
-        "role": "user",
+        "hashed_password": hashed.decode(),
+        "role": "owner" if user.username == "xotiic" else "user",
         "created_at": datetime.utcnow().isoformat(),
-        "last_login": None,
         "is_active": True,
         "total_scans": 0,
         "threats_found": 0
     }
     
-    supabase.table("users").insert(user_doc).execute()
+    service_supabase.table("users").insert(user_doc).execute()
     
     # Create tokens
-    access_token = create_access_token(
-        data={"sub": user.username, "user_id": user_id}
-    )
-    refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": user_id}
-    )
+    access_token = create_access_token({"sub": user.username, "user_id": user_id})
+    refresh_token = create_refresh_token({"sub": user.username, "user_id": user_id})
     
     # Store refresh token
-    supabase.table("tokens").insert({
+    service_supabase.table("tokens").insert({
         "user_id": user_id,
         "refresh_token": refresh_token,
         "created_at": datetime.utcnow().isoformat(),
@@ -576,56 +451,36 @@ async def register(user: UserCreate):
 
 @app.post("/api/auth/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
-    
     # Find user
     result = supabase.table("users").select("*")\
         .eq("username", form_data.username)\
         .execute()
     
     if not result.data or len(result.data) == 0:
-        # Try email
         result = supabase.table("users").select("*")\
             .eq("email", form_data.username)\
             .execute()
     
     if not result.data or len(result.data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
-        )
+        raise HTTPException(401, "Invalid credentials")
     
     user = result.data[0]
     
-    # Verify password
-    if not bcrypt.checkpw(
-        form_data.password.encode('utf-8'),
-        user["hashed_password"].encode('utf-8')
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password"
-        )
+    # Check password
+    if not bcrypt.checkpw(form_data.password.encode(), user["hashed_password"].encode()):
+        raise HTTPException(401, "Invalid credentials")
     
     # Update last login
-    supabase.table("users").update({
+    service_supabase.table("users").update({
         "last_login": datetime.utcnow().isoformat()
     }).eq("user_id", user["user_id"]).execute()
     
     # Create tokens
-    access_token = create_access_token(
-        data={"sub": user["username"], "user_id": user["user_id"]}
-    )
-    refresh_token = create_refresh_token(
-        data={"sub": user["username"], "user_id": user["user_id"]}
-    )
+    access_token = create_access_token({"sub": user["username"], "user_id": user["user_id"]})
+    refresh_token = create_refresh_token({"sub": user["username"], "user_id": user["user_id"]})
     
     # Store refresh token
-    supabase.table("tokens").insert({
+    service_supabase.table("tokens").insert({
         "user_id": user["user_id"],
         "refresh_token": refresh_token,
         "created_at": datetime.utcnow().isoformat(),
@@ -640,22 +495,33 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         "token_type": "bearer"
     }
 
+@app.get("/api/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Not authenticated")
+    
+    return {
+        "user_id": current_user["user_id"],
+        "username": current_user["username"],
+        "email": current_user["email"],
+        "role": current_user.get("role", "user"),
+        "is_admin": current_user.get("role") == "owner" or current_user.get("user_id") in config.ADMIN_IDS,
+        "total_scans": current_user.get("total_scans", 0),
+        "threats_found": current_user.get("threats_found", 0),
+        "created_at": current_user.get("created_at")
+    }
+
+@app.post("/api/auth/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    if current_user:
+        service_supabase.table("tokens").delete().eq("user_id", current_user["user_id"]).execute()
+        await bot_host.stop_bot(current_user["user_id"])
+    return {"success": True}
+
 @app.post("/api/auth/refresh", response_model=Token)
 async def refresh_token(refresh_token: str):
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
-    
     try:
         payload = jwt.decode(refresh_token, config.SECRET_KEY, algorithms=[config.ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token type"
-            )
-            
         username = payload.get("sub")
         user_id = payload.get("user_id")
         
@@ -666,24 +532,17 @@ async def refresh_token(refresh_token: str):
             .execute()
         
         if not result.data or len(result.data) == 0:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token not found"
-            )
+            raise HTTPException(401, "Invalid refresh token")
         
         # Create new tokens
-        new_access_token = create_access_token(
-            data={"sub": username, "user_id": user_id}
-        )
-        new_refresh_token = create_refresh_token(
-            data={"sub": username, "user_id": user_id}
-        )
+        access_token = create_access_token({"sub": username, "user_id": user_id})
+        new_refresh_token = create_refresh_token({"sub": username, "user_id": user_id})
         
         # Remove old token
-        supabase.table("tokens").delete().eq("refresh_token", refresh_token).execute()
+        service_supabase.table("tokens").delete().eq("refresh_token", refresh_token).execute()
         
         # Store new token
-        supabase.table("tokens").insert({
+        service_supabase.table("tokens").insert({
             "user_id": user_id,
             "refresh_token": new_refresh_token,
             "created_at": datetime.utcnow().isoformat(),
@@ -691,275 +550,141 @@ async def refresh_token(refresh_token: str):
         }).execute()
         
         return {
-            "access_token": new_access_token,
+            "access_token": access_token,
             "refresh_token": new_refresh_token,
             "token_type": "bearer"
         }
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token expired"
-        )
-    except jwt.PyJWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid refresh token"
-        )
+    except:
+        raise HTTPException(401, "Invalid refresh token")
 
-@app.get("/api/auth/me")
-async def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
-        
-    return {
-        "id": current_user["user_id"],
-        "username": current_user["username"],
-        "email": current_user["email"],
-        "role": current_user["role"],
-        "created_at": current_user["created_at"],
-        "last_login": current_user.get("last_login"),
-        "is_active": current_user.get("is_active", True),
-        "total_scans": current_user.get("total_scans", 0),
-        "threats_found": current_user.get("threats_found", 0)
-    }
+# ========== DISCORD BOT ROUTES ==========
 
-@app.post("/api/auth/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
-    if current_user and supabase:
-        supabase.table("tokens").delete().eq("user_id", current_user["user_id"]).execute()
-        if DISCORD_AVAILABLE:
-            await discord_manager.disconnect_bot(current_user["user_id"])
-    return {"success": True, "message": "Logged out successfully"}
-
-@app.post("/api/discord/connect")
-async def connect_discord_bot(
-    connection: DiscordBotConnect,
+@app.post("/api/bot/start")
+async def start_bot(
+    bot_connect: BotConnect,
     current_user: dict = Depends(get_current_user)
 ):
-    """Connect a Discord bot for the current user"""
+    """Start a Discord bot for the current user"""
     if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
+        raise HTTPException(401, "Not authenticated")
     
-    if not DISCORD_AVAILABLE:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Discord integration is not available on this server"
-        )
+    # Check if user is authorized to start this bot
+    if bot_connect.user_id != current_user["user_id"] and current_user.get("role") != "owner":
+        raise HTTPException(403, "Not authorized")
     
-    try:
-        # Validate token format
-        if len(connection.token) < 50:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid Discord token format"
-            )
-        
-        # Disconnect any existing bot
-        await discord_manager.disconnect_bot(current_user["user_id"])
-        
-        # Start new bot
-        bot_id = await discord_manager.start_bot(
-            token=connection.token,
-            channel_id=connection.channel_id,
-            user_id=current_user["user_id"]
-        )
-        
-        return {
-            "success": True,
-            "bot_id": bot_id,
-            "message": "Bot connected successfully"
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to connect bot: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to connect bot: {str(e)}"
-        )
-
-@app.post("/api/discord/send")
-async def send_discord_message(
-    message: DiscordMessage,
-    current_user: dict = Depends(get_current_user)
-):
-    """Send a message using user's connected Discord bot"""
-    if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
+    # Stop existing bot if any
+    await bot_host.stop_bot(bot_connect.user_id)
     
-    if not DISCORD_AVAILABLE:
-        return {"success": False, "message": "Discord integration not available"}
-    
-    success = await discord_manager.send_scan_results(
-        user_id=current_user["user_id"],
-        channel_id=message.channel_id,
-        scan_data=message.results if message.results else {}
+    # Start new bot
+    bot_host.start_bot_for_user(
+        user_id=bot_connect.user_id,
+        bot_token=bot_connect.bot_token,
+        channel_id=bot_connect.channel_id
     )
     
-    if success:
-        return {"success": True, "message": "Results sent to Discord"}
-    else:
-        return {"success": False, "message": "Failed to send to Discord - check bot connection"}
+    return {"status": "starting", "message": "Bot is starting..."}
 
-@app.post("/api/discord/disconnect")
-async def disconnect_discord_bot(current_user: dict = Depends(get_current_user)):
-    """Disconnect user's Discord bot"""
+@app.post("/api/bot/stop")
+async def stop_bot(
+    user_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Stop a user's bot"""
     if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
+        raise HTTPException(401, "Not authenticated")
     
-    if not DISCORD_AVAILABLE:
-        return {"success": False, "message": "Discord integration not available"}
+    if user_id != current_user["user_id"] and current_user.get("role") != "owner":
+        raise HTTPException(403, "Not authorized")
     
-    success = await discord_manager.disconnect_bot(current_user["user_id"])
-    
-    if success:
-        return {"success": True, "message": "Bot disconnected"}
-    else:
-        return {"success": False, "message": "No bot connected"}
+    success = await bot_host.stop_bot(user_id)
+    return {"status": "stopped" if success else "not_found"}
 
-@app.get("/api/discord/status")
-async def get_bot_status(current_user: dict = Depends(get_current_user)):
-    """Get user's Discord bot status"""
+@app.get("/api/bot/status")
+async def bot_status(
+    user_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get bot status for a user"""
     if not current_user:
-        return {"connected": False, "status": "not_authenticated"}
+        raise HTTPException(401, "Not authenticated")
     
-    if not DISCORD_AVAILABLE:
-        return {"connected": False, "status": "not_available"}
+    if user_id != current_user["user_id"] and current_user.get("role") != "owner":
+        raise HTTPException(403, "Not authorized")
     
-    is_connected = current_user["user_id"] in discord_manager.bots if hasattr(discord_manager, 'bots') else False
+    is_running = bot_host.get_bot_status(user_id)
     
-    bot_info = None
-    if supabase:
-        result = supabase.table("discord_bots").select("*")\
-            .eq("user_id", current_user["user_id"])\
-            .execute()
-        if result.data and len(result.data) > 0:
-            bot_info = result.data[0]
+    result = supabase.table("discord_bots")\
+        .select("*")\
+        .eq("user_id", user_id)\
+        .execute()
+    
+    bot_info = result.data[0] if result.data else None
     
     return {
-        "connected": is_connected,
+        "connected": is_running,
         "channel_id": bot_info.get("channel_id") if bot_info else None,
         "bot_name": bot_info.get("bot_name") if bot_info else None,
-        "status": "connected" if is_connected else "disconnected"
+        "status": "connected" if is_running else "disconnected"
     }
 
-@app.post("/api/scans/save")
-async def save_scan_result(
+# ========== SCAN ROUTES ==========
+
+@app.post("/api/scan/save")
+async def save_scan(
     scan: ScanResult,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
-    """Save scan results to database and optionally send to Discord"""
+    """Save scan results and send to Discord if bot connected"""
     if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
-    
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
+        raise HTTPException(401, "Not authenticated")
     
     # Save to database
     scan_id = str(uuid.uuid4())
     scan_doc = {
         "scan_id": scan_id,
         "user_id": current_user["user_id"],
-        "username": current_user["username"],
-        "name": scan.name,
+        "username": scan.username,
+        "computer": scan.computer,
         "files_scanned": scan.files_scanned,
         "threats_found": scan.threats_found,
-        "r6_accounts": json.dumps([dict(acc) for acc in scan.r6_accounts]),
-        "steam_accounts": json.dumps([dict(acc) for acc in scan.steam_accounts]),
-        "suspicious_files": json.dumps([dict(f) for f in scan.suspicious_files]),
-        "scan_duration": scan.scan_duration,
-        "status": scan.status,
-        "system_info": json.dumps(dict(scan.system_info)) if scan.system_info else None,
+        "r6_accounts": json.dumps(scan.r6_accounts),
+        "steam_accounts": json.dumps(scan.steam_accounts),
+        "suspicious_files": json.dumps(scan.suspicious_files),
+        "windows_install_date": scan.windows_install_date,
+        "antivirus_status": scan.antivirus_status,
+        "prefetch_files": json.dumps(scan.prefetch_files) if scan.prefetch_files else None,
+        "logitech_scripts": json.dumps(scan.logitech_scripts) if scan.logitech_scripts else None,
+        "scan_time": scan.scan_time,
         "created_at": datetime.utcnow().isoformat()
     }
     
-    supabase.table("scans").insert(scan_doc).execute()
+    service_supabase.table("scans").insert(scan_doc).execute()
     
     # Update user stats
-    supabase.table("users").update({
+    service_supabase.table("users").update({
         "total_scans": current_user["total_scans"] + 1,
         "threats_found": current_user["threats_found"] + scan.threats_found
     }).eq("user_id", current_user["user_id"]).execute()
     
-    # Log threats
-    if scan.threats_found > 0:
-        for threat in scan.suspicious_files:
-            supabase.table("threats").insert({
-                "threat_id": str(uuid.uuid4()),
-                "user_id": current_user["user_id"],
-                "username": current_user["username"],
-                "scan_id": scan_id,
-                "threat_name": threat.get("name", "Unknown"),
-                "severity": threat.get("severity", "MEDIUM"),
-                "file_path": threat.get("path", ""),
-                "action_taken": "Logged",
-                "timestamp": datetime.utcnow().isoformat()
-            }).execute()
+    # Send to Discord if bot connected
+    if current_user["user_id"] in bot_host.bots:
+        background_tasks.add_task(
+            bot_host.send_scan_to_discord,
+            current_user["user_id"],
+            scan.dict()
+        )
     
-    # Auto-send to Discord if bot is connected
-    discord_sent = False
-    if DISCORD_AVAILABLE and current_user["user_id"] in discord_manager.bots:
-        bot_info = None
-        result = supabase.table("discord_bots").select("*")\
-            .eq("user_id", current_user["user_id"])\
-            .execute()
-        if result.data and len(result.data) > 0:
-            bot_info = result.data[0]
-        
-        if bot_info and bot_info.get("channel_id"):
-            # Send in background
-            background_tasks.add_task(
-                discord_manager.send_scan_results,
-                current_user["user_id"],
-                bot_info["channel_id"],
-                scan_doc
-            )
-            discord_sent = True
-    
-    logger.info(f"✅ Scan saved for user {current_user['username']}: {scan.name}")
-    
-    return {
-        "success": True,
-        "scan_id": scan_id,
-        "discord_sent": discord_sent
-    }
+    return {"success": True, "scan_id": scan_id}
 
-@app.get("/api/scans/history")
-async def get_scan_history(
+@app.get("/api/scan/history")
+async def get_history(
     limit: int = 50,
     current_user: dict = Depends(get_current_user)
 ):
     """Get user's scan history"""
     if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
-    
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
+        raise HTTPException(401, "Not authenticated")
     
     result = supabase.table("scans").select("*")\
         .eq("user_id", current_user["user_id"])\
@@ -977,28 +702,21 @@ async def get_scan_history(
             scan["steam_accounts"] = json.loads(scan["steam_accounts"])
         if scan.get("suspicious_files"):
             scan["suspicious_files"] = json.loads(scan["suspicious_files"])
-        if scan.get("system_info"):
-            scan["system_info"] = json.loads(scan["system_info"])
+        if scan.get("prefetch_files"):
+            scan["prefetch_files"] = json.loads(scan["prefetch_files"])
+        if scan.get("logitech_scripts"):
+            scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
     
     return {"scans": scans}
 
-@app.get("/api/scans/{scan_id}")
-async def get_scan_details(
+@app.get("/api/scan/{scan_id}")
+async def get_scan(
     scan_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get detailed scan results"""
+    """Get specific scan details"""
     if not current_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated"
-        )
-    
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
+        raise HTTPException(401, "Not authenticated")
     
     result = supabase.table("scans").select("*")\
         .eq("scan_id", scan_id)\
@@ -1006,10 +724,7 @@ async def get_scan_details(
         .execute()
     
     if not result.data or len(result.data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Scan not found"
-        )
+        raise HTTPException(404, "Scan not found")
     
     scan = result.data[0]
     
@@ -1020,21 +735,18 @@ async def get_scan_details(
         scan["steam_accounts"] = json.loads(scan["steam_accounts"])
     if scan.get("suspicious_files"):
         scan["suspicious_files"] = json.loads(scan["suspicious_files"])
-    if scan.get("system_info"):
-        scan["system_info"] = json.loads(scan["system_info"])
+    if scan.get("prefetch_files"):
+        scan["prefetch_files"] = json.loads(scan["prefetch_files"])
+    if scan.get("logitech_scripts"):
+        scan["logitech_scripts"] = json.loads(scan["logitech_scripts"])
     
     return scan
 
-# Owner routes
+# ========== ADMIN ROUTES ==========
+
 @app.get("/api/admin/users")
-async def get_all_users(current_owner: dict = Depends(get_current_owner)):
-    """Get all users (owner only)"""
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
-    
+async def get_users(current_user: dict = Depends(get_current_admin)):
+    """Get all users (admin only)"""
     result = supabase.table("users").select("*")\
         .order("created_at")\
         .execute()
@@ -1048,96 +760,52 @@ async def get_all_users(current_owner: dict = Depends(get_current_owner)):
     
     return {"users": users}
 
-@app.post("/api/admin/update-role")
-async def update_user_role(
-    role_update: RoleUpdate,
-    current_owner: dict = Depends(get_current_owner)
-):
-    """Update user role (owner only)"""
-    if role_update.username == "xotiic":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot modify primary owner role"
-        )
+@app.get("/api/admin/stats")
+async def get_stats(current_user: dict = Depends(get_current_admin)):
+    """Get system stats (admin only)"""
+    users_result = supabase.table("users").select("*", count="exact").execute()
+    scans_result = supabase.table("scans").select("*", count="exact").execute()
     
-    if not supabase:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection not available"
-        )
+    return {
+        "total_users": users_result.count if hasattr(users_result, 'count') else 0,
+        "total_scans": scans_result.count if hasattr(scans_result, 'count') else 0,
+        "active_bots": len(bot_host.bots),
+        "admins": config.ADMIN_IDS
+    }
+
+# ========== STARTUP ==========
+@app.on_event("startup")
+async def startup():
+    logger.info("🚀 R6X CYBERSCAN Backend starting...")
+    logger.info(f"Admin IDs: {config.ADMIN_IDS}")
     
-    result = supabase.table("users").update({
-        "role": role_update.role
-    }).eq("username", role_update.username).execute()
+    # Check if owner exists
+    result = supabase.table("users").select("*").eq("username", "xotiic").execute()
     
     if not result.data or len(result.data) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    
-    logger.info(f"Role updated for {role_update.username} to {role_update.role}")
-    
-    return {"success": True, "message": f"Role updated for {role_update.username}"}
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    try:
-        # Check if Supabase is connected
-        if not supabase:
-            logger.error("❌ Supabase not connected - some features will be disabled")
-        else:
-            logger.info("✅ Supabase connected successfully")
-        
-        # Create owner account if doesn't exist
-        if supabase:
-            result = supabase.table("users").select("*")\
-                .eq("username", "xotiic")\
-                .execute()
-            
-            if not result.data or len(result.data) == 0:
-                hashed_password = bcrypt.hashpw(b"40671Mps19*", bcrypt.gensalt())
-                
-                owner_doc = {
-                    "user_id": str(uuid.uuid4()),
-                    "username": "xotiic",
-                    "email": "owner@r6x-cyberscan.com",
-                    "hashed_password": hashed_password.decode('utf-8'),
-                    "role": "owner",
-                    "created_at": datetime.utcnow().isoformat(),
-                    "last_login": None,
-                    "is_active": True,
-                    "total_scans": 0,
-                    "threats_found": 0
-                }
-                
-                supabase.table("users").insert(owner_doc).execute()
-                logger.info("✅ Default owner account created")
-        
-        logger.info(f"🚀 R6X CYBERSCAN Backend v{config.API_VERSION} started")
-        logger.info(f"💾 Database: Supabase")
-        logger.info(f"🤖 Discord Available: {DISCORD_AVAILABLE}")
-        
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
-        logger.error(traceback.format_exc())
+        hashed = bcrypt.hashpw(b"40671Mps19*", bcrypt.gensalt())
+        owner_doc = {
+            "user_id": str(uuid.uuid4()),
+            "username": "xotiic",
+            "email": "owner@r6x.com",
+            "hashed_password": hashed.decode(),
+            "role": "owner",
+            "created_at": datetime.utcnow().isoformat(),
+            "is_active": True,
+            "total_scans": 0,
+            "threats_found": 0
+        }
+        service_supabase.table("users").insert(owner_doc).execute()
+        logger.info("✅ Owner account created")
 
 @app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
+async def shutdown():
+    """Stop all bots on shutdown"""
     logger.info("Shutting down...")
-    if DISCORD_AVAILABLE:
-        await discord_manager.disconnect_all_bots()
-    logger.info("Shutdown complete")
+    for user_id in list(bot_host.bots.keys()):
+        await bot_host.stop_bot(user_id)
 
-# For local testing
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        "backend:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
