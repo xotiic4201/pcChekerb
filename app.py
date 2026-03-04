@@ -25,7 +25,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
 API_KEY = os.getenv('API_KEY', 'R6X-SECURE-KEY-CHANGE-ME-NOW')
-RENDER_URL = os.getenv('RENDER_URL', 'https://your-app-name.onrender.com')
+RENDER_URL = os.getenv('RENDER_URL', 'https://bot-hosting-b-ga04.onrender.com')
 
 # File paths
 EXE_FILENAME = "R6XScan.exe"
@@ -223,3 +223,4 @@ async def health():
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 5000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
