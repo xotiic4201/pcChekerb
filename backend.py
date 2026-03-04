@@ -13,11 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
-# These are fetched from Render environment variables
 TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))
 AUTHORIZED_USERS = os.getenv('AUTHORIZED_USERS', '').split(',') if os.getenv('AUTHORIZED_USERS') else []
-API_KEY = os.getenv('API_KEY', '')
+API_KEY = os.getenv('API_KEY', 'rnd_o2SUQpg4Ln3EsJSJsOYOeCHnLnId')
 RENDER_URL = os.getenv('RENDER_URL', 'https://r6x-cyberscan-api.onrender.com')
 
 # File paths
@@ -169,7 +168,7 @@ async def scan_complete(scan_data: ScanData, x_api_key: Optional[str] = Header(N
     active_scans[scan_id]['completed_time'] = datetime.now()
     active_scans[scan_id]['data'] = scan_data.dict()
     
-    # Add to history
+    # Add to history (no global keyword needed here)
     scan_history.append({
         'scan_id': scan_id,
         'user_id': user_id,
@@ -182,9 +181,8 @@ async def scan_complete(scan_data: ScanData, x_api_key: Optional[str] = Header(N
     })
     
     # Keep only last 100 scans in history
-    global scan_history
-    if len(scan_history) > 100:
-        scan_history = scan_history[-100:]
+    while len(scan_history) > 100:
+        scan_history.pop(0)
     
     logger.info(f"✅ Scan completed: {scan_id}")
     
@@ -283,11 +281,15 @@ async def get_stats(x_api_key: Optional[str] = Header(None)):
     total_files = sum(s.get('files_scanned', 0) for s in scan_history)
     total_suspicious = sum(s.get('suspicious_count', 0) for s in scan_history)
     
+    avg_duration = 0
+    if total_scans > 0:
+        avg_duration = sum(s.get('duration', 0) for s in scan_history) / total_scans
+    
     return {
         'total_scans': total_scans,
         'total_files_scanned': total_files,
         'total_suspicious_files': total_suspicious,
-        'average_duration': sum(s.get('duration', 0) for s in scan_history) / total_scans if total_scans > 0 else 0,
+        'average_duration': avg_duration,
         'active_scans': len(active_scans)
     }
 
@@ -300,4 +302,3 @@ if __name__ == "__main__":
     logger.info(f"Token loaded: {bool(TOKEN)}")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
-
