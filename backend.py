@@ -1,4 +1,4 @@
-# backend.py - R6X CYBERSCAN Production Backend
+# backend.py - R6X CYBERSCAN Production Backend with Supabase
 # Deploy this on Render.com
 
 import os
@@ -15,10 +15,15 @@ from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
-import motor.motor_asyncio
+from supabase import create_client, Client
 import logging
 from datetime import datetime, timedelta
 import secrets
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Discord imports - make them optional
 try:
@@ -35,8 +40,12 @@ class Config:
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES = 30
     REFRESH_TOKEN_EXPIRE_DAYS = 7
-    MONGODB_URL = os.getenv("MONGODB_URL", "mongodb+srv://xotiicglizzy_db_user:WBnaZXuhxBWzLwx5@cluster0.cvidwug.mongodb.net/")
-    DATABASE_NAME = "r6x_cyberscan"
+    
+    # Supabase configuration
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "https://your-project.supabase.co")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your-supabase-anon-key")
+    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "your-service-role-key")
+    
     API_VERSION = "4.0.0"
     ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
     
@@ -49,23 +58,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("r6x-backend")
 
-# Database setup - FIXED: removed await from top level
+# Initialize Supabase client
 try:
-    logger.info(f"Connecting to MongoDB...")
-    client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGODB_URL)
-    db = client[config.DATABASE_NAME]
-    
-    # Collections
-    users_collection = db["users"]
-    scans_collection = db["scans"]
-    tokens_collection = db["tokens"]
-    bots_collection = db["discord_bots"]
-    threats_collection = db["threats"]
-    
-    logger.info("✅ MongoDB client created successfully")
+    supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    # Test connection
+    supabase.table("users").select("*").limit(1).execute()
+    logger.info("✅ Connected to Supabase successfully")
 except Exception as e:
-    logger.error(f"❌ Failed to create MongoDB client: {e}")
-    raise
+    logger.error(f"❌ Failed to connect to Supabase: {e}")
+    # Don't raise, allow app to start but with limited functionality
+    supabase = None
 
 # Pydantic models
 class Token(BaseModel):
@@ -173,18 +175,16 @@ if DISCORD_AVAILABLE:
                     await channel.send(embed=embed)
                     
                     # Store bot info in database
-                    await bots_collection.update_one(
-                        {"user_id": user_id},
-                        {"$set": {
+                    if supabase:
+                        supabase.table("discord_bots").upsert({
+                            "user_id": user_id,
                             "bot_id": bot_id,
                             "token_preview": token[:10] + "...",
                             "channel_id": channel_id,
                             "bot_name": str(bot.user),
                             "status": "connected",
-                            "connected_at": datetime.utcnow()
-                        }},
-                        upsert=True
-                    )
+                            "connected_at": datetime.utcnow().isoformat()
+                        }).execute()
                     
                 @bot.event
                 async def on_command_error(ctx, error):
@@ -199,35 +199,35 @@ if DISCORD_AVAILABLE:
                     if str(ctx.channel.id) != channel_id:
                         return
                     
-                    # Get latest scan for user
-                    latest_scan = await scans_collection.find_one(
-                        {"user_id": user_id},
-                        sort=[("created_at", -1)]
-                    )
-                    
-                    if latest_scan:
-                        color = 0x00FF9D if latest_scan['threats_found'] == 0 else 0xFF003C
+                    # Get latest scan for user from Supabase
+                    if supabase:
+                        result = supabase.table("scans")\
+                            .select("*")\
+                            .eq("user_id", user_id)\
+                            .order("created_at", desc=True)\
+                            .limit(1)\
+                            .execute()
                         
-                        embed = discord.Embed(
-                            title="📊 Latest Scan Results",
-                            description=f"Scan: {latest_scan['name']}",
-                            color=color,
-                            timestamp=latest_scan['created_at']
-                        )
-                        embed.add_field(name="Files Scanned", value=str(latest_scan['files_scanned']), inline=True)
-                        embed.add_field(name="Threats Found", value=str(latest_scan['threats_found']), inline=True)
-                        embed.add_field(name="Duration", value=f"{latest_scan['scan_duration']:.2f}s", inline=True)
-                        
-                        if latest_scan.get('r6_accounts'):
-                            embed.add_field(name="R6 Accounts", value=str(len(latest_scan['r6_accounts'])), inline=True)
-                        
-                        if latest_scan.get('steam_accounts'):
-                            embed.add_field(name="Steam Accounts", value=str(len(latest_scan['steam_accounts'])), inline=True)
-                        
-                        embed.set_footer(text=f"User: {latest_scan['username']}")
-                        await ctx.send(embed=embed)
+                        if result.data and len(result.data) > 0:
+                            latest_scan = result.data[0]
+                            color = 0x00FF9D if latest_scan['threats_found'] == 0 else 0xFF003C
+                            
+                            embed = discord.Embed(
+                                title="📊 Latest Scan Results",
+                                description=f"Scan: {latest_scan['name']}",
+                                color=color,
+                                timestamp=datetime.fromisoformat(latest_scan['created_at'])
+                            )
+                            embed.add_field(name="Files Scanned", value=str(latest_scan['files_scanned']), inline=True)
+                            embed.add_field(name="Threats Found", value=str(latest_scan['threats_found']), inline=True)
+                            embed.add_field(name="Duration", value=f"{latest_scan['scan_duration']:.2f}s", inline=True)
+                            
+                            embed.set_footer(text=f"User: {latest_scan['username']}")
+                            await ctx.send(embed=embed)
+                        else:
+                            await ctx.send("📭 No scans found for your account")
                     else:
-                        await ctx.send("📭 No scans found for your account")
+                        await ctx.send("❌ Database connection error")
                         
                 @bot.command(name='help')
                 async def help_command(ctx):
@@ -373,10 +373,11 @@ if DISCORD_AVAILABLE:
                     if user_id in self.bot_tasks:
                         del self.bot_tasks[user_id]
                     
-                    await bots_collection.update_one(
-                        {"user_id": user_id},
-                        {"$set": {"status": "disconnected", "disconnected_at": datetime.utcnow()}}
-                    )
+                    if supabase:
+                        supabase.table("discord_bots")\
+                            .update({"status": "disconnected", "disconnected_at": datetime.utcnow().isoformat()})\
+                            .eq("user_id", user_id)\
+                            .execute()
                     
                     logger.info(f"✅ Bot disconnected for user {user_id}")
                     return True
@@ -460,9 +461,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         
         if username is None:
             return None
-            
-        user = await users_collection.find_one({"username": username})
-        return user
+        
+        if supabase:
+            result = supabase.table("users").select("*").eq("username", username).execute()
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+        return None
     except:
         return None
 
@@ -481,6 +485,8 @@ async def root():
         "service": "R6X CYBERSCAN API",
         "version": config.API_VERSION,
         "status": "operational",
+        "database": "supabase",
+        "database_status": "connected" if supabase else "disconnected",
         "discord_available": DISCORD_AVAILABLE,
         "bots_active": len(discord_manager.bots) if hasattr(discord_manager, 'bots') else 0,
         "timestamp": datetime.utcnow().isoformat()
@@ -488,12 +494,14 @@ async def root():
 
 @app.get("/api/health")
 async def health_check():
+    db_status = "connected"
     try:
-        # Test database connection
-        await db.command("ping")
-        db_status = "connected"
+        if supabase:
+            supabase.table("users").select("*").limit(1).execute()
+        else:
+            db_status = "disconnected"
     except Exception as e:
-        db_status = f"disconnected: {e}"
+        db_status = f"error: {e}"
         
     return {
         "status": "healthy",
@@ -505,15 +513,18 @@ async def health_check():
 
 @app.post("/api/auth/register", response_model=Token)
 async def register(user: UserCreate):
-    # Check if user exists
-    existing_user = await users_collection.find_one({
-        "$or": [
-            {"username": user.username},
-            {"email": user.email}
-        ]
-    })
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     
-    if existing_user:
+    # Check if user exists
+    result = supabase.table("users").select("*")\
+        .or_("username.eq.{},email.eq.{}".format(user.username, user.email))\
+        .execute()
+    
+    if result.data and len(result.data) > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username or email already registered"
@@ -523,35 +534,37 @@ async def register(user: UserCreate):
     hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
     
     # Create user document
+    user_id = str(uuid.uuid4())
     user_doc = {
-        "user_id": str(uuid.uuid4()),
+        "user_id": user_id,
         "username": user.username,
         "email": user.email,
         "hashed_password": hashed_password.decode('utf-8'),
         "role": "user",
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.utcnow().isoformat(),
         "last_login": None,
         "is_active": True,
         "total_scans": 0,
         "threats_found": 0
     }
     
-    await users_collection.insert_one(user_doc)
+    supabase.table("users").insert(user_doc).execute()
     
     # Create tokens
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": user_doc["user_id"]}
+        data={"sub": user.username, "user_id": user_id}
     )
     refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": user_doc["user_id"]}
+        data={"sub": user.username, "user_id": user_id}
     )
     
-    await tokens_collection.insert_one({
-        "user_id": user_doc["user_id"],
+    # Store refresh token
+    supabase.table("tokens").insert({
+        "user_id": user_id,
         "refresh_token": refresh_token,
-        "created_at": datetime.utcnow(),
-        "expires_at": datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)
-    })
+        "created_at": datetime.utcnow().isoformat(),
+        "expires_at": (datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+    }).execute()
     
     logger.info(f"✅ New user registered: {user.username}")
     
@@ -563,17 +576,30 @@ async def register(user: UserCreate):
 
 @app.post("/api/auth/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
+    
     # Find user
-    user = await users_collection.find_one({"username": form_data.username})
+    result = supabase.table("users").select("*")\
+        .eq("username", form_data.username)\
+        .execute()
     
-    if not user:
-        user = await users_collection.find_one({"email": form_data.username})
+    if not result.data or len(result.data) == 0:
+        # Try email
+        result = supabase.table("users").select("*")\
+            .eq("email", form_data.username)\
+            .execute()
     
-    if not user:
+    if not result.data or len(result.data) == 0:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password"
         )
+    
+    user = result.data[0]
     
     # Verify password
     if not bcrypt.checkpw(
@@ -586,10 +612,9 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         )
     
     # Update last login
-    await users_collection.update_one(
-        {"user_id": user["user_id"]},
-        {"$set": {"last_login": datetime.utcnow()}}
-    )
+    supabase.table("users").update({
+        "last_login": datetime.utcnow().isoformat()
+    }).eq("user_id", user["user_id"]).execute()
     
     # Create tokens
     access_token = create_access_token(
@@ -599,12 +624,13 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         data={"sub": user["username"], "user_id": user["user_id"]}
     )
     
-    await tokens_collection.insert_one({
+    # Store refresh token
+    supabase.table("tokens").insert({
         "user_id": user["user_id"],
         "refresh_token": refresh_token,
-        "created_at": datetime.utcnow(),
-        "expires_at": datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)
-    })
+        "created_at": datetime.utcnow().isoformat(),
+        "expires_at": (datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+    }).execute()
     
     logger.info(f"✅ User logged in: {form_data.username}")
     
@@ -616,6 +642,12 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.post("/api/auth/refresh", response_model=Token)
 async def refresh_token(refresh_token: str):
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
+    
     try:
         payload = jwt.decode(refresh_token, config.SECRET_KEY, algorithms=[config.ALGORITHM])
         if payload.get("type") != "refresh":
@@ -628,12 +660,12 @@ async def refresh_token(refresh_token: str):
         user_id = payload.get("user_id")
         
         # Check if token exists
-        stored_token = await tokens_collection.find_one({
-            "refresh_token": refresh_token,
-            "user_id": user_id
-        })
+        result = supabase.table("tokens").select("*")\
+            .eq("refresh_token", refresh_token)\
+            .eq("user_id", user_id)\
+            .execute()
         
-        if not stored_token:
+        if not result.data or len(result.data) == 0:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Refresh token not found"
@@ -648,15 +680,15 @@ async def refresh_token(refresh_token: str):
         )
         
         # Remove old token
-        await tokens_collection.delete_one({"refresh_token": refresh_token})
+        supabase.table("tokens").delete().eq("refresh_token", refresh_token).execute()
         
         # Store new token
-        await tokens_collection.insert_one({
+        supabase.table("tokens").insert({
             "user_id": user_id,
             "refresh_token": new_refresh_token,
-            "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)
-        })
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(days=config.REFRESH_TOKEN_EXPIRE_DAYS)).isoformat()
+        }).execute()
         
         return {
             "access_token": new_access_token,
@@ -688,8 +720,8 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "username": current_user["username"],
         "email": current_user["email"],
         "role": current_user["role"],
-        "created_at": current_user["created_at"].isoformat(),
-        "last_login": current_user.get("last_login").isoformat() if current_user.get("last_login") else None,
+        "created_at": current_user["created_at"],
+        "last_login": current_user.get("last_login"),
         "is_active": current_user.get("is_active", True),
         "total_scans": current_user.get("total_scans", 0),
         "threats_found": current_user.get("threats_found", 0)
@@ -697,8 +729,8 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/auth/logout")
 async def logout(current_user: dict = Depends(get_current_user)):
-    if current_user:
-        await tokens_collection.delete_many({"user_id": current_user["user_id"]})
+    if current_user and supabase:
+        supabase.table("tokens").delete().eq("user_id", current_user["user_id"]).execute()
         if DISCORD_AVAILABLE:
             await discord_manager.disconnect_bot(current_user["user_id"])
     return {"success": True, "message": "Logged out successfully"}
@@ -807,7 +839,14 @@ async def get_bot_status(current_user: dict = Depends(get_current_user)):
         return {"connected": False, "status": "not_available"}
     
     is_connected = current_user["user_id"] in discord_manager.bots if hasattr(discord_manager, 'bots') else False
-    bot_info = await bots_collection.find_one({"user_id": current_user["user_id"]})
+    
+    bot_info = None
+    if supabase:
+        result = supabase.table("discord_bots").select("*")\
+            .eq("user_id", current_user["user_id"])\
+            .execute()
+        if result.data and len(result.data) > 0:
+            bot_info = result.data[0]
     
     return {
         "connected": is_connected,
@@ -829,55 +868,63 @@ async def save_scan_result(
             detail="Not authenticated"
         )
     
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
+    
     # Save to database
+    scan_id = str(uuid.uuid4())
     scan_doc = {
-        "scan_id": str(uuid.uuid4()),
+        "scan_id": scan_id,
         "user_id": current_user["user_id"],
         "username": current_user["username"],
         "name": scan.name,
         "files_scanned": scan.files_scanned,
         "threats_found": scan.threats_found,
-        "r6_accounts": [dict(acc) for acc in scan.r6_accounts],
-        "steam_accounts": [dict(acc) for acc in scan.steam_accounts],
-        "suspicious_files": [dict(f) for f in scan.suspicious_files],
+        "r6_accounts": json.dumps([dict(acc) for acc in scan.r6_accounts]),
+        "steam_accounts": json.dumps([dict(acc) for acc in scan.steam_accounts]),
+        "suspicious_files": json.dumps([dict(f) for f in scan.suspicious_files]),
         "scan_duration": scan.scan_duration,
         "status": scan.status,
-        "system_info": dict(scan.system_info) if scan.system_info else None,
-        "created_at": datetime.utcnow()
+        "system_info": json.dumps(dict(scan.system_info)) if scan.system_info else None,
+        "created_at": datetime.utcnow().isoformat()
     }
     
-    await scans_collection.insert_one(scan_doc)
+    supabase.table("scans").insert(scan_doc).execute()
     
     # Update user stats
-    await users_collection.update_one(
-        {"user_id": current_user["user_id"]},
-        {
-            "$inc": {
-                "total_scans": 1,
-                "threats_found": scan.threats_found
-            }
-        }
-    )
+    supabase.table("users").update({
+        "total_scans": current_user["total_scans"] + 1,
+        "threats_found": current_user["threats_found"] + scan.threats_found
+    }).eq("user_id", current_user["user_id"]).execute()
     
     # Log threats
     if scan.threats_found > 0:
         for threat in scan.suspicious_files:
-            threat_doc = {
+            supabase.table("threats").insert({
                 "threat_id": str(uuid.uuid4()),
                 "user_id": current_user["user_id"],
                 "username": current_user["username"],
-                "scan_id": scan_doc["scan_id"],
+                "scan_id": scan_id,
                 "threat_name": threat.get("name", "Unknown"),
                 "severity": threat.get("severity", "MEDIUM"),
                 "file_path": threat.get("path", ""),
                 "action_taken": "Logged",
-                "timestamp": datetime.utcnow()
-            }
-            await threats_collection.insert_one(threat_doc)
+                "timestamp": datetime.utcnow().isoformat()
+            }).execute()
     
     # Auto-send to Discord if bot is connected
+    discord_sent = False
     if DISCORD_AVAILABLE and current_user["user_id"] in discord_manager.bots:
-        bot_info = await bots_collection.find_one({"user_id": current_user["user_id"]})
+        bot_info = None
+        result = supabase.table("discord_bots").select("*")\
+            .eq("user_id", current_user["user_id"])\
+            .execute()
+        if result.data and len(result.data) > 0:
+            bot_info = result.data[0]
+        
         if bot_info and bot_info.get("channel_id"):
             # Send in background
             background_tasks.add_task(
@@ -887,15 +934,13 @@ async def save_scan_result(
                 scan_doc
             )
             discord_sent = True
-    else:
-        discord_sent = False
     
     logger.info(f"✅ Scan saved for user {current_user['username']}: {scan.name}")
     
     return {
         "success": True,
-        "scan_id": scan_doc["scan_id"],
-        "discord_sent": discord_sent if 'discord_sent' in locals() else False
+        "scan_id": scan_id,
+        "discord_sent": discord_sent
     }
 
 @app.get("/api/scans/history")
@@ -910,16 +955,30 @@ async def get_scan_history(
             detail="Not authenticated"
         )
     
-    cursor = scans_collection.find(
-        {"user_id": current_user["user_id"]},
-        {"r6_accounts": 0, "steam_accounts": 0, "suspicious_files": 0}
-    ).sort("created_at", -1).limit(limit)
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     
-    scans = await cursor.to_list(length=limit)
+    result = supabase.table("scans").select("*")\
+        .eq("user_id", current_user["user_id"])\
+        .order("created_at", desc=True)\
+        .limit(limit)\
+        .execute()
     
+    scans = result.data if result.data else []
+    
+    # Parse JSON fields
     for scan in scans:
-        scan["_id"] = str(scan["_id"])
-        scan["created_at"] = scan["created_at"].isoformat()
+        if scan.get("r6_accounts"):
+            scan["r6_accounts"] = json.loads(scan["r6_accounts"])
+        if scan.get("steam_accounts"):
+            scan["steam_accounts"] = json.loads(scan["steam_accounts"])
+        if scan.get("suspicious_files"):
+            scan["suspicious_files"] = json.loads(scan["suspicious_files"])
+        if scan.get("system_info"):
+            scan["system_info"] = json.loads(scan["system_info"])
     
     return {"scans": scans}
 
@@ -935,19 +994,34 @@ async def get_scan_details(
             detail="Not authenticated"
         )
     
-    scan = await scans_collection.find_one({
-        "scan_id": scan_id,
-        "user_id": current_user["user_id"]
-    })
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     
-    if not scan:
+    result = supabase.table("scans").select("*")\
+        .eq("scan_id", scan_id)\
+        .eq("user_id", current_user["user_id"])\
+        .execute()
+    
+    if not result.data or len(result.data) == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Scan not found"
         )
     
-    scan["_id"] = str(scan["_id"])
-    scan["created_at"] = scan["created_at"].isoformat()
+    scan = result.data[0]
+    
+    # Parse JSON fields
+    if scan.get("r6_accounts"):
+        scan["r6_accounts"] = json.loads(scan["r6_accounts"])
+    if scan.get("steam_accounts"):
+        scan["steam_accounts"] = json.loads(scan["steam_accounts"])
+    if scan.get("suspicious_files"):
+        scan["suspicious_files"] = json.loads(scan["suspicious_files"])
+    if scan.get("system_info"):
+        scan["system_info"] = json.loads(scan["system_info"])
     
     return scan
 
@@ -955,14 +1029,22 @@ async def get_scan_details(
 @app.get("/api/admin/users")
 async def get_all_users(current_owner: dict = Depends(get_current_owner)):
     """Get all users (owner only)"""
-    cursor = users_collection.find({}, {"hashed_password": 0})
-    users = await cursor.to_list(length=1000)
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     
+    result = supabase.table("users").select("*")\
+        .order("created_at")\
+        .execute()
+    
+    users = result.data if result.data else []
+    
+    # Remove sensitive data
     for user in users:
-        user["_id"] = str(user["_id"])
-        user["created_at"] = user["created_at"].isoformat()
-        if user.get("last_login"):
-            user["last_login"] = user["last_login"].isoformat()
+        if "hashed_password" in user:
+            del user["hashed_password"]
     
     return {"users": users}
 
@@ -978,12 +1060,17 @@ async def update_user_role(
             detail="Cannot modify primary owner role"
         )
     
-    result = await users_collection.update_one(
-        {"username": role_update.username},
-        {"$set": {"role": role_update.role}}
-    )
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection not available"
+        )
     
-    if result.modified_count == 0:
+    result = supabase.table("users").update({
+        "role": role_update.role
+    }).eq("username", role_update.username).execute()
+    
+    if not result.data or len(result.data) == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
@@ -997,42 +1084,39 @@ async def update_user_role(
 async def startup_event():
     """Initialize on startup"""
     try:
-        # Create indexes
-        await users_collection.create_index("username", unique=True)
-        await users_collection.create_index("email", unique=True)
-        await users_collection.create_index("user_id", unique=True)
-        await scans_collection.create_index("scan_id", unique=True)
-        await scans_collection.create_index("user_id")
-        await scans_collection.create_index("created_at")
-        await tokens_collection.create_index("refresh_token", unique=True)
-        await tokens_collection.create_index("expires_at")
-        
-        logger.info("✅ Database indexes created")
+        # Check if Supabase is connected
+        if not supabase:
+            logger.error("❌ Supabase not connected - some features will be disabled")
+        else:
+            logger.info("✅ Supabase connected successfully")
         
         # Create owner account if doesn't exist
-        owner = await users_collection.find_one({"username": "xotiic"})
-        
-        if not owner:
-            hashed_password = bcrypt.hashpw(b"40671Mps19*", bcrypt.gensalt())
+        if supabase:
+            result = supabase.table("users").select("*")\
+                .eq("username", "xotiic")\
+                .execute()
             
-            owner_doc = {
-                "user_id": str(uuid.uuid4()),
-                "username": "xotiic",
-                "email": "owner@r6x-cyberscan.com",
-                "hashed_password": hashed_password.decode('utf-8'),
-                "role": "owner",
-                "created_at": datetime.utcnow(),
-                "last_login": None,
-                "is_active": True,
-                "total_scans": 0,
-                "threats_found": 0
-            }
-            
-            await users_collection.insert_one(owner_doc)
-            logger.info("✅ Default owner account created")
+            if not result.data or len(result.data) == 0:
+                hashed_password = bcrypt.hashpw(b"40671Mps19*", bcrypt.gensalt())
+                
+                owner_doc = {
+                    "user_id": str(uuid.uuid4()),
+                    "username": "xotiic",
+                    "email": "owner@r6x-cyberscan.com",
+                    "hashed_password": hashed_password.decode('utf-8'),
+                    "role": "owner",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "last_login": None,
+                    "is_active": True,
+                    "total_scans": 0,
+                    "threats_found": 0
+                }
+                
+                supabase.table("users").insert(owner_doc).execute()
+                logger.info("✅ Default owner account created")
         
         logger.info(f"🚀 R6X CYBERSCAN Backend v{config.API_VERSION} started")
-        logger.info(f"💾 MongoDB: Connected")
+        logger.info(f"💾 Database: Supabase")
         logger.info(f"🤖 Discord Available: {DISCORD_AVAILABLE}")
         
     except Exception as e:
